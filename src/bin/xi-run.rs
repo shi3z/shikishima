@@ -39,6 +39,55 @@ fn main() {
         }
         return;
     }
+    if let Some(i) = a.iter().position(|x| x == "--trace-dump") {
+        // teacher-forced pass over BASE.ids; writes the residual stream after visits 29..41 (input of visit 30 .. output of visit 41,
+        // i.e. the 12 layers of pass 3) for every token: f32 [token][13][2304]
+        use std::io::Write;
+        let base = a[i + 1].clone();
+        let outp = a[i + 2].clone();
+        let txt = std::fs::read_to_string(format!("{base}.ids")).unwrap();
+        let mut ls = txt.lines();
+        let _plen: usize = ls.next().unwrap().parse().unwrap();
+        let all: Vec<i32> = ls.next().unwrap().split(',').map(|x| x.parse().unwrap()).collect();
+        let nmax = n.min(all.len());
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&outp).unwrap());
+        let mut buf = vec![0f32; 48 * 32 * 2304];
+        let mut pos = 0;
+        while pos < nmax {
+            let t = 32.min(nmax - pos);
+            e.set_trace(buf.as_mut_ptr());
+            e.forward(&all[pos..pos + t], false, false).unwrap();
+            e.set_trace(std::ptr::null_mut());
+            if e.pending() > 128 { e.discard_pending(); }
+            for tk in 0..t {
+                for vi in 29..42 {
+                    let off = (vi * t + tk) * 2304;
+                    let bytes: Vec<u8> = buf[off..off + 2304].iter().flat_map(|x| x.to_le_bytes()).collect();
+                    f.write_all(&bytes).unwrap();
+                }
+            }
+            pos += t;
+        }
+        eprintln!("trace-dump {} tokens", nmax);
+        return;
+    }
+    if let Some(i) = a.iter().position(|x| x == "--free") {
+        // free-running greedy generation of n tokens compared with the stored reference ids (BASE.ids)
+        let base = a[i + 1].clone();
+        let txt = std::fs::read_to_string(format!("{base}.ids")).unwrap();
+        let mut ls = txt.lines();
+        let plen: usize = ls.next().unwrap().parse().unwrap();
+        let all: Vec<i32> = ls.next().unwrap().split(',').map(|x| x.parse().unwrap()).collect();
+        let refg = &all[plen..];
+        let mut cur = e.prefill(&all[..plen]).unwrap();
+        let mut out = vec![cur];
+        for _ in 1..n.min(refg.len()) { cur = e.forward(&[cur], false, true).unwrap()[0]; out.push(cur); if e.pending() > 128 { e.discard_pending(); } }
+        let first = out.iter().zip(refg.iter()).position(|(x, y)| x != y).unwrap_or(out.len());
+        let same = out.iter().zip(refg.iter()).filter(|(x, y)| x == y).count();
+        eprintln!("FREE n={} first_divergence={} positionwise_match={:.3}", out.len(), first, same as f64 / out.len() as f64);
+        println!("{}", tok.decode(&out.iter().map(|&x| x as u32).collect::<Vec<_>>(), false).unwrap());
+        return;
+    }
     if let Some(i) = a.iter().position(|x| x == "--tf") {
         use std::io::{Read, Write};
         let mode = a[i + 1].clone();
@@ -183,9 +232,12 @@ fn main() {
     }
     if a.iter().any(|x| x == "--bench-dense") {
         let names = ["q   (3072x2304)", "k   (1024x2304)", "v   (1024x2304)", "r   ( 384x2304)", "gate(3072x2304)", "wo  (2304x3072)", "head(201024x2304)", "fused launch (q,r,sink,gate,k,v)"];
-        for t in [1usize, 8] {
-            for w in 0..8 {
-                let (us, by, f8) = e.bench_dense(w, t as i32, 300).unwrap();
+        let dtl: Vec<usize> = std::env::var("XIK_BENCH_TLIST").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or(vec![1, 8]);
+        let dw: Vec<i32> = std::env::var("XIK_BENCH_WHICH").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or((0..8).collect());
+        let diters: i32 = std::env::var("XIK_BENCH_ITERS").ok().map(|v| v.parse().unwrap()).unwrap_or(300);
+        for &t in &dtl {
+            for &w in &dw {
+                let (us, by, f8) = e.bench_dense(w, t as i32, diters).unwrap();
                 eprintln!("T={t} {:34} {}: {:8.1} us  {:8.2} MB  = {:6.1} GB/s  (floor @456: {:7.1} us)", names[w as usize], if f8 { "fp8 " } else { "bf16" }, us, by / 1e6, by / us / 1e3, by / 456e3);
             }
         }
@@ -202,12 +254,16 @@ fn main() {
         return;
     }
     if a.iter().any(|x| x == "--bench-moe") {
-        for t in [1, 8] {
-            for kind in 0..2 {
-                for cfg in 0..4 {
+        let tl: Vec<i32> = std::env::var("XIK_BENCH_TLIST").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or(vec![1, 8]);
+        let cfgs: Vec<i32> = std::env::var("XIK_BENCH_CFGS").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or(vec![0, 1, 2, 3]);
+        let kinds: Vec<i32> = std::env::var("XIK_BENCH_KINDS").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or(vec![0, 1]);
+        let iters: i32 = std::env::var("XIK_BENCH_ITERS").ok().map(|v| v.parse().unwrap()).unwrap_or(200);
+        for &t in &tl {
+            for &kind in &kinds {
+                for &cfg in &cfgs {
                     let mut v = vec![];
                     for layer in [0, 7, 13] {
-                        let (us, by) = e.bench_moe(layer, kind, cfg, t, 200).unwrap();
+                        let (us, by) = e.bench_moe(layer, kind, cfg, t, iters).unwrap();
                         v.push((us, by));
                     }
                     let us = v.iter().map(|x| x.0).sum::<f64>() / 3.0;

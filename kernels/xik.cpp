@@ -1007,7 +1007,7 @@ void k_group(xik_ctx *c, int np, int maxper) {
 template <int KS, int R, int NB>
 ESIMD_INLINE void moe_fp4_body(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13,
                                const int32_t *ids, int cnt, int per, float g, float *Y, size_t ystride, int ldy, int rb,
-                               int ks, int stage) {
+                               int ks, int stage, uint64_t *tsq = nullptr) {
   using namespace es;
   simd<float, 16 * R> acc = 0.f;
   simd<uint32_t, 16> fold = 0;  // stage 1-3 (benchmark only): every loaded / unpacked lane feeds this
@@ -1081,6 +1081,11 @@ ESIMD_INLINE void moe_fp4_body(const uint32_t *wp, const uint32_t *sp, const syc
 #pragma unroll
           for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) += res.template select<16, 1>(16 * r) * sc;
         }
+        if (tsq && (s == 0 || s == per / 4 || s == per / 2 || s == (3 * per) / 4) &&
+            sycl::bit_cast<uint32_t>((float)acc[0]) != 0x7fc12345u) {  // diagnostic: progress timestamps, ordered after tile s's data
+          simd<uint64_t, 1> tv = es::rdtsc();
+          tv.copy_to(tsq + (s == 0 ? 0 : s == per / 4 ? 1 : s == per / 2 ? 2 : 3));
+        }
         if (s + NB < per) load(u, s + NB);
       }
     }
@@ -1108,6 +1113,8 @@ void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
   size_t nthreads = (size_t)maxslots * nrb * KS;
   static const int stage_s = getenv("XIK_FP4_STAGE") ? atoi(getenv("XIK_FP4_STAGE")) : 4;
   const int stage = stage_s;
+  static const bool fastdiv_s = !getenv("XIK_NO_FASTDIV");
+  const bool fastdiv = fastdiv_s;
   uint64_t *const ts = g_ts;
   static const unsigned perm_m = getenv("XIK_PERM") ? (unsigned)atoi(getenv("XIK_PERM")) : 1;  // diagnostic: gid -> task bijection
   const unsigned pm = perm_m;
@@ -1116,17 +1123,27 @@ void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
     size_t hw_gid = it.get_global_id(0);
     size_t gid = pm == 1 ? hw_gid : (hw_gid * pm) % (it.get_global_range(0));
     uint64_t t_start = ts ? es::rdtsc() : 0;
+    uint64_t *const tsq = ts ? ts + 8 * hw_gid + 2 : nullptr;
     int ks = (int)(gid % KS);
-    size_t r1 = gid / KS;
-    int rb = (int)(r1 % nrb);
-    int j = (int)(r1 / nrb);
+    int rb, j;
+    if (nrb == 144 && fastdiv) {  // constant divisor: multiply-shift instead of the emulated 64-bit division subroutine call
+      uint32_t r1 = (uint32_t)gid / KS;
+      rb = (int)(r1 % 144u);
+      j = (int)(r1 / 144u);
+    } else {
+      size_t r1 = gid / KS;
+      rb = (int)(r1 % nrb);
+      j = (int)(r1 / nrb);
+    }
     simd<int32_t, 16> d = block_load<int32_t, 16>(desc + j * 16);
     int cnt = d[1];
+    if (tsq && cnt != 0x7fc12345) { simd<uint64_t, 1> tv = es::rdtsc(); tv.copy_to(tsq + 4); }  // diagnostic: descriptor arrived
     if (cnt <= 0) return;
     int e = d[0];
     const uint32_t *wp = reinterpret_cast<const uint32_t *>(Wp) + (((size_t)e * nrb + rb) * nst + ks * per) * 128;
     const uint32_t *sp = reinterpret_cast<const uint32_t *>(Sp) + (((size_t)e * nrb + rb) * nst + ks * per) * 16;
     float g = amax[e] / den[0] * 16384.0f;
+    if (tsq && sycl::bit_cast<uint32_t>(g) != 0x7fc12345u) { simd<uint64_t, 1> tv = es::rdtsc(); tv.copy_to(tsq + 5); }  // diagnostic: amax/den arrived
     for (int g0 = 0; g0 < cnt; g0 += 8) {
       int n = cnt - g0 < 8 ? cnt - g0 : 8;
       int32_t ids[8];
@@ -1136,16 +1153,16 @@ void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
       } else {
         for (int r = 0; r < 8; r++) ids[r] = elist[(size_t)e * maxper + g0 + (r < n ? r : 0)];
       }
-      if (n <= 1) moe_fp4_body<KS, 1, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage);
-      else if (n <= 2) moe_fp4_body<KS, 2, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage);
-      else if (n <= 4) moe_fp4_body<KS, 4, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage);
-      else moe_fp4_body<KS, 8, (NB > 2 ? 2 : NB)>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage);
+      if (n <= 1) moe_fp4_body<KS, 1, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
+      else if (n <= 2) moe_fp4_body<KS, 2, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
+      else if (n <= 4) moe_fp4_body<KS, 4, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
+      else moe_fp4_body<KS, 8, (NB > 2 ? 2 : NB)>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
     }
     if (ts) {
       simd<uint64_t, 2> v;
       v[0] = t_start;
       v[1] = es::rdtsc();
-      v.copy_to(ts + 2 * hw_gid);
+      v.copy_to(ts + 8 * hw_gid);
     }
   });
 }
@@ -3006,6 +3023,10 @@ static void enqueue_body(xik_ctx *c, int T, int rows, bool out_argmax, int pos0)
     auto capv = [&]() { if (vi == 5) k_capture(c, f.cur, 0, T); else if (vi == 23) k_capture(c, f.cur, 1, T); else if (vi == 41) k_capture(c, f.cur, 2, T); };
     for (int l = 0; l < CORE0; l++) { capv(); run_layer(c, f, l, 0, T, pos0, false); trace(); }
     static const int npass_use = getenv("XIK_PASSES") ? std::max(1, std::min(NPASS, atoi(getenv("XIK_PASSES")))) : NPASS;  // APPROXIMATE mode: fewer loop passes
+    static const char *skip_env = getenv("XIK_SKIP_LAYERS");  // e.g. "17,16": layers (6..17) skipped in pass XIK_SKIP_PASS (default 2)
+    static const int skip_pass = getenv("XIK_SKIP_PASS") ? atoi(getenv("XIK_SKIP_PASS")) : 2;
+    static const unsigned skip_mask = [] { unsigned m = 0; if (const char *e = getenv("XIK_SKIP_LAYERS")) { for (const char *q = e; *q;) { int v = atoi(q); if (v >= CORE0 && v < CORE1) m |= 1u << (v - CORE0); while (*q && *q != ',') q++; if (*q) q++; } } return m; }();
+    const bool skip_on = skip_env && skip_mask;
     for (int p = 0; p < npass_use; p++) {
       if (p > 0) {
         if (p > 1) { f.freel.push_back(f.bank[0]); f.freel.push_back(f.bank[1]); }
@@ -3021,6 +3042,17 @@ static void enqueue_body(xik_ctx *c, int T, int rows, bool out_argmax, int pos0)
         f.nb = 1;  // blocks = [emb]; layer 6 (a boundary) re-appends the prelude stream
       }
       for (int l = CORE0; l < CORE1; l++) {
+        if (skip_on && p == skip_pass && ((skip_mask >> (l - CORE0)) & 1)) {  // APPROXIMATE mode: layer skipped in this pass
+          if (l % BLK == 0) {  // block boundary: keep the block bookkeeping, new stream starts as a copy of the old one
+            f.blk[f.nb++] = f.cur;
+            float *nc = f.pop();
+            c->q.memcpy(nc, f.cur, (size_t)T * D * 4);
+            f.cur = nc;
+          }
+          capv();
+          trace();
+          continue;
+        }
         if (p > 0) {
           int ci = l - CORE0;
           MixArgs a{};
@@ -3348,24 +3380,88 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
       }
       fprintf(stderr, "PROF kind=%d T=%d kernels=%zu dur=%.2f (min %.2f) period=%.2f (min %.2f) gap=%.2f us\n", kind, T, k.size(), sd / n, mind, sp / n, minp, sg / n);
     }
+    if (getenv("XIK_BENCH_FIRST") && !fp8l && kind == 0 && T == 1) {  // first-load latency of a fresh kernel (rdtsc start -> data arrived)
+      uint64_t *buf = sycl::malloc_device<uint64_t>(2 * 1152, c->q.q);
+      std::vector<uint64_t> h(2 * 1152);
+      const int32_t *hot = c->desc;
+      auto probe = [&](int mode, const char *name) {
+        for (int rep = 0; rep < 3; rep++) {
+          const uint8_t *cold = c->L[(layer + rep * 3) % 20].w13;
+          c->q.memset(buf, 0, 2 * 1152 * 8).wait();
+          if (mode == 1) c->q.single_task([=]() { ((volatile int32_t *)hot)[0] = 1; });          // write the line in the preceding kernel
+          c->q.parallel_for(nd_range<1>(1152, 16), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            using namespace es;
+            size_t g = it.get_global_id(0);
+            uint64_t t0 = es::rdtsc();
+            simd<int32_t, 16> v;
+            if (mode == 2) v = block_load<int32_t, 16>(reinterpret_cast<const int32_t *>(cold) + g * 16384);  // distinct 64 KB apart
+            else v = block_load<int32_t, 16>(hot);
+            uint64_t t1 = t0;
+            if (v[0] != 0x7fc12345) t1 = es::rdtsc();
+            simd<uint64_t, 2> o; o[0] = t0; o[1] = t1;
+            o.copy_to(buf + 2 * g);
+          });
+          c->q.wait();
+          c->q.memcpy(h.data(), buf, 2 * 1152 * 8).wait();
+          uint64_t b = ~0ull; for (int i = 0; i < 1152; i++) b = std::min(b, h[2 * i]);
+          std::vector<double> lat; for (int i = 0; i < 1152; i++) lat.push_back((h[2 * i + 1] - h[2 * i]) / 2400.0);
+          std::sort(lat.begin(), lat.end());
+          fprintf(stderr, "FIRST %-34s first-load latency us p10/p50/p90/max = %.2f/%.2f/%.2f/%.2f\n", name, lat[115], lat[576], lat[1036], lat[1151]);
+        }
+      };
+      // instruction-fetch probe: NI straight-line ALU instructions (dependent on t0, cannot be folded) before the hot load
+      auto probe_code = [&](auto NIc, const char *name) {
+        constexpr int NI = decltype(NIc)::value;
+        for (int rep = 0; rep < 3; rep++) {
+          c->q.memset(buf, 0, 2 * 1152 * 8).wait();
+          c->q.parallel_for(nd_range<1>(1152, 16), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            using namespace es;
+            size_t g = it.get_global_id(0);
+            uint64_t t0 = es::rdtsc();
+            simd<int32_t, 16> x = (int32_t)(t0 & 0xff) + simd<int32_t, 16>(0, 1);
+#pragma unroll
+            for (int i = 0; i < NI; i++) x = x * (2 * i + 3) + (i ^ 0x55);
+            simd<int32_t, 16> v = block_load<int32_t, 16>(hot);
+            v ^= x;
+            uint64_t t1 = t0;
+            if (v[0] != 0x7fc12345) t1 = es::rdtsc();
+            simd<uint64_t, 2> o; o[0] = t0; o[1] = t1;
+            o.copy_to(buf + 2 * g);
+          });
+          c->q.wait();
+          c->q.memcpy(h.data(), buf, 2 * 1152 * 8).wait();
+          std::vector<double> lat; for (int i = 0; i < 1152; i++) lat.push_back((h[2 * i + 1] - h[2 * i]) / 2400.0);
+          std::sort(lat.begin(), lat.end());
+          fprintf(stderr, "FIRST %-34s  start->load-arrived us p10/p50/p90/max = %.2f/%.2f/%.2f/%.2f\n", name, lat[115], lat[576], lat[1036], lat[1151]);
+        }
+      };
+      probe_code(std::integral_constant<int, 16>{}, "16 ALU instr before load");
+      probe_code(std::integral_constant<int, 256>{}, "256 ALU instr before load");
+      probe_code(std::integral_constant<int, 1024>{}, "1024 ALU instr before load");
+      probe_code(std::integral_constant<int, 4096>{}, "4096 ALU instr before load");
+      probe(0, "hot buffer, no write before");
+      probe(1, "hot buffer written by prev kernel");
+      probe(2, "distinct cold weight lines (64KB apart)");
+      sycl::free(buf, c->q.q);
+    }
     if (getenv("XIK_BENCH_TS") && !fp8l) {  // per-thread start/end timeline of one cold kernel
       size_t nth = (size_t)slots * (kind == 0 ? 2 * FI : D) / 16 * nks;
-      uint64_t *buf = sycl::malloc_device<uint64_t>(2 * nth, c->q.q);
-      std::vector<uint64_t> h(2 * nth);
+      uint64_t *buf = sycl::malloc_device<uint64_t>(8 * nth, c->q.q);
+      std::vector<uint64_t> h(8 * nth);
       for (int rep = 0; rep < 3; rep++) {
-        c->q.memset(buf, 0, 2 * nth * 8).wait();
+        c->q.memset(buf, 0, 8 * nth * 8).wait();
         g_ts = buf;
         run();
         c->q.wait();
         g_ts = nullptr;
-        c->q.memcpy(h.data(), buf, 2 * nth * 8).wait();
+        c->q.memcpy(h.data(), buf, 8 * nth * 8).wait();
         uint64_t t0 = ~0ull, t1 = 0;
         std::vector<std::pair<uint64_t, uint64_t>> th;
-        for (size_t i = 0; i < nth; i++) if (h[2 * i]) { th.push_back({h[2 * i], h[2 * i + 1]}); t0 = std::min(t0, h[2 * i]); t1 = std::max(t1, h[2 * i + 1]); }
+        for (size_t i = 0; i < nth; i++) if (h[8 * i]) { th.push_back({h[8 * i], h[8 * i + 1]}); t0 = std::min(t0, h[8 * i]); t1 = std::max(t1, h[8 * i + 1]); }
         if (th.empty()) continue;
         if (const char *dp = getenv("XIK_BENCH_TSDUMP")) {
           char fn[512]; snprintf(fn, sizeof fn, "%s.k%d.T%d.n%zu.r%d", dp, kind, T, nth, rep);
-          if (FILE *f = fopen(fn, "wb")) { fwrite(h.data(), 8, 2 * nth, f); fclose(f); }
+          if (FILE *f = fopen(fn, "wb")) { fwrite(h.data(), 8, 8 * nth, f); fclose(f); }
         }
         std::sort(th.begin(), th.end());
         std::vector<uint64_t> en; for (auto &x : th) en.push_back(x.second);

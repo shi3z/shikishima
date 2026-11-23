@@ -144,6 +144,10 @@ impl Engine {
         unsafe { ffi::xik_mem(self.ctx, o.as_mut_ptr()) };
         o
     }
+    /// Debug: residual stream after every visit of the next forward(s) is copied to `buf` ([48][T][2304] f32). Null disables.
+    pub fn set_trace(&mut self, buf: *mut f32) {
+        unsafe { ffi::xik_trace(self.ctx, buf) }
+    }
     pub fn set_moe_cfg(&mut self, cfg: i32) {
         unsafe { ffi::xik_set_moe_cfg(self.ctx, cfg) }
     }
