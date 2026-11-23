@@ -942,7 +942,7 @@ inline es::simd<uint32_t, 16> fp8_pair(es::simd<uint32_t, 16> m) {
   return ((m & 0x007F007Fu) << 7) | ((m & 0x00800080u) << 8);
 }
 
-template <int R, int NB>
+template <int R, int NB, int PF>
 ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13,
                                const int32_t *ids, int cnt, int nst, float *Y, int ldy, int rb) {
   using namespace es;
@@ -969,6 +969,13 @@ ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const syc
 #pragma unroll
   for (int u = 0; u < NB; u++)
     if (u < nst) load(u, u);
+  if constexpr (PF > 0) {
+#pragma unroll
+    for (int d = 0; d < PF; d++)
+      if (d < nst) {
+        for (int h = 0; h < 4; h++) prefetch<uint32_t, 64>(wp + (size_t)(d + NB) * 256 + h * 64, sycl::ext::oneapi::experimental::properties{es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>});
+      }
+  }
   for (int s0 = 0; s0 < nst; s0 += NB) {
 #pragma unroll
     for (int u = 0; u < NB; u++) {
@@ -1003,9 +1010,79 @@ ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const syc
 #pragma unroll
           for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) += res.template select<16, 1>(16 * r) * sc;
         }
+        if constexpr (PF > 0) {
+          if (s + NB + PF < nst) {
+#pragma unroll
+            for (int h = 0; h < 4; h++) prefetch<uint32_t, 64>(wp + (size_t)(s + NB + PF) * 256 + h * 64, sycl::ext::oneapi::experimental::properties{es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>});
+          }
+        }
         if (s + NB < nst) load(u, s + NB);
       }
     }
+  }
+#pragma unroll
+  for (int r = 0; r < R; r++)
+    if (r < cnt) {
+      simd<float, 16> o = acc.template select<16, 1>(16 * r);
+      o.copy_to(Y + (size_t)ids[r] * ldy + rb * 16);
+    }
+}
+
+
+// Split variant: the 1 KB supertile is loaded as two 512 B halves (tiles 0-1 = scale block 0, tiles 2-3 = block 1).
+// Block 0 is unpacked and multiplied while block 1 is still arriving; no extra register buffer (same 1 KB as NB=1).
+template <int R>
+ESIMD_INLINE void moe_fp8_body_split(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13,
+                                     const int32_t *ids, int cnt, int nst, float *Y, int ldy, int rb) {
+  using namespace es;
+  simd<float, 16 * R> acc = 0.f;
+  const uint32_t *xr[R];
+#pragma unroll
+  for (int r = 0; r < R; r++) {
+    int p = ids[r < cnt ? r : 0];
+    xr[r] = reinterpret_cast<const uint32_t *>(X16 + (size_t)(w13 ? p / TOPK : p) * ldx);
+  }
+  simd<uint32_t, 128> wh[2];       // wh[blk]: the two tiles of scale block blk
+  simd<uint32_t, 8> sbuf;
+  simd<uint32_t, 32 * R> xb;
+  auto load_half = [&](int blk, int s) {
+    wh[blk].template select<64, 1>(0) = block_load<uint32_t, 64>(wp + (size_t)s * 256 + blk * 128);
+    wh[blk].template select<64, 1>(64) = block_load<uint32_t, 64>(wp + (size_t)s * 256 + blk * 128 + 64);
+  };
+  auto consume = [&](int blk) {
+    simd<uint8_t, 32> s8 = sbuf.template bit_cast_view<uint8_t>();
+    simd<float, 16 * R> res = 0.f;
+#pragma unroll
+    for (int th = 0; th < 2; th++) {
+      simd<uint32_t, 128> B;
+#pragma unroll
+      for (int q = 0; q < 4; q++) {
+        simd<uint32_t, 16> xq = wh[blk].template select<16, 1>(64 * th + 16 * q);
+        simd<uint32_t, 16> m0 = xq & 0x00FF00FFu, m1 = (xq >> 8) & 0x00FF00FFu;
+        B.template select<16, 1>(16 * (2 * q)) = fp8_pair(m0);
+        B.template select<16, 1>(16 * (2 * q + 1)) = fp8_pair(m1);
+      }
+      simd<int32_t, 8 * R> a;
+#pragma unroll
+      for (int r = 0; r < R; r++) a.template select<8, 1>(8 * r) = xb.template select<8, 1>(32 * r + 8 * (blk * 2 + th)).template bit_cast_view<int32_t>();
+      simd<int32_t, 128> Bi = B.template bit_cast_view<int32_t>();
+      res = xmx::dpas<8, R, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(res, Bi, a);
+    }
+    simd<uint8_t, 16> sc8 = s8.template select<16, 1>(16 * blk);
+    simd<uint32_t, 16> sw = convert<uint32_t>(sc8);
+    simd<uint32_t, 16> sbits = (sw + 8u) << 23;
+    simd<float, 16> sc = sbits.template bit_cast_view<float>();
+#pragma unroll
+    for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) += res.template select<16, 1>(16 * r) * sc;
+  };
+  for (int s = 0; s < nst; s++) {
+    load_half(0, s);
+    sbuf = block_load<uint32_t, 8>(sp + (size_t)s * 8);
+#pragma unroll
+    for (int r = 0; r < R; r++) xb.template select<32, 1>(32 * r) = block_load<uint32_t, 32>(xr[r] + (size_t)s * 32);
+    load_half(1, s);   // issued before block 0 is consumed: its latency overlaps the unpack + DPAS of block 0
+    consume(0);
+    consume(1);
   }
 #pragma unroll
   for (int r = 0; r < R; r++)
@@ -1019,9 +1096,10 @@ ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const syc
 static int fp8_ks() { static const int v = getenv("XIK_FP8_KS") ? atoi(getenv("XIK_FP8_KS")) : 2; return v; }
 // Kernel variants that differ only in register/pipeline structure (identical arithmetic order => bit-identical results):
 //   0: 128 GRF, NB=2   1: 128 GRF, NB=1   2: 256 GRF, NB=2   3: 256 GRF, NB=1
+static int fp8_pf() { static const int v = getenv("XIK_FP8_PF") ? atoi(getenv("XIK_FP8_PF")) : 0; return v; }
 static int fp8_cfg() { static const int v = getenv("XIK_FP8_CFG") ? atoi(getenv("XIK_FP8_CFG")) : 1; return v; }
 
-template <int NB, bool G256>
+template <int NB, bool G256, int PF = 0>
 void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper,
                 int maxslots, int rows, int K, float *Y, int ldy, size_t ystride) {
   const int KSV = fp8_ks();
@@ -1052,10 +1130,17 @@ void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
       } else {
         for (int r = 0; r < 8; r++) ids[r] = elist[(size_t)e * maxper + g0 + (r < n ? r : 0)];
       }
-      if (n <= 1) moe_fp8_body<1, NB>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-      else if (n <= 2) moe_fp8_body<2, NB>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-      else if (n <= 4) moe_fp8_body<4, NB>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-      else moe_fp8_body<8, NB>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+      if constexpr (NB == 0) {
+        if (n <= 1) moe_fp8_body_split<1>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        else if (n <= 2) moe_fp8_body_split<2>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        else if (n <= 4) moe_fp8_body_split<4>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        else moe_fp8_body_split<8>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+      } else {
+        if (n <= 1) moe_fp8_body<1, NB, PF>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        else if (n <= 2) moe_fp8_body<2, NB, PF>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        else if (n <= 4) moe_fp8_body<4, NB, PF>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        else moe_fp8_body<8, NB, PF>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+      }
     }
   };
   if constexpr (G256) {
@@ -1067,10 +1152,13 @@ void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
 }
 void moe_fp8g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper,
               int maxslots, int rows, int K, float *Y, int ldy, size_t ystride) {
+  if (fp8_cfg() == 1 && fp8_pf() == 1) return moe_fp8g_t<1, false, 1>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
+  if (fp8_cfg() == 1 && fp8_pf() == 2) return moe_fp8g_t<1, false, 2>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
   switch (fp8_cfg()) {
     case 1: return moe_fp8g_t<1, false>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
     case 2: return moe_fp8g_t<2, true>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
     case 3: return moe_fp8g_t<1, true>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
+    case 4: return moe_fp8g_t<0, false>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);  // split halves
     default: return moe_fp8g_t<2, false>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
   }
 }
