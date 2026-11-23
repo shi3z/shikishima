@@ -1098,6 +1098,7 @@ ESIMD_INLINE void moe_fp4_body(const uint32_t *wp, const uint32_t *sp, const syc
   }
 }
 
+uint64_t *g_ts = nullptr;  // diagnostic: per-thread start/end rdtsc of moe_fp4g (null = off)
 template <int KS, int NB>
 void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13,
                 const float *amax, const float *den, int maxper, int maxslots, int rows, int K, float *Y,
@@ -1107,9 +1108,14 @@ void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
   size_t nthreads = (size_t)maxslots * nrb * KS;
   static const int stage_s = getenv("XIK_FP4_STAGE") ? atoi(getenv("XIK_FP4_STAGE")) : 4;
   const int stage = stage_s;
+  uint64_t *const ts = g_ts;
+  static const unsigned perm_m = getenv("XIK_PERM") ? (unsigned)atoi(getenv("XIK_PERM")) : 1;  // diagnostic: gid -> task bijection
+  const unsigned pm = perm_m;
   c->q.parallel_for(nd_range<1>(nthreads, 16), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
     using namespace es;
-    size_t gid = it.get_global_id(0);
+    size_t hw_gid = it.get_global_id(0);
+    size_t gid = pm == 1 ? hw_gid : (hw_gid * pm) % (it.get_global_range(0));
+    uint64_t t_start = ts ? es::rdtsc() : 0;
     int ks = (int)(gid % KS);
     size_t r1 = gid / KS;
     int rb = (int)(r1 % nrb);
@@ -1135,8 +1141,73 @@ void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
       else if (n <= 4) moe_fp4_body<KS, 4, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage);
       else moe_fp4_body<KS, 8, (NB > 2 ? 2 : NB)>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage);
     }
+    if (ts) {
+      simd<uint64_t, 2> v;
+      v[0] = t_start;
+      v[1] = es::rdtsc();
+      v.copy_to(ts + 2 * hw_gid);
+    }
   });
 }
+
+// Dynamic-scheduling variant (XIK_DYN=P threads, default off): persistent threads pull (slot, row-block, K-chunk) tasks
+// from an atomic counter, so a thread that runs slowly simply takes fewer tasks (the static kernel finishes at its
+// slowest thread: per-thread end times spread 46..71 us for a 52 us ideal).  Numerics of each task are those of the
+// static kernel with the same KS (fixed K-split, independent of which thread runs it).
+uint32_t *g_dyn_cnt = nullptr;
+template <int KS, int NB>
+void moe_fp4g_dyn(xik_ctx *c, int P, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13,
+                  const float *amax, const float *den, int maxper, int maxslots, int rows, int K, float *Y,
+                  size_t ystride, int ldy) {
+  int nrb = rows / 16, nst = K / 64, per = nst / KS;
+  const int32_t *desc = c->desc, *elist = c->elist;
+  const uint32_t ntasks = (uint32_t)((size_t)maxslots * nrb * KS);
+  if (!g_dyn_cnt) { g_dyn_cnt = sycl::malloc_device<uint32_t>(16, c->q.q); c->q.memset(g_dyn_cnt, 0, 64).wait(); }
+  uint32_t *const cnt_p = g_dyn_cnt;
+  const uint32_t nthr = (uint32_t)P;
+  c->q.parallel_for(nd_range<1>(nthr, 16), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+#define XIK_FETCH() (atomic_update<atomic_op::inc, uint32_t, 1>(cnt_p, simd<uint32_t, 1>(0))[0])
+    uint32_t next = XIK_FETCH();
+    while (true) {
+      uint32_t tk = next;
+      if (tk >= ntasks) {
+        if (tk == ntasks + nthr - 1) {  // last failing fetch of the last thread: reset for the next launch
+          simd<uint32_t, 1> off = 0, z = 0;
+          atomic_update<atomic_op::store, uint32_t, 1>(cnt_p, off, z);
+        }
+        break;
+      }
+      next = XIK_FETCH();
+      int ks = (int)(tk % KS);
+      size_t r1 = tk / KS;
+      int rb = (int)(r1 % nrb);
+      int j = (int)(r1 / nrb);
+      simd<int32_t, 16> d = block_load<int32_t, 16>(desc + j * 16);
+      int cnt = d[1];
+      if (cnt <= 0) continue;
+      int e = d[0];
+      const uint32_t *wp = reinterpret_cast<const uint32_t *>(Wp) + (((size_t)e * nrb + rb) * nst + ks * per) * 128;
+      const uint32_t *sp = reinterpret_cast<const uint32_t *>(Sp) + (((size_t)e * nrb + rb) * nst + ks * per) * 16;
+      float g = amax[e] / den[0] * 16384.0f;
+      for (int g0 = 0; g0 < cnt; g0 += 8) {
+        int n = cnt - g0 < 8 ? cnt - g0 : 8;
+        int32_t ids[8];
+        if (g0 == 0) {
+#pragma unroll
+          for (int r = 0; r < 8; r++) ids[r] = d[2 + r];
+        } else {
+          for (int r = 0; r < 8; r++) ids[r] = elist[(size_t)e * maxper + g0 + (r < n ? r : 0)];
+        }
+        if (n <= 1) moe_fp4_body<KS, 1, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, 4);
+        else if (n <= 2) moe_fp4_body<KS, 2, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, 4);
+        else if (n <= 4) moe_fp4_body<KS, 4, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, 4);
+        else moe_fp4_body<KS, 8, (NB > 2 ? 2 : NB)>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, 4);
+      }
+    }
+  });
+}
+int dyn_threads() { static const int v = getenv("XIK_DYN") ? atoi(getenv("XIK_DYN")) : 0; return v; }
 
 // configurations: index -> (K split, pipeline depth). nks = K split (partial-sum buffers).
 struct MoeCfg { int ks, nb; };
@@ -1145,6 +1216,12 @@ constexpr int NMOE_CFG = 8;
 void moe_fp4g(xik_ctx *c, int cfg, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13,
               const float *amax, const float *den, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride,
               int ldy) {
+  if (dyn_threads() > 0) {
+    if (cfg == 1) return moe_fp4g_dyn<1, 2>(c, dyn_threads(), Wp, Sp, X16, ldx, w13, amax, den, maxper, maxslots, rows, K, Y, ystride, ldy);
+    if (cfg == 0) return moe_fp4g_dyn<2, 2>(c, dyn_threads(), Wp, Sp, X16, ldx, w13, amax, den, maxper, maxslots, rows, K, Y, ystride, ldy);
+    if (cfg == 2) return moe_fp4g_dyn<4, 2>(c, dyn_threads(), Wp, Sp, X16, ldx, w13, amax, den, maxper, maxslots, rows, K, Y, ystride, ldy);
+    if (cfg == 3) return moe_fp4g_dyn<8, 2>(c, dyn_threads(), Wp, Sp, X16, ldx, w13, amax, den, maxper, maxslots, rows, K, Y, ystride, ldy);
+  }
 #define MC(I, KS, NB) if (cfg == I) return moe_fp4g_t<KS, NB>(c, Wp, Sp, X16, ldx, w13, amax, den, maxper, maxslots, rows, K, Y, ystride, ldy);
   MC(0, 2, 2) MC(1, 1, 2) MC(2, 4, 2) MC(3, 8, 2) MC(4, 2, 3) MC(5, 2, 4) MC(6, 4, 3) MC(7, 4, 4)
 #undef MC
@@ -3217,6 +3294,10 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
         else if (mode == 3) r[p] = (k * 2 + tk) % NE;            // stride 2
       }
     }
+    if (const char *pd = getenv("XIK_BENCH_DIST")) {  // n distinct experts (duplicates across the T*8 picks): fixed-vs-slope fit
+      int n = std::max(1, std::min(atoi(pd), np));
+      for (int p = 0; p < np; p++) r[p] = ((p % n) * 7 + 3) % NE;
+    }
     c->q.memcpy(c->ridx, r.data(), np * 4).wait();
     k_group(c, np, T);
     c->q.wait();
@@ -3248,6 +3329,56 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
     c->q.wait();
     double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
     *out_us = us;
+    if (getenv("XIK_BENCH_PROF")) {  // GPU-timestamp decomposition: kernel duration vs start-to-start period vs idle gap
+      c->q.wait();
+      c->q.evs.clear(); c->q.rec = true; c->q.tag = 0;
+      for (int i = 0; i < 100; i++) run();
+      c->q.wait();
+      c->q.rec = false;
+      std::vector<std::pair<double, double>> k;
+      for (auto &p : c->q.evs) k.push_back({p.second.get_profiling_info<sycl::info::event_profiling::command_start>() * 1e-3,
+                                            p.second.get_profiling_info<sycl::info::event_profiling::command_end>() * 1e-3});
+      c->q.evs.clear();
+      std::sort(k.begin(), k.end());
+      double sd = 0, sp = 0, sg = 0; int n = 0; double mind = 1e30, minp = 1e30;
+      for (size_t i = 1; i + 1 < k.size(); i++) {
+        double d = k[i].second - k[i].first, per = k[i + 1].first - k[i].first, gap = k[i + 1].first - k[i].second;
+        sd += d; sp += per; sg += gap; n++; mind = std::min(mind, d); minp = std::min(minp, per);
+      }
+      fprintf(stderr, "PROF kind=%d T=%d kernels=%zu dur=%.2f (min %.2f) period=%.2f (min %.2f) gap=%.2f us\n", kind, T, k.size(), sd / n, mind, sp / n, minp, sg / n);
+    }
+    if (getenv("XIK_BENCH_TS") && !fp8l) {  // per-thread start/end timeline of one cold kernel
+      size_t nth = (size_t)slots * (kind == 0 ? 2 * FI : D) / 16 * nks;
+      uint64_t *buf = sycl::malloc_device<uint64_t>(2 * nth, c->q.q);
+      std::vector<uint64_t> h(2 * nth);
+      for (int rep = 0; rep < 3; rep++) {
+        c->q.memset(buf, 0, 2 * nth * 8).wait();
+        g_ts = buf;
+        run();
+        c->q.wait();
+        g_ts = nullptr;
+        c->q.memcpy(h.data(), buf, 2 * nth * 8).wait();
+        uint64_t t0 = ~0ull, t1 = 0;
+        std::vector<std::pair<uint64_t, uint64_t>> th;
+        for (size_t i = 0; i < nth; i++) if (h[2 * i]) { th.push_back({h[2 * i], h[2 * i + 1]}); t0 = std::min(t0, h[2 * i]); t1 = std::max(t1, h[2 * i + 1]); }
+        if (th.empty()) continue;
+        if (const char *dp = getenv("XIK_BENCH_TSDUMP")) {
+          char fn[512]; snprintf(fn, sizeof fn, "%s.k%d.T%d.n%zu.r%d", dp, kind, T, nth, rep);
+          if (FILE *f = fopen(fn, "wb")) { fwrite(h.data(), 8, 2 * nth, f); fclose(f); }
+        }
+        std::sort(th.begin(), th.end());
+        std::vector<uint64_t> en; for (auto &x : th) en.push_back(x.second);
+        std::sort(en.begin(), en.end());
+        auto q = [&](std::vector<uint64_t> &v, double f) { return (double)(v[(size_t)(f * (v.size() - 1))] - t0); };
+        std::vector<uint64_t> st; for (auto &x : th) st.push_back(x.first);
+        std::vector<uint64_t> dur; for (auto &x : th) dur.push_back(x.second - x.first);
+        std::sort(dur.begin(), dur.end());
+        fprintf(stderr, "TS kind=%d T=%d threads=%zu span=%llu ticks | start p0/50/90/100=%.0f/%.0f/%.0f/%.0f | end p0/10/50/90/100=%.0f/%.0f/%.0f/%.0f/%.0f | dur p0/50/100=%llu/%llu/%llu\n",
+                kind, T, th.size(), (unsigned long long)(t1 - t0), q(st, 0), q(st, .5), q(st, .9), q(st, 1), q(en, 0), q(en, .1), q(en, .5), q(en, .9), q(en, 1),
+                (unsigned long long)dur[0], (unsigned long long)dur[dur.size() / 2], (unsigned long long)dur.back());
+      }
+      sycl::free(buf, c->q.q);
+    }
     if (fp8l) *out_bytes = (double)distinct * (kind == 0 ? (2.0 * FI * D * (1 + 1.0 / 32)) : ((double)D * FI * (1 + 1.0 / 32)));
     else *out_bytes = (double)distinct * (kind == 0 ? (2.0 * FI * D / 2 + 2.0 * FI * D / 16) : ((double)D * FI / 2 + (double)D * FI / 16));
     return 0;
