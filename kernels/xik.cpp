@@ -1007,9 +1007,10 @@ void k_group(xik_ctx *c, int np, int maxper) {
 template <int KS, int R, int NB>
 ESIMD_INLINE void moe_fp4_body(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13,
                                const int32_t *ids, int cnt, int per, float g, float *Y, size_t ystride, int ldy, int rb,
-                               int ks) {
+                               int ks, int stage) {
   using namespace es;
   simd<float, 16 * R> acc = 0.f;
+  simd<uint32_t, 16> fold = 0;  // stage 1-3 (benchmark only): every loaded / unpacked lane feeds this
   const uint32_t *xr[R];
 #pragma unroll
   for (int r = 0; r < R; r++) {
@@ -1035,7 +1036,15 @@ ESIMD_INLINE void moe_fp4_body(const uint32_t *wp, const uint32_t *sp, const syc
 #pragma unroll
     for (int u = 0; u < NB; u++) {
       int s = s0 + u;
-      if (s < per) {
+      if (s < per && stage == 1) {
+        // load only: fold every dword that arrived
+#pragma unroll
+        for (int i = 0; i < 8; i++) fold ^= wb[u].template select<16, 1>(16 * i);
+        fold ^= sb[u];
+#pragma unroll
+        for (int i = 0; i < 2 * R; i++) fold ^= xb[u].template select<16, 1>(16 * i);
+        if (s + NB < per) load(u, s + NB);
+      } else if (s < per) {
         simd<uint8_t, 64> s8 = sb[u].template bit_cast_view<uint8_t>();
 #pragma unroll
         for (int b = 0; b < 4; b++) {
@@ -1045,6 +1054,18 @@ ESIMD_INLINE void moe_fp4_body(const uint32_t *wp, const uint32_t *sp, const syc
           for (int r = 0; r < 4; r++) {
             B.template select<16, 1>(16 * r) = fp4_pair(R0 >> (4 * r));
             B.template select<16, 1>(16 * (r + 4)) = fp4_pair(R1 >> (4 * r));
+          }
+          if (stage == 2 || stage == 3) {
+#pragma unroll
+            for (int i = 0; i < 8; i++) fold ^= B.template select<16, 1>(16 * i);
+            if (stage == 3) {
+              simd<uint8_t, 16> sc8 = s8.template select<16, 1>(16 * b);
+              simd<uint32_t, 16> sw = convert<uint32_t>(sc8);
+              simd<uint32_t, 16> sbits = (sw & 0x7Fu) << 20;
+              simd<float, 16> sc = sbits.template bit_cast_view<float>() * 1.329227995784916e36f;
+              fold ^= sc.template bit_cast_view<uint32_t>();
+            }
+            continue;
           }
           simd<int32_t, 8 * R> a;
 #pragma unroll
@@ -1064,6 +1085,10 @@ ESIMD_INLINE void moe_fp4_body(const uint32_t *wp, const uint32_t *sp, const syc
       }
     }
   }
+  if (stage != 4) {
+#pragma unroll
+    for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) = fold.template bit_cast_view<float>();
+  }
 #pragma unroll
   for (int r = 0; r < R; r++) {
     if (r < cnt) {
@@ -1080,6 +1105,8 @@ void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
   int nrb = rows / 16, nst = K / 64, per = nst / KS;
   const int32_t *desc = c->desc, *elist = c->elist;
   size_t nthreads = (size_t)maxslots * nrb * KS;
+  static const int stage_s = getenv("XIK_FP4_STAGE") ? atoi(getenv("XIK_FP4_STAGE")) : 4;
+  const int stage = stage_s;
   c->q.parallel_for(nd_range<1>(nthreads, 16), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
     using namespace es;
     size_t gid = it.get_global_id(0);
@@ -1103,10 +1130,10 @@ void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
       } else {
         for (int r = 0; r < 8; r++) ids[r] = elist[(size_t)e * maxper + g0 + (r < n ? r : 0)];
       }
-      if (n <= 1) moe_fp4_body<KS, 1, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks);
-      else if (n <= 2) moe_fp4_body<KS, 2, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks);
-      else if (n <= 4) moe_fp4_body<KS, 4, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks);
-      else moe_fp4_body<KS, 8, (NB > 2 ? 2 : NB)>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks);
+      if (n <= 1) moe_fp4_body<KS, 1, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage);
+      else if (n <= 2) moe_fp4_body<KS, 2, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage);
+      else if (n <= 4) moe_fp4_body<KS, 4, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage);
+      else moe_fp4_body<KS, 8, (NB > 2 ? 2 : NB)>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage);
     }
   });
 }
@@ -3181,6 +3208,15 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
     int np = T * TOPK;
     std::vector<int32_t> r(np);
     for (int p = 0; p < np; p++) r[p] = (p * 7 + 3 + (p / 8) * 11) % NE;
+    if (const char *pe = getenv("XIK_BENCH_EXP")) {  // expert placement experiment (T=1 pattern, later tokens offset)
+      int mode = atoi(pe);
+      for (int p = 0; p < np; p++) {
+        int k = p % 8, tk = p / 8;
+        if (mode == 1) r[p] = (k + 8 * tk) % NE;                 // C: 8 contiguous experts
+        else if (mode == 2) r[p] = (k * 16 + 1 + tk) % NE;       // D: widest spread, stride 16
+        else if (mode == 3) r[p] = (k * 2 + tk) % NE;            // stride 2
+      }
+    }
     c->q.memcpy(c->ridx, r.data(), np * 4).wait();
     k_group(c, np, T);
     c->q.wait();
@@ -3197,7 +3233,8 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
         else moe_fp8g(c, lq.w2, lq.w2_s, c->x16_act, FI, false, T, slots, D, FI, c->yp_part, D, (size_t)np * D);
         return;
       }
-      const LayerW &lq = c->L[(layer + (it++ % 20)) % 20];  // rotate over 20 layers: weights are cold every call
+      static const int nrot = getenv("XIK_BENCH_ROT") ? atoi(getenv("XIK_BENCH_ROT")) : 20;  // 20 = cold; 1 = same layer every call (TLB warm)
+      const LayerW &lq = c->L[(layer + (it++ % nrot)) % 20];  // rotate over layers: weights are cold every call
       if (kind == 0)
         moe_fp4g(c, cfg, lq.w13, lq.w13_s, c->x16_in, D, true, lq.w13_amax, lq.w13_den, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
       else
