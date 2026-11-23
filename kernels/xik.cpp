@@ -170,6 +170,7 @@ void phase(xik_ctx *c, int id) {
   c->tprev = now;
 }
 
+static bool lat_on() { static const bool v = getenv("XIK_LAT") && atoi(getenv("XIK_LAT")); return v; }
 // --------------------------------------------------------------- GEMV (bf16)
 // Y[t][row] = sum_k W[row][k] * X[t][k]; one sub-group (16 lanes) handles R rows
 // and TB tokens, so every x element is loaded once per R rows.
@@ -179,6 +180,7 @@ void gemv_bf16_t(queue &q, const uint16_t *W, const float *X, int ldx, float *Y,
   int nsg = rows / R;
   int wg = 128;
   int nwg = (nsg * 16 + wg - 1) / wg;
+  const bool lat = lat_on();
   q.parallel_for(nd_range<1>(nwg * wg, wg), [=](nd_item<1> it) SUBGROUP16 {
     auto sg = it.get_sub_group();
     int lane = sg.get_local_linear_id();
@@ -187,6 +189,42 @@ void gemv_bf16_t(queue &q, const uint16_t *W, const float *X, int ldx, float *Y,
     float acc[R][TB];
     for (int r = 0; r < R; r++)
       for (int t = 0; t < TB; t++) acc[r][t] = 0.f;
+    if (lat && TB == 1 && R == 4) {
+      // same per-lane accumulation order as the plain loop below; U iterations' loads are issued together
+      constexpr int U = 3;
+      for (int kb = lane; kb < K / 8; kb += 16 * U) {
+        vec<float, 4> xa[U], xb[U];
+        vec<uint32_t, 4> wv[U][R];
+#pragma unroll
+        for (int j = 0; j < U; j++) {
+          int k8 = kb + 16 * j;
+          if (k8 < K / 8) {
+            xa[j] = *reinterpret_cast<const vec<float, 4> *>(X + k8 * 8);
+            xb[j] = *reinterpret_cast<const vec<float, 4> *>(X + k8 * 8 + 4);
+#pragma unroll
+            for (int r = 0; r < R; r++) wv[j][r] = *reinterpret_cast<const vec<uint32_t, 4> *>(W + (size_t)(row0 + r) * K + k8 * 8);
+          }
+        }
+#pragma unroll
+        for (int j = 0; j < U; j++) {
+          int k8 = kb + 16 * j;
+          if (k8 < K / 8) {
+            float xv0[8];
+            for (int i = 0; i < 4; i++) { xv0[i] = xa[j][i]; xv0[4 + i] = xb[j][i]; }
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+              float wf[8];
+              for (int i = 0; i < 4; i++) {
+                wf[2 * i] = sycl::bit_cast<float>(wv[j][r][i] << 16);
+                wf[2 * i + 1] = sycl::bit_cast<float>(wv[j][r][i] & 0xFFFF0000u);
+              }
+              for (int i = 0; i < 8; i++) acc[r][0] += wf[i] * xv0[i];
+            }
+          }
+        }
+      }
+    }
+    else
     for (int k8 = lane; k8 < K / 8; k8 += 16) {
       float xv[TB][8];
       for (int t = 0; t < TB; t++) {
@@ -1626,14 +1664,30 @@ struct BlendArgs {
 // out = rbf(rms((1 - tanh f) * dest + tanh g * msg) * w)
 template <int N>
 void k_blend_t(xik_ctx *c, const BlendArgs &a, int T) {
+  const bool lat = lat_on();
   c->q.parallel_for(nd_range<1>((size_t)T * N * 256, 256), [=](nd_item<1> it) {
     int gi = it.get_group(0), l = it.get_local_id(0);
     int t = gi / N, k = gi % N;
     float v[9], ss = 0.f;
-    for (int i = 0; i < 9; i++) {
-      size_t o = (size_t)t * D + l + i * 256;
-      v[i] = (1.f - sycl::tanh(a.f[k][o])) * a.dest[k][o] + sycl::tanh(a.g[k][o]) * a.msg[k][o];
-      ss += v[i] * v[i];
+    if (lat) {
+      // all 36 independent loads are issued before the first use (one latency instead of nine); arithmetic order unchanged
+      float fv[9], gv[9], dv[9], mv[9];
+#pragma unroll
+      for (int i = 0; i < 9; i++) {
+        size_t o = (size_t)t * D + l + i * 256;
+        fv[i] = a.f[k][o]; gv[i] = a.g[k][o]; dv[i] = a.dest[k][o]; mv[i] = a.msg[k][o];
+      }
+#pragma unroll
+      for (int i = 0; i < 9; i++) {
+        v[i] = (1.f - sycl::tanh(fv[i])) * dv[i] + sycl::tanh(gv[i]) * mv[i];
+        ss += v[i] * v[i];
+      }
+    } else {
+      for (int i = 0; i < 9; i++) {
+        size_t o = (size_t)t * D + l + i * 256;
+        v[i] = (1.f - sycl::tanh(a.f[k][o])) * a.dest[k][o] + sycl::tanh(a.g[k][o]) * a.msg[k][o];
+        ss += v[i] * v[i];
+      }
     }
     ss = reduce_over_group(it.get_group(), ss, plus<float>());
     float inv = sycl::rsqrt(ss / D + EPS);
@@ -1852,6 +1906,66 @@ void k_router(xik_ctx *c, const LayerW &lw, int T) {
     }
   });
 }
+
+// T == 1 fusion of k_router + k_cvt_f16 + k_group (one work-group of NE items; same arithmetic, same results).
+// k_group reads ridx[p] for p < 8; every work-item already holds the chosen experts, so no global round trip is needed.
+void k_route_fused1(xik_ctx *c, const LayerW &lw) {
+  const float *logit = c->tmp1;
+  const float *bias = lw.router_bias;
+  int32_t *ridx = c->ridx;
+  float *rwt = c->rwt;
+  const float *xin = c->in[0];
+  sycl::half *x16 = c->x16_in;
+  int32_t *ecnt = c->ecnt, *elist = c->elist, *actl = c->act_e, *nact = c->nact, *desc = c->desc;
+  const int np = TOPK, maxper = 1, maxslots = std::min(NE, TOPK);
+  c->q.parallel_for(nd_range<1>(NE, NE), [=](nd_item<1> it) {
+    int e = it.get_local_id(0);
+    auto g = it.get_group();
+    // ---- k_cvt_f16 (independent of routing)
+    for (int i = e; i < D; i += NE) x16[i] = (sycl::half)xin[i];
+    // ---- k_router (identical code, t = 0)
+    float s = sigmoidf(logit[e]);
+    float sel = s + bias[e];
+    float chosen_w[TOPK];
+    int chosen_i[TOPK];
+    float cur = sel;
+    for (int k = 0; k < TOPK; k++) {
+      float m = reduce_over_group(g, cur, maximum<float>());
+      int cand = (cur == m) ? e : NE;
+      int idx = reduce_over_group(g, cand, minimum<int>());
+      float sw = group_broadcast(g, s, idx);
+      chosen_i[k] = idx;
+      chosen_w[k] = sw;
+      if (e == idx) cur = -3.0e38f;
+    }
+    if (e == 0) {
+      float sum = 0.f;
+      for (int k = 0; k < TOPK; k++) sum += chosen_w[k];
+      for (int k = 0; k < TOPK; k++) {
+        ridx[k] = chosen_i[k];
+        rwt[k] = chosen_w[k] / (sum + 1e-20f) * ROUTE_SCALE;
+      }
+    }
+    // ---- k_group (identical code; ridx[p] == chosen_i[p])
+    int cnt = 0;
+    for (int p = 0; p < np; p++)
+      if (chosen_i[p] == e) elist[(size_t)e * maxper + cnt++] = p;
+    ecnt[e] = cnt;
+    int flag = cnt > 0 ? 1 : 0;
+    int pos = exclusive_scan_over_group(g, flag, plus<int>());
+    if (flag) {
+      actl[pos] = e;
+      int32_t *d = desc + pos * 16;
+      d[0] = e;
+      d[1] = cnt;
+      for (int i = 0; i < 8; i++) d[2 + i] = elist[(size_t)e * maxper + (i < cnt ? i : 0)];
+    }
+    int tot = reduce_over_group(g, flag, plus<int>());
+    if (e == 0) nact[0] = tot;
+    for (int j = tot + e; j < maxslots; j += NE) desc[j * 16 + 1] = 0;
+  });
+}
+static bool fuse_route() { static const bool v = getenv("XIK_FUSE_ROUTE") && atoi(getenv("XIK_FUSE_ROUTE")); return v; }
 
 void k_act(xik_ctx *c, int npairs, int nks) {
   const float *gu = c->gu_part;
@@ -2713,7 +2827,8 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
 
   // ---- MoE
   gemv_bf16_old(c, lw.router, c->in[0], D, c->tmp1, NE, NE, D, T, false);
-  k_router(c, lw, T);
+  const bool fr = fuse_route() && T == 1 && !use_int8() && !getenv("XIK_OLD_FP8");
+  if (fr) k_route_fused1(c, lw); else k_router(c, lw, T);
   phase(c, P_MOE_ROUTE);
   int np = T * TOPK;
   int nks = 1;
@@ -2734,8 +2849,8 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
       k_act(c, np, 1);
       expert_fp8<false>(c, lw, c->act, FI, c->yp_part, D, c->ridx, np, D, FI);
     } else {
-      k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
-      k_group(c, np, T);
+      if (!fr) { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
+      k_group(c, np, T); }
       int slots = std::min(NE, np);
       nks = fp8_ks();
       moe_fp8g(c, lw.w13, lw.w13_s, c->x16_in, D, true, T, slots, 2 * FI, D, c->gu_part, 2 * FI, (size_t)np * 2 * FI);
@@ -2746,8 +2861,8 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   } else {
     int mcfg = (c->moe_cfg >= 0) ? c->moe_cfg : 1;  // one K split for every T: results must not depend on the verify width
     nks = MOE_CFGS[mcfg].ks;
-    k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
-    k_group(c, np, T);
+    if (!fr) { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
+    k_group(c, np, T); }
     int slots = std::min(NE, np);
     moe_fp4g(c, mcfg, lw.w13, lw.w13_s, c->x16_in, D, true, lw.w13_amax, lw.w13_den, T, slots, 2 * FI, D, c->gu_part,
              (size_t)np * 2 * FI, 2 * FI);
