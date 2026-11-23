@@ -278,7 +278,7 @@ impl SpecDiag {
     pub fn report(&self, name: &str) -> String {
         if self.rounds == 0 { return format!("{name}: no rounds"); }
         let r = self.rounds as f64;
-        let hist: Vec<String> = self.khist.iter().enumerate().filter(|(_, &c)| c > 0).map(|(k, c)| format!("K{k}:{c}")).collect();
+        let hist: Vec<String> = self.khist.iter().enumerate().filter(|(_, c)| **c > 0).map(|(k, c)| format!("K{k}:{c}")).collect();
         format!("{name}: rounds {} | candidate len {:.1} | K {:.1} | accepted {:.2} (of K: {:.0}%) | full-accept {:.0}% | verify {:.1} ms | commit {:.2} ms | K hist [{}]",
             self.rounds, self.cand_len as f64 / r, self.k_sum as f64 / r, self.acc_sum as f64 / r, 100.0 * self.acc_sum as f64 / self.k_sum.max(1) as f64,
             100.0 * self.full as f64 / r, self.t_verify / r * 1e3, self.t_commit / r * 1e3, hist.join(" "))
