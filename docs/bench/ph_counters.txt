@@ -1,0 +1,49 @@
+per token (memory-mode run; MB/token = counter GB/s x time / 48)
+## experts NVFP4
+cfg     ms DRAM rd MB DRAM wr MB LSC rd MB L3 rd MB L3 wr MB LSC miss% L3 miss%
+A     5.45      800.8       34.9    1346.9    900.0    209.1      31.6     73.5
+B     4.99      739.3       21.4    1273.1    837.5    204.7      31.7     72.0
+C     5.55      824.6       33.9    1396.7    930.4    220.0      31.8     72.9
+D     4.99      729.0        5.6    1263.1    831.4    204.6      31.8     70.8
+E     4.65      670.3        5.1    1157.9    763.4    186.8      31.8     71.1
+## attention dense (q,k,v,r,gate,sink,o)
+cfg     ms DRAM rd MB DRAM wr MB LSC rd MB L3 rd MB L3 wr MB LSC miss% L3 miss%
+A     4.04      667.4       26.6    1106.4    745.5    173.6      31.4     73.7
+B     4.12      631.9       16.1    1041.7    707.7    159.8      31.4     73.3
+C     3.81      601.0       23.4     991.5    670.3    150.2      31.4     74.2
+D     3.79      566.8        4.8     950.4    640.5    151.4      31.4     71.5
+E     3.79      644.4        5.3    1072.1    725.2    163.0      31.6     72.7
+## loop controllers
+cfg     ms DRAM rd MB DRAM wr MB LSC rd MB L3 rd MB L3 wr MB LSC miss% L3 miss%
+A     1.74      194.2        9.2     342.4    222.6     63.1      32.7     68.3
+B     1.74      252.2        6.4     439.2    289.0     77.7      32.4     68.9
+C     1.73      198.1       10.7     349.1    228.0     65.4      32.6     67.5
+D     1.71      255.6        2.5     452.3    296.3     82.7      32.5     67.0
+E     1.71      264.8        2.5     467.7    307.0     85.0      32.6     67.3
+## output head
+cfg     ms DRAM rd MB DRAM wr MB LSC rd MB L3 rd MB L3 wr MB LSC miss% L3 miss%
+A     1.06      347.8        3.1     577.1    360.3     86.4      26.8     80.1
+B     1.06      345.0        3.3     565.7    357.7     82.7      26.8     80.5
+C     1.04      369.3        2.3     603.4    382.0     91.0      27.0     80.3
+D     1.04      385.2        2.4     628.1    398.1     95.3      26.9     80.2
+E     1.04      334.1        1.8     553.0    345.2     84.9      26.9     79.9
+## experts MXFP8
+cfg     ms DRAM rd MB DRAM wr MB LSC rd MB L3 rd MB L3 wr MB LSC miss% L3 miss%
+A     0.85      122.1        3.3     173.7    131.2     14.1      28.0     85.1
+B     0.86      152.3        4.0     215.3    163.6     18.7      28.0     84.7
+C     0.86      138.5        3.6     196.9    148.6     16.2      28.2     85.0
+D     0.86      156.8        3.4     222.3    168.6     19.0      28.1     84.5
+E     0.86      157.6        3.6     221.3    168.9     18.0      28.0     85.2
+## attention core (score/softmax/kv/conv-state)
+cfg     ms DRAM rd MB DRAM wr MB LSC rd MB L3 rd MB L3 wr MB LSC miss% L3 miss%
+A     1.07      143.2        5.7     234.3    160.2     36.7      31.5     73.2
+B     1.08      182.6        4.8     298.2    202.8     45.9      30.9     73.7
+C     1.08      172.9        7.0     287.7    194.1     46.9      31.8     72.3
+D     1.07      217.0        1.7     353.6    242.5     53.1      31.1     73.0
+E     1.07      175.5        1.8     289.9    197.8     44.5      31.5     72.8
+## TOTAL
+A 16.61 ms  DRAM rd 2651 MB  wr 96 MB  LSC rd 4417  L3 rd 2935
+B 16.16 ms  DRAM rd 2733 MB  wr 66 MB  LSC rd 4555  L3 rd 3034
+C 16.37 ms  DRAM rd 2710 MB  wr 94 MB  LSC rd 4504  L3 rd 3004
+D 15.63 ms  DRAM rd 2654 MB  wr 23 MB  LSC rd 4441  L3 rd 2962
+E 15.29 ms  DRAM rd 2621 MB  wr 23 MB  LSC rd 4399  L3 rd 2927

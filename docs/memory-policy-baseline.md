@@ -25,3 +25,13 @@ Reproduce: `docs/bench/cum.sh` (log: `docs/bench/cum_all_off_vs_default.log`).
 | geo-mean | | +7.2% | | +6.4% |
 
 Plain is ~56 tok/s (~17.9 ms/token); 75 tok/s (13.33 ms) is NOT reached.
+
+## Counter / per-kernel breakdown (VTune, 48 decode steps, one run per config)
+Configs: A all off; B NVFP4 policy only; C Dense policy only; D both; E both + fastdiv (= defaults).
+Reproduce: `docs/bench/ph.sh`, tables: `docs/bench/ph_kernel_time.txt`, `docs/bench/ph_counters.txt`.
+
+GPU kernel time/token: A 16.61, B 16.16, C 16.37, D 15.63, E 15.29 ms (-1.32 ms; wall-clock 19.1 -> 17.8 ms/token agrees).
+Largest drops: NVFP4 expert -0.80, Dense attention -0.25. Controller / attention core unchanged (no measurable cross-kernel pollution).
+DRAM read per token A 2651 MB vs E 2621 MB; LSC miss 31.6% vs 31.8%: policy changes neither bytes nor hit rate.
+Caveat: per-kernel DRAM counters under-count in E2E sampling (~70% of logical bytes); L1 hit rate and SEND counts unavailable.
+Mechanism for the speed-up is NOT established by counters. Single run per config: the ~0.3 ms interaction in small kernels is unconfirmed.

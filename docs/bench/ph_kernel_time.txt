@@ -1,0 +1,95 @@
+== A
+kernel time per token 16.61 ms, 1088 launches/token (48 decode steps)
+
+category                                       ms/tok  share launch | 
+----------------------------------------------------------------------
+experts NVFP4                                    5.45  32.8%     88 | 
+attention dense (q,k,v,r,gate,sink,o)            4.04  24.3%    120 | 
+loop controllers                                 1.74  10.5%    168 | 
+attention core (score/softmax/kv/conv-state)     1.07   6.5%    144 | 
+output head                                      1.06   6.4%      1 | 
+experts MXFP8                                    0.86   5.2%      8 | 
+MoE glue (route, group, act, combine, cvt)       0.70   4.2%    240 | 
+norm / attention-residual mix                    0.67   4.1%    174 | 
+router                                           0.57   3.4%     48 | 
+short convs                                      0.30   1.8%     96 | 
+other                                            0.16   0.9%      1 | 
+TOTAL                                           16.61               | 
+
+host->GPU read 0.018 GB/s, system-memory read 0.000 GB/s during decode
+== B
+kernel time per token 16.16 ms, 1088 launches/token (48 decode steps)
+
+category                                       ms/tok  share launch | 
+----------------------------------------------------------------------
+experts NVFP4                                    4.99  30.9%     88 | 
+attention dense (q,k,v,r,gate,sink,o)            4.12  25.5%    120 | 
+loop controllers                                 1.74  10.8%    168 | 
+attention core (score/softmax/kv/conv-state)     1.08   6.7%    144 | 
+output head                                      1.06   6.5%      1 | 
+experts MXFP8                                    0.86   5.3%      8 | 
+MoE glue (route, group, act, combine, cvt)       0.68   4.2%    240 | 
+norm / attention-residual mix                    0.66   4.1%    174 | 
+router                                           0.56   3.5%     48 | 
+short convs                                      0.26   1.6%     96 | 
+other                                            0.16   1.0%      1 | 
+TOTAL                                           16.16               | 
+
+host->GPU read 0.019 GB/s, system-memory read 0.000 GB/s during decode
+== C
+kernel time per token 16.37 ms, 1088 launches/token (48 decode steps)
+
+category                                       ms/tok  share launch | 
+----------------------------------------------------------------------
+experts NVFP4                                    5.55  33.9%     88 | 
+attention dense (q,k,v,r,gate,sink,o)            3.81  23.3%    120 | 
+loop controllers                                 1.73  10.6%    168 | 
+attention core (score/softmax/kv/conv-state)     1.08   6.6%    144 | 
+output head                                      1.04   6.3%      1 | 
+experts MXFP8                                    0.86   5.2%      8 | 
+MoE glue (route, group, act, combine, cvt)       0.68   4.2%    240 | 
+norm / attention-residual mix                    0.67   4.1%    174 | 
+router                                           0.57   3.5%     48 | 
+short convs                                      0.27   1.6%     96 | 
+other                                            0.12   0.7%      1 | 
+TOTAL                                           16.37               | 
+
+host->GPU read 0.019 GB/s, system-memory read 0.000 GB/s during decode
+== D
+kernel time per token 15.63 ms, 1088 launches/token (48 decode steps)
+
+category                                       ms/tok  share launch | 
+----------------------------------------------------------------------
+experts NVFP4                                    4.99  31.9%     88 | 
+attention dense (q,k,v,r,gate,sink,o)            3.79  24.3%    120 | 
+loop controllers                                 1.71  10.9%    168 | 
+attention core (score/softmax/kv/conv-state)     1.07   6.8%    144 | 
+output head                                      1.04   6.6%      1 | 
+experts MXFP8                                    0.86   5.5%      8 | 
+norm / attention-residual mix                    0.64   4.1%    174 | 
+MoE glue (route, group, act, combine, cvt)       0.62   4.0%    240 | 
+router                                           0.55   3.5%     48 | 
+short convs                                      0.24   1.5%     96 | 
+other                                            0.12   0.7%      1 | 
+TOTAL                                           15.63               | 
+
+host->GPU read 0.018 GB/s, system-memory read 0.000 GB/s during decode
+== E
+kernel time per token 15.29 ms, 1088 launches/token (48 decode steps)
+
+category                                       ms/tok  share launch | 
+----------------------------------------------------------------------
+experts NVFP4                                    4.65  30.4%     88 | 
+attention dense (q,k,v,r,gate,sink,o)            3.79  24.8%    120 | 
+loop controllers                                 1.71  11.2%    168 | 
+attention core (score/softmax/kv/conv-state)     1.07   7.0%    144 | 
+output head                                      1.04   6.8%      1 | 
+experts MXFP8                                    0.86   5.6%      8 | 
+norm / attention-residual mix                    0.64   4.2%    174 | 
+MoE glue (route, group, act, combine, cvt)       0.62   4.1%    240 | 
+router                                           0.55   3.6%     48 | 
+short convs                                      0.24   1.6%     96 | 
+other                                            0.12   0.8%      1 | 
+TOTAL                                           15.29               | 
+
+host->GPU read 0.018 GB/s, system-memory read 0.000 GB/s during decode
