@@ -3005,7 +3005,8 @@ static void enqueue_body(xik_ctx *c, int T, int rows, bool out_argmax, int pos0)
     };
     auto capv = [&]() { if (vi == 5) k_capture(c, f.cur, 0, T); else if (vi == 23) k_capture(c, f.cur, 1, T); else if (vi == 41) k_capture(c, f.cur, 2, T); };
     for (int l = 0; l < CORE0; l++) { capv(); run_layer(c, f, l, 0, T, pos0, false); trace(); }
-    for (int p = 0; p < NPASS; p++) {
+    static const int npass_use = getenv("XIK_PASSES") ? std::max(1, std::min(NPASS, atoi(getenv("XIK_PASSES")))) : NPASS;  // APPROXIMATE mode: fewer loop passes
+    for (int p = 0; p < npass_use; p++) {
       if (p > 0) {
         if (p > 1) { f.freel.push_back(f.bank[0]); f.freel.push_back(f.bank[1]); }
         // bank = [blocks[2], stream]; reset to the prelude state (blocks[0..1])
