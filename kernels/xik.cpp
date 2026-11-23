@@ -343,6 +343,7 @@ struct DArgs {
   DSeg s[8];
   int n = 0, total_wg = 0;
   int ksd = KSD_DEFAULT;
+  int cls = 0;  // use class for the per-use cache policy: 0 attention q/k/v/r/gate/sink, 1 loop controller, 2 attention O, 3 head
   void add(const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool round) {
     int nrb = (rows + 15) / 16;
     auto it = g_fp8_scale.find(W);
@@ -661,7 +662,15 @@ static void dgemm_av(xik_ctx *c, const DArgs &a, int T) {
   else if (a.ksd == 32) dgemm_k<32, AV, PD>(c, a, T);
   else dgemm_k<16, AV, PD>(c, a, T);
 }
-static int dg_pol() { static const int v = getenv("XIK_DENSE_POL") ? atoi(getenv("XIK_DENSE_POL")) : 0; return v; }
+static int dg_pol(int cls) {
+  // default: attention q/k/v/r/gate/sink, attention O and head use L1-streaming + L2-uncached weight loads (policy 5), the loop
+  // controller keeps the default encoding; XIK_DENSE_POL=n sets every class, XIK_POL_ATT/CTL/O/HEAD one class
+  static const bool have_all = getenv("XIK_DENSE_POL") != nullptr;
+  static const int all = have_all ? atoi(getenv("XIK_DENSE_POL")) : 0;
+  auto pick = [&](const char *name, int dflt) { return getenv(name) ? atoi(getenv(name)) : (have_all ? all : dflt); };
+  static const int v[4] = {pick("XIK_POL_ATT", 5), pick("XIK_POL_CTL", 0), pick("XIK_POL_O", 5), pick("XIK_POL_HEAD", 5)};
+  return v[cls & 3];
+}
 void dgemm(xik_ctx *c, const DArgs &a, int T) {
   switch (dg_addr()) {
     case 1: return dgemm_av<1>(c, a, T);
@@ -671,7 +680,7 @@ void dgemm(xik_ctx *c, const DArgs &a, int T) {
     case 5: return dgemm_av<5>(c, a, T);
     case 6: return dgemm_av<6>(c, a, T);
     default:
-      switch (dg_pol()) {  // cache-control variants of the weight loads (FP8 path only; see ldp)
+      switch (dg_pol(a.cls)) {  // cache-control variants of the weight loads (FP8 path only; see ldp)
         case 1: return dgemm_av<0, 1>(c, a, T);
         case 2: return dgemm_av<0, 2>(c, a, T);
         case 3: return dgemm_av<0, 3>(c, a, T);
@@ -692,6 +701,7 @@ struct GSeg {
 struct GArgs {
   GSeg s[8];
   int n = 0, total_sg = 0;
+  int cls = 0;  // per-use cache-policy class, see DArgs::cls
   void add(const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool round, int ldw = 0) {
     s[n] = GSeg{W, X, Y, rows, K, ldx, ldy, total_sg, (int)round, ldw ? ldw : K};
     total_sg += rows / 4;
@@ -762,13 +772,15 @@ void gemv_multi(xik_ctx *c, const GArgs &a, int T) {
   DArgs d;
   static const int ksd_proj = getenv("XIK_KSD_PROJ") ? atoi(getenv("XIK_KSD_PROJ")) : KSD_DEFAULT;
   d.ksd = ksd_proj;
+  d.cls = a.cls;
   for (int i = 0; i < a.n; i++) d.add(a.s[i].W, a.s[i].X, a.s[i].ldx, a.s[i].Y, a.s[i].ldy, a.s[i].rows, a.s[i].K, a.s[i].round);
   dgemm(c, d, T);
 }
 void gemv_bf16(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, int T,
-               bool round_out, int ksd = KSD_DEFAULT) {
+               bool round_out, int ksd = KSD_DEFAULT, int cls = 0) {
   DArgs d;
   d.ksd = ksd;
+  d.cls = cls;
   d.add(W, X, ldx, Y, ldy, rows, K, round_out);
   dgemm(c, d, T);
 }
@@ -2867,6 +2879,8 @@ void run_ctl(xik_ctx *c, const LayerW &lw, const int *cid, int n, const float **
     ba.dest[j] = dest[j]; ba.msg[j] = msg[j]; ba.g[j] = c->cg3[j]; ba.f[j] = c->cf3[j]; ba.nw[j] = nw[j]; ba.out[j] = out[j];
   }
   k_pairnorm(c, pa, T);
+  g1.cls = 1;
+  g2.cls = 1;
   gemv_multi(c, g1, T);
   gemv_multi(c, g2, T);
   k_blend(c, ba, T);
@@ -2947,7 +2961,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   k_attn(c, lw, slot, local, T, pos0);
   phase(c, P_ATTN);
   static const int ksd_wo = getenv("XIK_KSD_WO") ? atoi(getenv("XIK_KSD_WO")) : 32;
-  gemv_bf16(c, lw.wo, c->attn_o, QD, c->ao2, D, D, QD, T, true, ksd_wo);
+  gemv_bf16(c, lw.wo, c->attn_o, QD, c->ao2, D, D, QD, T, true, ksd_wo, 2);
   phase(c, P_WO);
 
   // ---- attn short conv, residual / block bookkeeping
@@ -3132,7 +3146,7 @@ static void enqueue_body(xik_ctx *c, int T, int rows, bool out_argmax, int pos0)
     }
     const float *hx = out_argmax ? c->in[0] : c->in[0] + (size_t)(T - 1) * D;
     static const int ksd_head = getenv("XIK_KSD_HEAD") ? atoi(getenv("XIK_KSD_HEAD")) : KSD_DEFAULT;
-    gemv_bf16(c, c->unembed, hx, D, c->logits, VOCAB, VOCAB, D, rows, false, ksd_head);
+    gemv_bf16(c, c->unembed, hx, D, c->logits, VOCAB, VOCAB, D, rows, false, ksd_head, 3);
     k_softcap_argmax(c, rows);
     phase(c, P_HEAD);
 }
