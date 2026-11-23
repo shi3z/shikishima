@@ -19,6 +19,110 @@ fn main() {
     let mut e = Engine::new(&dir, 4096, 64).expect("engine");
     eprintln!("load {:.1}s", t0.elapsed().as_secs_f64());
     e.reset();
+    // Teacher-forced logits study (approximate-mode research).  --tf g BASE: greedy-generate n tokens with the current engine
+    // configuration, store ids + full logits.  --tf r BASE: replay the stored ids through the current configuration (e.g.
+    // XIK_PASSES=2) and compare its logits with the stored ones (draft = this run, target = stored).
+    if a.iter().any(|x| x == "--time-verify") {
+        // wall time of verify(T)+commit(1) vs plain forward(1): cost model inputs for speculative decoding
+        let c0 = e.prefill(&ids).unwrap();
+        for &t in &[1usize, 2, 3, 5, 8, 9, 12, 17, 24, 32] {
+            let blk: Vec<i32> = std::iter::repeat(c0).take(t).collect();
+            let mut v = vec![];
+            for r in 0..12 {
+                let t0 = Instant::now();
+                if t == 1 { e.forward(&blk, false, true).unwrap(); } else { e.verify(&blk).unwrap(); e.commit(1).unwrap(); }
+                if e.pending() > 128 { e.discard_pending(); }
+                if r > 1 { v.push(t0.elapsed().as_secs_f64() * 1e3); }
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!("TV T={t:2} median {:.2} ms (min {:.2})", v[v.len() / 2], v[0]);
+        }
+        return;
+    }
+    if let Some(i) = a.iter().position(|x| x == "--tf") {
+        use std::io::{Read, Write};
+        let mode = a[i + 1].clone();
+        let base = a[i + 2].clone();
+        let v = xeinkling::engine::VOCAB_U;
+        let lsm = |l: &[f32]| -> (f64, Vec<f64>) {
+            let m = l.iter().cloned().fold(f32::MIN, f32::max) as f64;
+            let z: f64 = l.iter().map(|&x| (x as f64 - m).exp()).sum();
+            let lz = m + z.ln();
+            (lz, vec![])
+        };
+        if mode == "g" {
+            let mut lf = std::io::BufWriter::new(std::fs::File::create(format!("{base}.logits")).unwrap());
+            e.prefill(&ids[..ids.len() - 1]).unwrap();
+            let mut cur = e.forward(&[*ids.last().unwrap()], true, true).unwrap()[0];
+            let mut out = vec![];
+            for _ in 0..n {
+                let bytes: Vec<u8> = e.logits[..v].iter().flat_map(|x| x.to_le_bytes()).collect();
+                lf.write_all(&bytes).unwrap();
+                out.push(cur);
+                cur = e.forward(&[cur], true, true).unwrap()[0];
+                if e.pending() > 128 { e.discard_pending(); }
+            }
+            let mut f = std::fs::File::create(format!("{base}.ids")).unwrap();
+            writeln!(f, "{}", ids.len()).unwrap();
+            writeln!(f, "{}", ids.iter().chain(out.iter()).map(|x| x.to_string()).collect::<Vec<_>>().join(",")).unwrap();
+            eprintln!("generated {} tokens", out.len());
+            return;
+        }
+        let txt = std::fs::read_to_string(format!("{base}.ids")).unwrap();
+        let mut ls = txt.lines();
+        let plen: usize = ls.next().unwrap().parse().unwrap();
+        let all: Vec<i32> = ls.next().unwrap().split(',').map(|x| x.parse().unwrap()).collect();
+        let gtok = &all[plen..];
+        let nn = gtok.len().min(n);
+        let mut lf = std::io::BufReader::new(std::fs::File::open(format!("{base}.logits")).unwrap());
+        e.prefill(&all[..plen - 1]).unwrap();
+        e.forward(&[all[plen - 1]], true, false).unwrap();
+        let (mut t1, mut t5a, mut t5b, mut klsum) = (0usize, 0usize, 0usize, 0f64);
+        let mut flags = String::new();
+        let mut marg: Vec<(f64, bool)> = vec![];
+        let mut buf = vec![0u8; v * 4];
+        let mut tl = vec![0f32; v];
+        for step in 0..nn {
+            lf.read_exact(&mut buf).unwrap();
+            for (j, c) in buf.chunks_exact(4).enumerate() { tl[j] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]); }
+            let dl = &e.logits[..v];
+            let am = |l: &[f32]| l.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b });
+            let top = |l: &[f32], k: usize| { let mut ix: Vec<usize> = (0..v).collect(); ix.select_nth_unstable_by(k, |&a, &b| l[b].partial_cmp(&l[a]).unwrap()); ix.truncate(k); ix };
+            let (ta, tv) = am(&tl);
+            let (da, _) = am(dl);
+            let t5 = top(&tl, 5);
+            let d5 = top(dl, 5);
+            let ok = ta == da;
+            if ok { t1 += 1; }
+            if t5.contains(&da) { t5a += 1; }
+            if d5.contains(&ta) { t5b += 1; }
+            flags.push(if ok { '1' } else { '0' });
+            // target second-best for margin
+            let second = tl.iter().enumerate().filter(|(i, _)| *i != ta).fold(f32::MIN, |m, (_, &x)| m.max(x));
+            marg.push(((tv - second) as f64, ok));
+            // KL(target || draft)
+            let (lzt, _) = lsm(&tl);
+            let (lzd, _) = lsm(dl);
+            let mut kl = 0f64;
+            for j in 0..v { let lp = tl[j] as f64 - lzt; let lq = dl[j] as f64 - lzd; let p = lp.exp(); if p > 1e-12 { kl += p * (lp - lq); } }
+            klsum += kl;
+            if step + 1 < nn { e.forward(&[gtok[step]], true, false).unwrap(); if e.pending() > 128 { e.discard_pending(); } }
+        }
+        let nf = nn as f64;
+        // consecutive-agreement run lengths (accepted-draft-length distribution for K = infinity)
+        let mut runs = vec![0usize; 18];
+        let mut cur = 0usize;
+        for ch in flags.chars() { if ch == '1' { cur += 1; } else { runs[cur.min(17)] += 1; cur = 0; } }
+        runs[cur.min(17)] += 1;
+        marg.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let q = |f: f64| marg[((marg.len() - 1) as f64 * f) as usize].0;
+        let hi: Vec<&(f64, bool)> = marg.iter().filter(|m| m.0 >= 2.0).collect();
+        eprintln!("TF n={nn} top1 {:.3} | draft-top1 in target-top5 {:.3} | target-top1 in draft-top5 {:.3} | KL(t||d) {:.4} nats/token", t1 as f64 / nf, t5a as f64 / nf, t5b as f64 / nf, klsum / nf);
+        eprintln!("TF margin(target top1-top2) quantiles 10/50/90 = {:.2}/{:.2}/{:.2}; margin>=2.0: {} tokens, agree {:.3}", q(0.1), q(0.5), q(0.9), hi.len(), hi.iter().filter(|m| m.1).count() as f64 / hi.len().max(1) as f64);
+        eprintln!("TF runs (consecutive agreeing tokens before a miss, 0..17+): {:?}", runs);
+        std::fs::write(format!("{base}.agree"), flags).unwrap();
+        return;
+    }
     if let Some(i) = a.iter().position(|x| x == "--profile-cycles") {
         let k: usize = a[i + 1].parse().unwrap();
         let cyc: usize = a[i + 2].parse().unwrap();
