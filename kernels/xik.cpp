@@ -230,7 +230,7 @@ void gemv_bf16_old(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float
 // Dense weights are repacked once into DPAS B-operand tiles:  Wt[rb16][kt16][r=8][n=16] dwords,
 // dword (r, n) = bf16 pair (row rb*16+n, k = kt*16 + 2r, 2r+1).  One DPAS (repeat R) multiplies one tile
 // with R tokens, so all tokens of a pass share a single read of the weights.
-constexpr int KSD = 16;  // K-split threads per work-group (reduced through SLM)
+constexpr int KSD_DEFAULT = 16;  // K-split threads per work-group (reduced through SLM); per call site, see DArgs::ksd
 
 void k_repack_bf16(xik_ctx *c, const uint16_t *raw, uint32_t *dst, int rows, int rows_pad, int K) {
   int nkt = K / 16;
@@ -253,6 +253,7 @@ struct DSeg {
 struct DArgs {
   DSeg s[8];
   int n = 0, total_wg = 0;
+  int ksd = KSD_DEFAULT;
   void add(const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool round) {
     int nrb = (rows + 15) / 16;
     s[n] = DSeg{reinterpret_cast<const uint32_t *>(W), X, Y, rows, nrb, K, ldx, ldy, (int)round, total_wg};
@@ -260,7 +261,7 @@ struct DArgs {
     n++;
   }
 };
-template <int R>
+template <int R, int KSD>
 void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
   q.parallel_for(nd_range<1>((size_t)a.total_wg * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
     using namespace es;
@@ -337,14 +338,20 @@ void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
     }
   });
 }
-void dgemm(xik_ctx *c, const DArgs &a, int T) {
+template <int KSD>
+static void dgemm_k(xik_ctx *c, const DArgs &a, int T) {
   for (int t0 = 0; t0 < T; t0 += 8) {
     int n = std::min(8, T - t0);
-    if (n == 1) dgemm_t<1>(c->q, a, t0, n);
-    else if (n == 2) dgemm_t<2>(c->q, a, t0, n);
-    else if (n <= 4) dgemm_t<4>(c->q, a, t0, n);
-    else dgemm_t<8>(c->q, a, t0, n);
+    if (n == 1) dgemm_t<1, KSD>(c->q, a, t0, n);
+    else if (n == 2) dgemm_t<2, KSD>(c->q, a, t0, n);
+    else if (n <= 4) dgemm_t<4, KSD>(c->q, a, t0, n);
+    else dgemm_t<8, KSD>(c->q, a, t0, n);
   }
+}
+void dgemm(xik_ctx *c, const DArgs &a, int T) {
+  if (a.ksd == 8) dgemm_k<8>(c, a, T);
+  else if (a.ksd == 32) dgemm_k<32>(c, a, T);
+  else dgemm_k<16>(c, a, T);
 }
 
 // ------------------------------------------------- multi-matrix GEMV (one launch)
@@ -425,12 +432,15 @@ void gemv_multi(xik_ctx *c, const GArgs &a, int T) {
   for (int i = 0; i < a.n; i++) old |= a.s[i].ldw != a.s[i].K;
   if (old) return gemv_multi_old(c, a, T);
   DArgs d;
+  static const int ksd_proj = getenv("XIK_KSD_PROJ") ? atoi(getenv("XIK_KSD_PROJ")) : KSD_DEFAULT;
+  d.ksd = ksd_proj;
   for (int i = 0; i < a.n; i++) d.add(a.s[i].W, a.s[i].X, a.s[i].ldx, a.s[i].Y, a.s[i].ldy, a.s[i].rows, a.s[i].K, a.s[i].round);
   dgemm(c, d, T);
 }
 void gemv_bf16(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, int T,
-               bool round_out) {
+               bool round_out, int ksd = KSD_DEFAULT) {
   DArgs d;
+  d.ksd = ksd;
   d.add(W, X, ldx, Y, ldy, rows, K, round_out);
   dgemm(c, d, T);
 }
@@ -913,18 +923,16 @@ struct NormArgs {
 // out = rbf(rms(x) * w) for up to 3 independent (x, w, out) triples
 template <int N>
 void k_wnorm_t(xik_ctx *c, const NormArgs &a, int T) {
-  c->q.parallel_for(nd_range<1>((size_t)T * 256, 256), [=](nd_item<1> it) {
-    int t = it.get_group(0), l = it.get_local_id(0);
-    for (int k = 0; k < N; k++) {
-      float v[9], ss = 0.f;
-      for (int i = 0; i < 9; i++) { v[i] = a.x[k][(size_t)t * D + l + i * 256]; ss += v[i] * v[i]; }
-      ss = reduce_over_group(it.get_group(), ss, plus<float>());
-      float inv = sycl::rsqrt(ss / D + EPS);
-      for (int i = 0; i < 9; i++) a.out[k][(size_t)t * D + l + i * 256] = rbf(v[i] * inv * bf2f(a.w[k][l + i * 256]));
-    }
+  c->q.parallel_for(nd_range<1>((size_t)T * N * 256, 256), [=](nd_item<1> it) {
+    int gi = it.get_group(0), l = it.get_local_id(0);
+    int t = gi / N, k = gi % N;
+    float v[9], ss = 0.f;
+    for (int i = 0; i < 9; i++) { v[i] = a.x[k][(size_t)t * D + l + i * 256]; ss += v[i] * v[i]; }
+    ss = reduce_over_group(it.get_group(), ss, plus<float>());
+    float inv = sycl::rsqrt(ss / D + EPS);
+    for (int i = 0; i < 9; i++) a.out[k][(size_t)t * D + l + i * 256] = rbf(v[i] * inv * bf2f(a.w[k][l + i * 256]));
   });
 }
-
 void k_wnorm(xik_ctx *c, const NormArgs &a, int T) { if (a.n == 1) k_wnorm_t<1>(c, a, T); else k_wnorm_t<3>(c, a, T); }
 
 struct PairArgs {
@@ -935,20 +943,17 @@ struct PairArgs {
 };
 template <int N>
 void k_pairnorm_t(xik_ctx *c, const PairArgs &a, int T) {
-  c->q.parallel_for(nd_range<1>((size_t)T * 256, 256), [=](nd_item<1> it) {
-    int t = it.get_group(0), l = it.get_local_id(0);
-    for (int k = 0; k < N; k++)
-      for (int h = 0; h < 2; h++) {
-        const float *x = h ? a.msg[k] : a.dest[k];
-        float v[9], ss = 0.f;
-        for (int i = 0; i < 9; i++) { v[i] = x[(size_t)t * D + l + i * 256]; ss += v[i] * v[i]; }
-        ss = reduce_over_group(it.get_group(), ss, plus<float>());
-        float inv = sycl::rsqrt(ss / D + EPS);
-        for (int i = 0; i < 9; i++) a.pair[k][(size_t)t * 2 * D + h * D + l + i * 256] = rbf(v[i] * inv);
-      }
+  c->q.parallel_for(nd_range<1>((size_t)T * N * 2 * 256, 256), [=](nd_item<1> it) {
+    int gi = it.get_group(0), l = it.get_local_id(0);
+    int h = gi % 2, k = (gi / 2) % N, t = gi / (2 * N);
+    const float *x = h ? a.msg[k] : a.dest[k];
+    float v[9], ss = 0.f;
+    for (int i = 0; i < 9; i++) { v[i] = x[(size_t)t * D + l + i * 256]; ss += v[i] * v[i]; }
+    ss = reduce_over_group(it.get_group(), ss, plus<float>());
+    float inv = sycl::rsqrt(ss / D + EPS);
+    for (int i = 0; i < 9; i++) a.pair[k][(size_t)t * 2 * D + h * D + l + i * 256] = rbf(v[i] * inv);
   });
 }
-
 void k_pairnorm(xik_ctx *c, const PairArgs &a, int T) { if (a.n == 1) k_pairnorm_t<1>(c, a, T); else k_pairnorm_t<3>(c, a, T); }
 
 struct BlendArgs {
@@ -960,22 +965,20 @@ struct BlendArgs {
 // out = rbf(rms((1 - tanh f) * dest + tanh g * msg) * w)
 template <int N>
 void k_blend_t(xik_ctx *c, const BlendArgs &a, int T) {
-  c->q.parallel_for(nd_range<1>((size_t)T * 256, 256), [=](nd_item<1> it) {
-    int t = it.get_group(0), l = it.get_local_id(0);
-    for (int k = 0; k < N; k++) {
-      float v[9], ss = 0.f;
-      for (int i = 0; i < 9; i++) {
-        size_t o = (size_t)t * D + l + i * 256;
-        v[i] = (1.f - sycl::tanh(a.f[k][o])) * a.dest[k][o] + sycl::tanh(a.g[k][o]) * a.msg[k][o];
-        ss += v[i] * v[i];
-      }
-      ss = reduce_over_group(it.get_group(), ss, plus<float>());
-      float inv = sycl::rsqrt(ss / D + EPS);
-      for (int i = 0; i < 9; i++) a.out[k][(size_t)t * D + l + i * 256] = rbf(v[i] * inv * bf2f(a.nw[k][l + i * 256]));
+  c->q.parallel_for(nd_range<1>((size_t)T * N * 256, 256), [=](nd_item<1> it) {
+    int gi = it.get_group(0), l = it.get_local_id(0);
+    int t = gi / N, k = gi % N;
+    float v[9], ss = 0.f;
+    for (int i = 0; i < 9; i++) {
+      size_t o = (size_t)t * D + l + i * 256;
+      v[i] = (1.f - sycl::tanh(a.f[k][o])) * a.dest[k][o] + sycl::tanh(a.g[k][o]) * a.msg[k][o];
+      ss += v[i] * v[i];
     }
+    ss = reduce_over_group(it.get_group(), ss, plus<float>());
+    float inv = sycl::rsqrt(ss / D + EPS);
+    for (int i = 0; i < 9; i++) a.out[k][(size_t)t * D + l + i * 256] = rbf(v[i] * inv * bf2f(a.nw[k][l + i * 256]));
   });
 }
-
 void k_blend(xik_ctx *c, const BlendArgs &a, int T) { if (a.n == 1) k_blend_t<1>(c, a, T); else k_blend_t<3>(c, a, T); }
 
 // ------------------------------------------------------------- short conv
@@ -1952,7 +1955,8 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   phase(c, P_KV);
   k_attn(c, lw, slot, local, T, pos0);
   phase(c, P_ATTN);
-  gemv_bf16(c, lw.wo, c->attn_o, QD, c->ao2, D, D, QD, T, true);
+  static const int ksd_wo = getenv("XIK_KSD_WO") ? atoi(getenv("XIK_KSD_WO")) : 32;
+  gemv_bf16(c, lw.wo, c->attn_o, QD, c->ao2, D, D, QD, T, true, ksd_wo);
   phase(c, P_WO);
 
   // ---- attn short conv, residual / block bookkeeping
@@ -2098,7 +2102,8 @@ static void enqueue_body(xik_ctx *c, int T, int rows, bool out_argmax, int pos0)
       k_capture(c, c->in[0], 3, T);
     }
     const float *hx = out_argmax ? c->in[0] : c->in[0] + (size_t)(T - 1) * D;
-    gemv_bf16(c, c->unembed, hx, D, c->logits, VOCAB, VOCAB, D, rows, false);
+    static const int ksd_head = getenv("XIK_KSD_HEAD") ? atoi(getenv("XIK_KSD_HEAD")) : KSD_DEFAULT;
+    gemv_bf16(c, c->unembed, hx, D, c->logits, VOCAB, VOCAB, D, rows, false, ksd_head);
     k_softcap_argmax(c, rows);
     phase(c, P_HEAD);
 }
