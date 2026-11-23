@@ -159,6 +159,14 @@ impl Engine {
         }
         Ok((us, by))
     }
+    /// NVFP4 microbenchmark variants (var 0..3, na accumulators, rot layer rotation): (wall us/call, GPU event us/call).
+    pub fn bench_fp4var(&mut self, var: i32, na: i32, rot: i32, iters: i32) -> Result<(f64, f64), String> {
+        let (mut us, mut dur) = (0f64, 0f64);
+        if unsafe { ffi::xik_bench_fp4var(self.ctx, var, na, rot, iters, &mut us, &mut dur) } != 0 {
+            return Err(last_error());
+        }
+        Ok((us, dur))
+    }
     pub fn bench_launch(&mut self, n: i32, kind: i32) -> f64 {
         unsafe { ffi::xik_bench_launch(self.ctx, n, kind) }
     }

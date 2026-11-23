@@ -192,6 +192,35 @@ fn main() {
         eprintln!("T=1 step: wall {:.2} ms | host submit finished at {:.2} ms | complete at {:.2} ms (in-forward timers)", wall, (after[14] - before[14]) / n as f64 / 1e3, (after[15] - before[15]) / n as f64 / 1e3);
         return;
     }
+    if a.iter().any(|x| x == "--step-timeline") {
+        // GPU timeline of T=1 decode steps (needs XIK_PROFILE=1): kernels, sum of kernel durations, GPU span, idle inside the span, wall per step
+        let c0 = e.prefill_drafting(&ids).unwrap();
+        let mut cur = c0;
+        for _ in 0..8 { cur = e.forward(&[cur], false, true).unwrap()[0]; }
+        let n = 24;
+        e.prof_rec(true);
+        let mut walls = vec![];
+        for i in 0..n {
+            e.prof_tag(i);
+            let t = Instant::now();
+            cur = e.forward(&[cur], false, true).unwrap()[0];
+            walls.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let seg = e.prof_segments();
+        e.prof_rec(false);
+        let (mut k, mut sum, mut span, mut gaps) = (0f64, 0f64, 0f64, 0f64);
+        let mut prev_end = None;
+        for sg in &seg {
+            k += sg[1]; sum += sg[2]; span += sg[3];
+            if let Some(pe) = prev_end { gaps += sg[4] - pe; }
+            prev_end = Some(sg[5]);
+        }
+        let m = seg.len() as f64;
+        let wall = walls.iter().sum::<f64>() / n as f64;
+        eprintln!("STEP T=1 ({} steps): kernels/step {:.0} | sum of kernel durations {:.3} ms | GPU span {:.3} ms (idle inside span {:.3} ms) | gap between steps {:.3} ms | wall/step {:.3} ms",
+            seg.len(), k / m, sum / m / 1e3, span / m / 1e3, (span - sum) / m / 1e3, gaps / (m - 1.0) / 1e3, wall);
+        return;
+    }
     if a.iter().any(|x| x == "--bench-prefill") {
         // time per forward pass of T new tokens (plain forward, state reset between sizes)
         for t in [1usize, 2, 4, 8, 16, 32, 64] {
@@ -249,6 +278,22 @@ fn main() {
             for kind in 0..2 {
                 let (us, by) = e.bench_moe(20, kind, 0, t as i32, 200).unwrap();
                 eprintln!("T={t} {} : {:7.1} us  {:6.1} MB  = {:6.1} GB/s", if kind == 0 { "w13" } else { "w2 " }, us, by / 1e6, by / us / 1e3);
+            }
+        }
+        return;
+    }
+    if a.iter().any(|x| x == "--bench-fp4var") {
+        let iters: i32 = std::env::var("XIK_BENCH_ITERS").ok().map(|v| v.parse().unwrap()).unwrap_or(2000);
+        let rot: i32 = std::env::var("XIK_BENCH_ROT").ok().map(|v| v.parse().unwrap()).unwrap_or(20);
+        let names = ["A dpas-only", "B load+dpas", "C load+unpack+dpas", "D load+unpack+scale+dpas", "D+desc/amax", "D+desc+st.uc", "D+st.uc", "B+st.uc", "C+st.uc"];
+        let nv: i32 = std::env::var("XIK_BENCH_NVAR").ok().map(|v| v.parse().unwrap()).unwrap_or(4);
+        for rep in 0..3 {
+            for var in 0..nv {
+                for na in [1, 2, 4, 8] {
+                    if var >= 4 && na != 1 { continue; }
+                    let (us, dur) = e.bench_fp4var(var, na, rot, iters).unwrap();
+                    eprintln!("FP4VAR rep{rep} {} NA={na} rot={rot}: wall {:7.2} us  gpu {:7.2} us", names[var as usize], us, dur);
+                }
             }
         }
         return;
