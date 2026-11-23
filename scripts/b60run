@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Run a command on the Arc Pro B60 under the machine-wide GPU lock.
+# Every XeFlash run that touches the GPU must go through this wrapper: other
+# sessions use the same lock, and two jobs on the card corrupt each other's
+# timings (and may not fit in VRAM together).
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if ! command -v icpx >/dev/null 2>&1; then
+  set +u
+  # shellcheck disable=SC1091
+  source "${ONEAPI_ROOT:-/opt/intel/oneapi}/setvars.sh" >/dev/null 2>&1 || true
+  set -u
+fi
+export LD_LIBRARY_PATH="$root/build:${LD_LIBRARY_PATH:-}"
+export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:gpu}"
+export ZES_ENABLE_SYSMAN=1
+exec flock "${XF_GPU_LOCK:-/tmp/b60.lock}" "$@"

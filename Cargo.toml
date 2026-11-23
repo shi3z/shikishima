@@ -1,0 +1,15 @@
+[package]
+name = "xeinkling"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Inkling-2-Mini inference engine for the Intel Arc Pro B60 (Rust host, SYCL kernels)"
+
+[dependencies]
+serde_json = "1"
+memmap2 = "0.9"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
+[profile.release]
+opt-level = 3
+debug = 1

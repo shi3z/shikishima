@@ -1,0 +1,39 @@
+XeFlash
+Copyright 2026 the XeFlash authors
+
+XeFlash is a reconstruction of YASAKANI for the Intel Xe architecture. It takes
+the YASAKANI inference engine for Qwen3.8-27B as its starting point and
+rebuilds it around the Xe2 GPU (Intel Arc Pro B60): a Rust host, SYCL/ESIMD
+kernels and a weight format that feeds the XMX systolic array directly.
+
+This product is based on software developed by the YASAKANI authors
+(https://github.com/yasakani-dev/yasakani).
+YASAKANI: Copyright 2026 the YASAKANI authors, licensed under the Apache
+License, Version 2.0. XeFlash follows YASAKANI's licence and is distributed
+under the same terms.
+
+What comes from YASAKANI
+------------------------
+* The project lineage, the benchmark conditions and the reference
+  measurements quoted in docs/.
+* The speculative-decoding ideas used here that originate there: the
+  hidden-state taps of the block drafter, the copy / table draft sources, and
+  the rule for switching between 8 and 16 verify rows.
+* The optional backend in experimental/bdraft2 compiles against the YASAKANI
+  B60 port's headers and runs YASAKANI's drafter ("bdraft2") and its model
+  files. Those files are not part of this repository and remain under their
+  own notices (see YASAKANI's NOTICE and THIRD_PARTY_NOTICES.md: the drafter
+  is derived from the DFlash 2 draft model for Qwen3.8-27B and was re-trained
+  by the YASAKANI authors).
+
+Model files
+-----------
+No model weights are distributed with this software. XeFlash converts
+Qwen3.8-27B, published by the Qwen team (Alibaba Cloud) under the Apache
+License 2.0, into its own quantised format; converted files are NOT the
+original weights and behave differently in accuracy and speed.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this software except in compliance with the License. You may obtain a copy
+of the License in the file LICENSE or at
+http://www.apache.org/licenses/LICENSE-2.0
