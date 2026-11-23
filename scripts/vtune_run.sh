@@ -9,6 +9,6 @@ restore() { sudo -n sysctl -w kernel.yama.ptrace_scope=$p kernel.perf_event_para
 trap restore EXIT
 sudo -n sysctl -w kernel.yama.ptrace_scope=0 kernel.perf_event_paranoid=0 kernel.kptr_restrict=0 >/dev/null
 rm -rf $R/vt
-vtune -collect gpu-hotspots "$@" -r $R/vt -- scripts/b60run ./target/release/xi-run /data/inkling/model ids:371,151451,149879,151194,149884 $N > $R/run.log 2>&1
+vtune -collect gpu-hotspots "$@" -r $R/vt -- scripts/b60run ./target/release/xi-run /data/inkling/model ${XI_PROMPT:-ids:371,151451,149879,151194,149884} $N ${XI_EXTRA:-} > $R/run.log 2>&1
 vtune -report hotspots -group-by computing-task -r $R/vt -format csv -csv-delimiter tab > $R/tasks.csv 2>$R/report.err
 echo done > $R/DONE

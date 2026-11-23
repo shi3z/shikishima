@@ -907,6 +907,173 @@ void moe_fp4g(xik_ctx *c, int cfg, const uint8_t *Wp, const uint8_t *Sp, const s
   throw std::runtime_error("bad moe cfg");
 }
 
+// ================================================================ MXFP8 DPAS path (layers 20-23)
+// Raw: W[e][row][K] e4m3 bytes, scale S[e][row][K/32] ue8m0.  Repacked once into DPAS tiles:
+//   Wt[e][rb16][st64][t=4][q=4][lane=16] dwords: bytes [k0,k2,k1,k3] of elements 4q..4q+3 of tile t (K = st*64 + 16*t)
+//   St[e][rb][st][blk=2][lane=16] bytes: scale of K block 32*blk.
+// A 32-element block spans two 16-wide tiles: both DPAS accumulate into the same register, then the block scale
+// 2^(s-127) (times 2^8, undoing the fp16 bit trick) is applied once.
+void k_repack_mxfp8(xik_ctx *c, const uint8_t *raw, uint32_t *dst, const uint8_t *sraw, uint8_t *sdst, int rows, int K) {
+  int nrb = rows / 16, nst = K / 64;
+  size_t items = (size_t)NE * nrb * nst * 16;
+  c->q.parallel_for(range<1>(items), [=](id<1> id) {
+    size_t i = id[0];
+    int n = (int)(i % 16);
+    size_t t = i / 16;
+    int st = (int)(t % nst);
+    t /= nst;
+    int rb = (int)(t % nrb);
+    int e = (int)(t / nrb);
+    size_t row = (size_t)e * rows + rb * 16 + n;
+    uint32_t *wd = dst + (((size_t)e * nrb + rb) * nst + st) * 256;
+    for (int tl = 0; tl < 4; tl++)
+      for (int q = 0; q < 4; q++) {
+        uint32_t w = *reinterpret_cast<const uint32_t *>(raw + row * K + (size_t)st * 64 + tl * 16 + 4 * q);
+        uint32_t e0 = w & 0xFF, e1 = (w >> 8) & 0xFF, e2 = (w >> 16) & 0xFF, e3 = w >> 24;
+        wd[(tl * 4 + q) * 16 + n] = e0 | (e2 << 8) | (e1 << 16) | (e3 << 24);
+      }
+    uint8_t *sd = sdst + (((size_t)e * nrb + rb) * nst + st) * 32;
+    for (int b = 0; b < 2; b++) sd[b * 16 + n] = sraw[row * (K / 32) + st * 2 + b];
+  });
+}
+
+inline es::simd<uint32_t, 16> fp8_pair(es::simd<uint32_t, 16> m) {
+  return ((m & 0x007F007Fu) << 7) | ((m & 0x00800080u) << 8);
+}
+
+template <int R, int NB>
+ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13,
+                               const int32_t *ids, int cnt, int nst, float *Y, int ldy, int rb) {
+  using namespace es;
+  simd<float, 16 * R> acc = 0.f;
+  const uint32_t *xr[R];
+#pragma unroll
+  for (int r = 0; r < R; r++) {
+    int p = ids[r < cnt ? r : 0];
+    xr[r] = reinterpret_cast<const uint32_t *>(X16 + (size_t)(w13 ? p / TOPK : p) * ldx);
+  }
+  simd<uint32_t, 256> wb[NB];
+  simd<uint32_t, 8> sb[NB];
+  simd<uint32_t, 32 * R> xb[NB];
+  auto load = [&](int u, int s) {
+#pragma unroll
+    for (int h = 0; h < 4; h++) {
+      simd<uint32_t, 64> t0 = block_load<uint32_t, 64>(wp + (size_t)s * 256 + h * 64);
+      wb[u].template select<64, 1>(64 * h) = t0;
+    }
+    sb[u] = block_load<uint32_t, 8>(sp + (size_t)s * 8);
+#pragma unroll
+    for (int r = 0; r < R; r++) xb[u].template select<32, 1>(32 * r) = block_load<uint32_t, 32>(xr[r] + (size_t)s * 32);
+  };
+#pragma unroll
+  for (int u = 0; u < NB; u++)
+    if (u < nst) load(u, u);
+  for (int s0 = 0; s0 < nst; s0 += NB) {
+#pragma unroll
+    for (int u = 0; u < NB; u++) {
+      int s = s0 + u;
+      if (s < nst) {
+        simd<uint8_t, 32> s8 = sb[u].template bit_cast_view<uint8_t>();
+#pragma unroll
+        for (int blk = 0; blk < 2; blk++) {
+          simd<float, 16 * R> res = 0.f;
+#pragma unroll
+          for (int th = 0; th < 2; th++) {
+            int t = blk * 2 + th;
+            simd<uint32_t, 128> B;
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+              simd<uint32_t, 16> xq = wb[u].template select<16, 1>(64 * t + 16 * q);
+              simd<uint32_t, 16> m0 = xq & 0x00FF00FFu, m1 = (xq >> 8) & 0x00FF00FFu;
+              B.template select<16, 1>(16 * (2 * q)) = fp8_pair(m0);
+              B.template select<16, 1>(16 * (2 * q + 1)) = fp8_pair(m1);
+            }
+            simd<int32_t, 8 * R> a;
+#pragma unroll
+            for (int r = 0; r < R; r++) a.template select<8, 1>(8 * r) = xb[u].template select<8, 1>(32 * r + 8 * t).template bit_cast_view<int32_t>();
+            simd<int32_t, 128> Bi = B.template bit_cast_view<int32_t>();
+            res = xmx::dpas<8, R, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16,
+                            xmx::dpas_argument_type::fp16>(res, Bi, a);
+          }
+          simd<uint8_t, 16> sc8 = s8.template select<16, 1>(16 * blk);
+          simd<uint32_t, 16> sw = convert<uint32_t>(sc8);
+          simd<uint32_t, 16> sbits = (sw + 8u) << 23;  // 2^(s - 127) * 2^8
+          simd<float, 16> sc = sbits.template bit_cast_view<float>();
+#pragma unroll
+          for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) += res.template select<16, 1>(16 * r) * sc;
+        }
+        if (s + NB < nst) load(u, s + NB);
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < R; r++)
+    if (r < cnt) {
+      simd<float, 16> o = acc.template select<16, 1>(16 * r);
+      o.copy_to(Y + (size_t)ids[r] * ldy + rb * 16);
+    }
+}
+
+// K split of the MXFP8 expert kernel: one value for every T (results are batch-invariant). Valid: 1,2,3,6 (18 and 36 supertiles).
+static int fp8_ks() { static const int v = getenv("XIK_FP8_KS") ? atoi(getenv("XIK_FP8_KS")) : 2; return v; }
+// Kernel variants that differ only in register/pipeline structure (identical arithmetic order => bit-identical results):
+//   0: 128 GRF, NB=2   1: 128 GRF, NB=1   2: 256 GRF, NB=2   3: 256 GRF, NB=1
+static int fp8_cfg() { static const int v = getenv("XIK_FP8_CFG") ? atoi(getenv("XIK_FP8_CFG")) : 1; return v; }
+
+template <int NB, bool G256>
+void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper,
+                int maxslots, int rows, int K, float *Y, int ldy, size_t ystride) {
+  const int KSV = fp8_ks();
+  int nrb = rows / 16, nst = K / 64, per = nst / KSV;
+  const int32_t *desc = c->desc, *elist = c->elist;
+  size_t nthreads = (size_t)maxslots * nrb * KSV;
+  auto kernel = [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    size_t gid = it.get_global_id(0);
+    int ks = (int)(gid % KSV);
+    size_t r1 = gid / KSV;
+    int rb = (int)(r1 % nrb);
+    int j = (int)(r1 / nrb);
+    simd<int32_t, 16> d = block_load<int32_t, 16>(desc + j * 16);
+    int cnt = d[1];
+    if (cnt <= 0) return;
+    int e = d[0];
+    const uint32_t *wp = reinterpret_cast<const uint32_t *>(Wp) + (((size_t)e * nrb + rb) * nst + ks * per) * 256;
+    const uint32_t *sp = reinterpret_cast<const uint32_t *>(Sp) + (((size_t)e * nrb + rb) * nst + ks * per) * 8;
+    const sycl::half *xs = X16 + (size_t)ks * per * 64;
+    float *Yk = Y + (size_t)ks * ystride;
+    for (int g0 = 0; g0 < cnt; g0 += 8) {
+      int n = cnt - g0 < 8 ? cnt - g0 : 8;
+      int32_t ids[8];
+      if (g0 == 0) {
+#pragma unroll
+        for (int r = 0; r < 8; r++) ids[r] = d[2 + r];
+      } else {
+        for (int r = 0; r < 8; r++) ids[r] = elist[(size_t)e * maxper + g0 + (r < n ? r : 0)];
+      }
+      if (n <= 1) moe_fp8_body<1, NB>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+      else if (n <= 2) moe_fp8_body<2, NB>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+      else if (n <= 4) moe_fp8_body<4, NB>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+      else moe_fp8_body<8, NB>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+    }
+  };
+  if constexpr (G256) {
+    sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+    c->q.parallel_for(nd_range<1>(nthreads, 16), props, kernel);
+  } else {
+    c->q.parallel_for(nd_range<1>(nthreads, 16), kernel);
+  }
+}
+void moe_fp8g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper,
+              int maxslots, int rows, int K, float *Y, int ldy, size_t ystride) {
+  switch (fp8_cfg()) {
+    case 1: return moe_fp8g_t<1, false>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
+    case 2: return moe_fp8g_t<2, true>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
+    case 3: return moe_fp8g_t<1, true>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
+    default: return moe_fp8g_t<2, false>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
+  }
+}
+
 void k_cvt_f16(xik_ctx *c, const float *x, sycl::half *y, size_t n) {
   c->q.parallel_for(range<1>(n), [=](id<1> i) { y[i[0]] = (sycl::half)x[i[0]]; });
 }
@@ -1501,6 +1668,20 @@ int xik_finalize(xik_ctx *c) {
           w.ctl_down[j] = tp16(c, cp + "down_weight");
           w.ctl_gain[j] = tp16(c, cp + "gain_weight");
           w.ctl_forget[j] = tp16(c, cp + "forget_weight");
+        }
+      }
+      if (is_mxfp8(l) && !getenv("XIK_OLD_FP8")) {
+        for (int m = 0; m < 2; m++) {
+          std::string wn = p + (m ? "mlp.experts.w2_weight" : "mlp.experts.w13_weight");
+          std::string sn = wn + "_scale";
+          int rows = m ? D : 2 * FI, K = m ? FI : D;
+          Buf &wb = c->tensors.at(wn), &sb = c->tensors.at(sn);
+          uint8_t *nw = (uint8_t *)malloc_device(wb.bytes + 64, c->q), *ns = (uint8_t *)malloc_device(sb.bytes + 64, c->q);
+          if (!nw || !ns) throw std::runtime_error("repack alloc failed");
+          k_repack_mxfp8(c, (const uint8_t *)wb.p, (uint32_t *)nw, (const uint8_t *)sb.p, ns, rows, K);
+          c->q.wait();
+          sycl::free(wb.p, c->q); sycl::free(sb.p, c->q);
+          wb.p = nw; sb.p = ns;
         }
       }
       if (!is_mxfp8(l)) {
@@ -2107,10 +2288,21 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   int np = T * TOPK;
   int nks = 1;
   if (is_mxfp8(layer)) {
-    expert_fp8<true>(c, lw, c->in[0], D, c->gu_part, 2 * FI, c->ridx, np, 2 * FI, D);
-    phase(c, P_MOE_W13);
-    k_act(c, np, 1);
-    expert_fp8<false>(c, lw, c->act, FI, c->yp_part, D, c->ridx, np, D, FI);
+    if (getenv("XIK_OLD_FP8")) {
+      expert_fp8<true>(c, lw, c->in[0], D, c->gu_part, 2 * FI, c->ridx, np, 2 * FI, D);
+      phase(c, P_MOE_W13);
+      k_act(c, np, 1);
+      expert_fp8<false>(c, lw, c->act, FI, c->yp_part, D, c->ridx, np, D, FI);
+    } else {
+      k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
+      k_group(c, np, T);
+      int slots = std::min(NE, np);
+      nks = fp8_ks();
+      moe_fp8g(c, lw.w13, lw.w13_s, c->x16_in, D, true, T, slots, 2 * FI, D, c->gu_part, 2 * FI, (size_t)np * 2 * FI);
+      phase(c, P_MOE_W13);
+      k_act(c, np, nks);
+      moe_fp8g(c, lw.w2, lw.w2_s, c->x16_act, FI, false, T, slots, D, FI, c->yp_part, D, (size_t)np * D);
+    }
   } else {
     int mcfg = (c->moe_cfg >= 0) ? c->moe_cfg : 1;  // one K split for every T: results must not depend on the verify width
     nks = MOE_CFGS[mcfg].ks;
@@ -2429,7 +2621,7 @@ extern "C" void xik_set_moe_cfg(xik_ctx *c, int cfg) { c->moe_cfg = cfg; }
 // (distinct per token). Returns average microseconds per call and the bytes of expert weights it touches.
 extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, int iters, double *out_us, double *out_bytes) {
   try {
-    if (is_mxfp8(layer)) throw std::runtime_error("fp4 layers only");
+    const bool fp8l = is_mxfp8(layer);
     const LayerW &lw = c->L[layer];
     int np = T * TOPK;
     std::vector<int32_t> r(np);
@@ -2444,6 +2636,12 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
     for (int e : r) if (!seen[e]) { seen[e] = 1; distinct++; }
     int it = 0;
     auto run = [&]() {
+      if (fp8l) {
+        const LayerW &lq = c->L[20 + (it++ % 4)];  // 4 MXFP8 layers x ~1 GB: cold weights every call
+        if (kind == 0) moe_fp8g(c, lq.w13, lq.w13_s, c->x16_in, D, true, T, slots, 2 * FI, D, c->gu_part, 2 * FI, (size_t)np * 2 * FI);
+        else moe_fp8g(c, lq.w2, lq.w2_s, c->x16_act, FI, false, T, slots, D, FI, c->yp_part, D, (size_t)np * D);
+        return;
+      }
       const LayerW &lq = c->L[(layer + (it++ % 20)) % 20];  // rotate over 20 layers: weights are cold every call
       if (kind == 0)
         moe_fp4g(c, cfg, lq.w13, lq.w13_s, c->x16_in, D, true, lq.w13_amax, lq.w13_den, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
@@ -2458,7 +2656,8 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
     c->q.wait();
     double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
     *out_us = us;
-    *out_bytes = (double)distinct * (kind == 0 ? (2.0 * FI * D / 2 + 2.0 * FI * D / 16) : ((double)D * FI / 2 + (double)D * FI / 16));
+    if (fp8l) *out_bytes = (double)distinct * (kind == 0 ? (2.0 * FI * D * (1 + 1.0 / 32)) : ((double)D * FI * (1 + 1.0 / 32)));
+    else *out_bytes = (double)distinct * (kind == 0 ? (2.0 * FI * D / 2 + 2.0 * FI * D / 16) : ((double)D * FI / 2 + (double)D * FI / 16));
     return 0;
   } catch (std::exception &e) {
     g_err = e.what();

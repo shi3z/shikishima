@@ -39,9 +39,48 @@ fn main() {
         eprintln!("T=1 step: wall {:.2} ms | host submit finished at {:.2} ms | complete at {:.2} ms (in-forward timers)", wall, (after[14] - before[14]) / n as f64 / 1e3, (after[15] - before[15]) / n as f64 / 1e3);
         return;
     }
+    if a.iter().any(|x| x == "--bench-prefill") {
+        // time per forward pass of T new tokens (plain forward, state reset between sizes)
+        for t in [1usize, 2, 4, 8, 16, 32, 64] {
+            let toks: Vec<i32> = (0..t as i32).map(|i| 1000 + i * 37).collect();
+            e.reset();
+            e.forward(&toks, false, true).unwrap(); // warm-up
+            let mut v = vec![];
+            for _ in 0..5 {
+                e.reset();
+                let t0 = Instant::now();
+                e.forward(&toks, false, true).unwrap();
+                v.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!("T={t:3}: {:7.1} ms per pass = {:6.2} ms/token = {:7.0} tok/s", v[2], v[2] / t as f64, t as f64 / v[2] * 1e3);
+        }
+        return;
+    }
+    if let Some(i) = a.iter().position(|x| x == "--loop-pass") {
+        // repeat one T-token pass many times (for VTune): xi-run <dir> x 1 --loop-pass T N
+        let t: usize = a[i + 1].parse().unwrap();
+        let nn: usize = a[i + 2].parse().unwrap();
+        let toks: Vec<i32> = (0..t as i32).map(|i| 1000 + i * 37).collect();
+        for _ in 0..nn {
+            e.reset();
+            e.forward(&toks, false, true).unwrap();
+        }
+        return;
+    }
     if a.iter().any(|x| x == "--bench-launch") {
         eprintln!("empty kernel      : {:.2} us/launch (back to back, in-order queue)", e.bench_launch(4000, 1));
         eprintln!("1-WG rmsnorm (T=1): {:.2} us/launch", e.bench_launch(4000, 0));
+        return;
+    }
+    if a.iter().any(|x| x == "--bench-fp8") {
+        // cold MXFP8 expert kernel (layers 20-23): T tokens x 8 experts
+        for t in [1usize, 8] {
+            for kind in 0..2 {
+                let (us, by) = e.bench_moe(20, kind, 0, t as i32, 200).unwrap();
+                eprintln!("T={t} {} : {:7.1} us  {:6.1} MB  = {:6.1} GB/s", if kind == 0 { "w13" } else { "w2 " }, us, by / 1e6, by / us / 1e3);
+            }
+        }
         return;
     }
     if a.iter().any(|x| x == "--bench-moe") {
