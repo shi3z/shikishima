@@ -25,6 +25,20 @@ fn main() {
         eprintln!("{}", xeinkling::spec::profile_cycles(&mut e, &ids, cyc, k).unwrap());
         return;
     }
+    if a.iter().any(|x| x == "--bench-submit") {
+        let c0 = e.prefill_drafting(&ids).unwrap();
+        let mut cur = c0;
+        for _ in 0..8 { cur = e.forward(&[cur], false, true).unwrap()[0]; }
+        e.prof(false);
+        let n = 60;
+        let before = e.prof_us();
+        let t = Instant::now();
+        for _ in 0..n { cur = e.forward(&[cur], false, true).unwrap()[0]; }
+        let wall = t.elapsed().as_secs_f64() * 1e3 / n as f64;
+        let after = e.prof_us();
+        eprintln!("T=1 step: wall {:.2} ms | host submit finished at {:.2} ms | complete at {:.2} ms (in-forward timers)", wall, (after[14] - before[14]) / n as f64 / 1e3, (after[15] - before[15]) / n as f64 / 1e3);
+        return;
+    }
     if a.iter().any(|x| x == "--bench-launch") {
         eprintln!("empty kernel      : {:.2} us/launch (back to back, in-order queue)", e.bench_launch(4000, 1));
         eprintln!("1-WG rmsnorm (T=1): {:.2} us/launch", e.bench_launch(4000, 0));

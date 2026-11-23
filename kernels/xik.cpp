@@ -12,7 +12,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <array>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 #include "xik.h"
@@ -134,7 +136,9 @@ struct xik_ctx {
   float *stream, *mix[3], *msg[4], *in[3], *tmp0, *tmp1;
   float *qb, *kb, *vb, *rb, *sinkb, *gateb, *dynk, *dynv, *attn_o, *ao2, *hid, *pairb;
   float *gu, *act, *ypair, *gu_part, *yp_part; sycl::half *x16_in, *x16_act; int nks = 1; float *rep_dummy, *rwt, *logits, *moe_o, *convout, *scr;
-  int32_t *ridx, *ids_d, *am_d;
+  int32_t *ridx, *ids_d, *am_d, *dparams = nullptr;
+  std::map<std::array<int, 4>, std::shared_ptr<sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>>> graphs;
+  bool graph_failed = false;
   float *trace_dev = nullptr, *trace_host = nullptr;
   bool prof = false;
   double prof_us[16] = {0};
@@ -1062,6 +1066,7 @@ void k_kv(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
   ConvArgs av{c->vb, so + 3 * KVD, sn ? sn + 3 * KVD : nullptr, nullptr, nullptr, KVD, T, local ? lw.v_conv : nullptr, lw.v_static,
               c->dynv, NKV, local ? 2.2360679775f : 3.0f};
   float *kc = c->kcache[slot], *vc = c->vcache[slot];
+  const int32_t *dpp = c->dparams;
   int ngrp = T * NKV, nst = sn ? 3 * KVD / HD : 0;
   c->q.parallel_for(nd_range<1>((size_t)(ngrp + nst) * HD, HD), [=](nd_item<1> it) {
     int idx = it.get_group(0), d = it.get_local_id(0);
@@ -1079,7 +1084,7 @@ void k_kv(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
     float ks = reduce_over_group(g, kv * kv, plus<float>());
     float vs = reduce_over_group(g, vv * vv, plus<float>());
     float f = sycl::fmin(QK_CLIP / (sycl::sqrt(ks) + 1e-6f), 1.0f);
-    int pos = pos0 + t;
+    int pos = dpp[0] + t;
     size_t slotpos = local ? (pos % RING) : pos;
     kc[slotpos * KVD + ch] = rbf(kv * f);
     vc[slotpos * KVD + ch] = vv * sycl::rsqrt(vs / HD + EPS);
@@ -1091,6 +1096,7 @@ void k_attn(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0)
   const float *kc = c->kcache[slot], *vc = c->vcache[slot];
   const uint16_t *rp = lw.rel_proj;
   float *out = c->attn_o;
+  const int32_t *dpp = c->dparams;
   int maxkeys = local ? WIN : c->max_ctx;
   const float scale = 1.0f / sycl::sqrt((float)HD);
   c->q.submit([&](handler &h) {
@@ -1101,7 +1107,7 @@ void k_attn(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0)
       int idx = it.get_group(0), tid = it.get_local_id(0);
       int t = idx / NH, hh = idx % NH, kvh = hh / (NH / NKV);
       auto g = it.get_group();
-      int pos = pos0 + t;
+      int pos = dpp[0] + t;
       int lo = local ? sycl::max(0, pos - WIN + 1) : 0;
       int nk = pos - lo + 1;
       qs[tid] = q[(size_t)t * QD + hh * HD + tid];
@@ -1476,7 +1482,8 @@ int xik_finalize(xik_ctx *c) {
     }
     c->logits = A((size_t)T * VOCAB);
     c->ridx = dalloc<int32_t>(c, (size_t)T * TOPK);
-    c->ids_d = dalloc<int32_t>(c, T);
+    c->ids_d = dalloc<int32_t>(c, T + 8);
+    c->dparams = c->ids_d + T;
     c->am_d = dalloc<int32_t>(c, T);
     c->trace_dev = A((size_t)NSLOT * T * D);
     init_drafter(c);
@@ -2028,15 +2035,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
 
 }  // namespace
 
-static int do_forward(xik_ctx *c, const int32_t *ids, int T, float *logits_last, int32_t *out_argmax, bool defer) {
-  try {
-    c->defer = defer;
-    if (T < 1 || T > c->max_tokens) throw std::runtime_error("bad T");
-    if (c->pos + T > c->max_ctx) throw std::runtime_error("context overflow");
-    if (c->pos + T > 8192) throw std::runtime_error("log-scaling beyond 8192 tokens not implemented yet");
-    const int pos0 = c->pos;
-    if (c->prof) { c->q.wait(); c->tprev = std::chrono::steady_clock::now(); }
-    c->q.memcpy(c->ids_d, ids, (size_t)T * 4);
+static void enqueue_body(xik_ctx *c, int T, int rows, bool out_argmax, int pos0) {
     Fwd f;
     for (int i = 9; i >= 0; i--) f.freel.push_back(c->pool[i]);
     f.cur = f.pop();
@@ -2098,15 +2097,66 @@ static int do_forward(xik_ctx *c, const int32_t *ids, int T, float *logits_last,
       k_wnorm(c, na, T);
       k_capture(c, c->in[0], 3, T);
     }
-    int rows = out_argmax ? T : 1;
     const float *hx = out_argmax ? c->in[0] : c->in[0] + (size_t)(T - 1) * D;
     gemv_bf16(c, c->unembed, hx, D, c->logits, VOCAB, VOCAB, D, rows, false);
     k_softcap_argmax(c, rows);
     phase(c, P_HEAD);
+}
+
+static int do_forward(xik_ctx *c, const int32_t *ids, int T, float *logits_last, int32_t *out_argmax, bool defer) {
+  try {
+    c->defer = defer;
+    if (T < 1 || T > c->max_tokens) throw std::runtime_error("bad T");
+    if (c->pos + T > c->max_ctx) throw std::runtime_error("context overflow");
+    if (c->pos + T > 8192) throw std::runtime_error("log-scaling beyond 8192 tokens not implemented yet");
+    const int pos0 = c->pos;
+    auto t_fwd0 = std::chrono::steady_clock::now();
+    if (c->prof) { c->q.wait(); c->tprev = std::chrono::steady_clock::now(); }
+    int rows = out_argmax ? T : 1;
+    c->q.memcpy(c->ids_d, ids, (size_t)T * 4);
+    c->q.memcpy(c->dparams, &pos0, 4);
+    static const bool want_graph = getenv("XIK_GRAPH") != nullptr;
+    bool use_graph = want_graph && out_argmax && !c->prof && !c->trace_host && T <= 8 && !c->graph_failed;
+    if (use_graph)
+      for (int sl = 1; sl < NSLOT; sl++) if (c->cpar[sl] != c->cpar[0]) use_graph = false;
+    if (use_graph) {
+      namespace gx = sycl::ext::oneapi::experimental;
+      std::array<int, 4> key{T, rows, defer ? 1 : 0, c->cpar[0]};
+      auto it = c->graphs.find(key);
+      try {
+        if (it == c->graphs.end()) {
+          int saved[NSLOT];
+          memcpy(saved, c->cpar, sizeof(saved));
+          gx::command_graph<gx::graph_state::modifiable> g(c->q.q.get_context(), c->q.q.get_device());
+          g.begin_recording(c->q.q);
+          enqueue_body(c, T, rows, out_argmax != nullptr, pos0);
+          g.end_recording();
+          memcpy(c->cpar, saved, sizeof(saved));
+          auto ge = std::make_shared<gx::command_graph<gx::graph_state::executable>>(g.finalize());
+          it = c->graphs.emplace(key, ge).first;
+        }
+        c->q.q.ext_oneapi_graph(*it->second);
+        if (!defer) for (int sl = 0; sl < NSLOT; sl++) c->cpar[sl] ^= 1;
+      } catch (std::exception &ex) {
+        fprintf(stderr, "xik: graph path disabled (%s)\n", ex.what());
+        c->graph_failed = true;
+        c->q.wait();
+        throw;
+      }
+    } else {
+      enqueue_body(c, T, rows, out_argmax != nullptr, pos0);
+    }
     if (out_argmax) c->q.memcpy(out_argmax, c->am_d, (size_t)T * 4);
     if (logits_last) c->q.memcpy(logits_last, c->logits + (size_t)(rows - 1) * VOCAB, (size_t)VOCAB_U * 4);
     if (c->trace_host) c->q.memcpy(c->trace_host, c->trace_dev, (size_t)NSLOT * T * D * 4);
+    static const bool timing = getenv("XIK_TIMING") != nullptr;
+    auto t_sub = std::chrono::steady_clock::now();
     c->q.wait();
+    if (timing) {
+      auto t_end = std::chrono::steady_clock::now();
+      c->prof_us[14] += std::chrono::duration<double, std::micro>(t_sub - t_fwd0).count();
+      c->prof_us[15] += std::chrono::duration<double, std::micro>(t_end - t_fwd0).count();
+    }
     if (defer) c->pend_T = T; else c->pos += T;
     c->defer = false;
     return 0;
