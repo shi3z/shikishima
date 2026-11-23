@@ -117,6 +117,7 @@ struct xik_ctx {
   float *cap = nullptr;
   int cap_pos = 0, ing_pos = 0;  // hidden-state ring: rows written / rows already fed to the drafter
   int32_t *ecnt = nullptr, *elist = nullptr, *act_e = nullptr, *nact = nullptr, *desc = nullptr;
+  int8_t *ahi = nullptr; uint8_t *alo = nullptr; float *asx = nullptr;  // INT8 path: activation planes + per-row scales
   int moe_cfg = -1;
   // ---- DSpark drafter
   bool has_dr = false;
@@ -1074,6 +1075,147 @@ void moe_fp8g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half
   }
 }
 
+// ================================================================ INT8 DPAS path for MXFP8 layers (XIK_INT8=1, lossy)
+// The MXFP8 weights are re-quantised once at load into signed 8-bit integers with one bf16 scale per (row, 32-element
+// block):  q = clamp(rint(w / s), -127, 127),  s = bf16(max|w| / 127)  (measured error ~0.55% RMS, about 1/7 of the e4m3
+// rounding itself).  The integers are DPAS B operands as they are (no unpacking at run time).
+// Activations are quantised per token to int16 (scale max|x| / 32767) and split in a signed high and an unsigned low
+// byte plane; both planes go through s8/u8 DPAS and  acc = hi * 256 + lo.
+//   Wi[e][rb16][kb32][r=8][n=16] dwords: dword (r, n) = bytes q[n][32*kb + 4r .. 4r+3]
+//   Si[e][rb16][kb32][n=16]      bf16 scales
+void k_requant_int8(xik_ctx *c, const uint8_t *raw, const uint8_t *sraw, uint32_t *dst, uint16_t *sdst, int rows, int K) {
+  int nrb = rows / 16, nkb = K / 32;
+  size_t items = (size_t)NE * nrb * nkb * 16;
+  c->q.parallel_for(range<1>(items), [=](id<1> id) {
+    size_t i = id[0];
+    int n = (int)(i % 16);
+    size_t t = i / 16;
+    int kb = (int)(t % nkb);
+    t /= nkb;
+    int rb = (int)(t % nrb);
+    int e = (int)(t / nrb);
+    size_t row = (size_t)e * rows + rb * 16 + n;
+    float scl = sycl::bit_cast<float>((uint32_t)sraw[row * nkb + kb] << 23);  // 2^(s-127)
+    float w[32], mx = 0.f;
+    for (int k = 0; k < 32; k++) {
+      uint32_t b = raw[row * K + (size_t)kb * 32 + k];
+      w[k] = e4m3(b) * scl;
+      mx = sycl::fmax(mx, sycl::fabs(w[k]));
+    }
+    float sc = rbf(mx / 127.0f);
+    if (sc == 0.f) sc = 1.0f;
+    float inv = 1.0f / sc;
+    uint32_t *wd = dst + (((size_t)e * nrb + rb) * nkb + kb) * 128;
+    for (int r = 0; r < 8; r++) {
+      uint32_t word = 0;
+      for (int j = 0; j < 4; j++) {
+        int q = (int)sycl::rint(w[4 * r + j] * inv);
+        q = sycl::clamp(q, -127, 127);
+        word |= (uint32_t)(q & 0xFF) << (8 * j);
+      }
+      wd[r * 16 + n] = word;
+    }
+    sdst[(((size_t)e * nrb + rb) * nkb + kb) * 16 + n] = (uint16_t)(sycl::bit_cast<uint32_t>(sc) >> 16);
+  });
+}
+
+// per token: int16 quantisation of x (bf16-valued fp32): hi (s8) and lo (u8) byte planes, scale sx = max|x| / 32767
+void k_quant_act16(xik_ctx *c, const float *x, int ldx, int K, int rows, int8_t *hi, uint8_t *lo, float *sx) {
+  c->q.parallel_for(nd_range<1>((size_t)rows * 256, 256), [=](nd_item<1> it) {
+    int r = it.get_group(0), l = it.get_local_id(0);
+    float mx = 0.f;
+    for (int k = l; k < K; k += 256) mx = sycl::fmax(mx, sycl::fabs(x[(size_t)r * ldx + k]));
+    mx = reduce_over_group(it.get_group(), mx, maximum<float>());
+    float s = mx > 0.f ? mx / 32767.0f : 1.0f;
+    float inv = 1.0f / s;
+    if (l == 0) sx[r] = s;
+    for (int k = l; k < K; k += 256) {
+      int q = (int)sycl::rint(x[(size_t)r * ldx + k] * inv);
+      q = sycl::clamp(q, -32767, 32767);
+      hi[(size_t)r * K + k] = (int8_t)(q >> 8);  // arithmetic shift: floor(q / 256)
+      lo[(size_t)r * K + k] = (uint8_t)(q & 0xFF);
+    }
+  });
+}
+
+template <int R>
+ESIMD_INLINE void moe_i8_body(const uint32_t *wp, const uint16_t *sp, const int8_t *xhi, const uint8_t *xlo, const float *sxp,
+                              int Kx, bool w13, const int32_t *ids, int cnt, int nkb, float *Y, int ldy, int rb) {
+  using namespace es;
+  simd<float, 16 * R> acc = 0.f;
+  const uint32_t *hr[R], *lr[R];
+  float sx[R];
+#pragma unroll
+  for (int r = 0; r < R; r++) {
+    int p = ids[r < cnt ? r : 0];
+    int row = w13 ? p / TOPK : p;
+    hr[r] = reinterpret_cast<const uint32_t *>(xhi + (size_t)row * Kx);
+    lr[r] = reinterpret_cast<const uint32_t *>(xlo + (size_t)row * Kx);
+    sx[r] = sxp[row];
+  }
+  for (int kb = 0; kb < nkb; kb++) {
+    simd<uint32_t, 128> B = block_load<uint32_t, 128>(wp + (size_t)kb * 128);
+    simd<uint16_t, 16> sb16 = block_load<uint16_t, 16>(sp + (size_t)kb * 16);
+    simd<uint32_t, 16> sbits = convert<uint32_t>(sb16) << 16;
+    simd<float, 16> sc = sbits.template bit_cast_view<float>();
+    simd<int32_t, 8 * R> ah, al;
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+      simd<uint32_t, 8> h8 = block_load<uint32_t, 8>(hr[r] + (size_t)kb * 8);
+      simd<uint32_t, 8> l8 = block_load<uint32_t, 8>(lr[r] + (size_t)kb * 8);
+      ah.template select<8, 1>(8 * r) = h8.template bit_cast_view<int32_t>();
+      al.template select<8, 1>(8 * r) = l8.template bit_cast_view<int32_t>();
+    }
+    simd<int32_t, 128> Bi = B.template bit_cast_view<int32_t>();
+    simd<int32_t, 16 * R> z = 0;
+    simd<int32_t, 16 * R> rh = xmx::dpas<8, R, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::s8, xmx::dpas_argument_type::s8>(z, Bi, ah);
+    simd<int32_t, 16 * R> rl = xmx::dpas<8, R, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::s8, xmx::dpas_argument_type::u8>(z, Bi, al);
+    simd<float, 16 * R> f = convert<float>(rh) * 256.0f + convert<float>(rl);
+#pragma unroll
+    for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) += f.template select<16, 1>(16 * r) * sc;
+  }
+#pragma unroll
+  for (int r = 0; r < R; r++)
+    if (r < cnt) {
+      simd<float, 16> o = acc.template select<16, 1>(16 * r) * sx[r];
+      o.copy_to(Y + (size_t)ids[r] * ldy + rb * 16);
+    }
+}
+
+void moe_i8g(xik_ctx *c, const uint8_t *Wi, const uint8_t *Si, const int8_t *xhi, const uint8_t *xlo, const float *sx, int Kx,
+             bool w13, int maxper, int maxslots, int rows, int K, float *Y, int ldy) {
+  int nrb = rows / 16, nkb = K / 32;
+  const int32_t *desc = c->desc, *elist = c->elist;
+  size_t nthreads = (size_t)maxslots * nrb;
+  c->q.parallel_for(nd_range<1>(nthreads, 16), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    size_t gid = it.get_global_id(0);
+    int rb = (int)(gid % nrb);
+    int j = (int)(gid / nrb);
+    simd<int32_t, 16> d = block_load<int32_t, 16>(desc + j * 16);
+    int cnt = d[1];
+    if (cnt <= 0) return;
+    int e = d[0];
+    const uint32_t *wp = reinterpret_cast<const uint32_t *>(Wi) + ((size_t)e * nrb + rb) * nkb * 128;
+    const uint16_t *sp = reinterpret_cast<const uint16_t *>(Si) + ((size_t)e * nrb + rb) * nkb * 16;
+    for (int g0 = 0; g0 < cnt; g0 += 8) {
+      int n = cnt - g0 < 8 ? cnt - g0 : 8;
+      int32_t ids[8];
+      if (g0 == 0) {
+#pragma unroll
+        for (int r = 0; r < 8; r++) ids[r] = d[2 + r];
+      } else {
+        for (int r = 0; r < 8; r++) ids[r] = elist[(size_t)e * maxper + g0 + (r < n ? r : 0)];
+      }
+      if (n <= 1) moe_i8_body<1>(wp, sp, xhi, xlo, sx, Kx, w13, ids, n, nkb, Y, ldy, rb);
+      else if (n <= 2) moe_i8_body<2>(wp, sp, xhi, xlo, sx, Kx, w13, ids, n, nkb, Y, ldy, rb);
+      else if (n <= 4) moe_i8_body<4>(wp, sp, xhi, xlo, sx, Kx, w13, ids, n, nkb, Y, ldy, rb);
+      else moe_i8_body<8>(wp, sp, xhi, xlo, sx, Kx, w13, ids, n, nkb, Y, ldy, rb);
+    }
+  });
+}
+static bool use_int8() { static const bool v = getenv("XIK_INT8") != nullptr; return v; }
+
 void k_cvt_f16(xik_ctx *c, const float *x, sycl::half *y, size_t n) {
   c->q.parallel_for(range<1>(n), [=](id<1> i) { y[i[0]] = (sycl::half)x[i[0]]; });
 }
@@ -1670,7 +1812,21 @@ int xik_finalize(xik_ctx *c) {
           w.ctl_forget[j] = tp16(c, cp + "forget_weight");
         }
       }
-      if (is_mxfp8(l) && !getenv("XIK_OLD_FP8")) {
+      if (is_mxfp8(l) && use_int8()) {
+        for (int m = 0; m < 2; m++) {
+          std::string wn = p + (m ? "mlp.experts.w2_weight" : "mlp.experts.w13_weight");
+          std::string sn = wn + "_scale";
+          int rows = m ? D : 2 * FI, K = m ? FI : D;
+          Buf &wb = c->tensors.at(wn), &sb = c->tensors.at(sn);
+          size_t nbw = (size_t)NE * rows * K, nbs = (size_t)NE * rows * (K / 32) * 2;
+          uint8_t *nw = (uint8_t *)malloc_device(nbw + 64, c->q), *ns = (uint8_t *)malloc_device(nbs + 64, c->q);
+          if (!nw || !ns) throw std::runtime_error("int8 repack alloc failed");
+          k_requant_int8(c, (const uint8_t *)wb.p, (const uint8_t *)sb.p, (uint32_t *)nw, (uint16_t *)ns, rows, K);
+          c->q.wait();
+          sycl::free(wb.p, c->q); sycl::free(sb.p, c->q);
+          wb.p = nw; sb.p = ns; wb.bytes = nbw; sb.bytes = nbs;
+        }
+      } else if (is_mxfp8(l) && !getenv("XIK_OLD_FP8")) {
         for (int m = 0; m < 2; m++) {
           std::string wn = p + (m ? "mlp.experts.w2_weight" : "mlp.experts.w13_weight");
           std::string sn = wn + "_scale";
@@ -1753,6 +1909,7 @@ int xik_finalize(xik_ctx *c) {
     c->moe_o = A((size_t)T * D);
     c->convout = A((size_t)T * D);
     c->scr = A(8192);
+    c->ahi = dalloc<int8_t>(c, (size_t)T * TOPK * 2304); c->alo = dalloc<uint8_t>(c, (size_t)T * TOPK * 2304); c->asx = dalloc<float>(c, (size_t)T * TOPK);
     c->ecnt = dalloc<int32_t>(c, NE); c->elist = dalloc<int32_t>(c, (size_t)NE * T); c->act_e = dalloc<int32_t>(c, NE); c->nact = dalloc<int32_t>(c, 4); c->desc = dalloc<int32_t>(c, (size_t)NE * 16);
     c->cap = A((size_t)CAPR * 4 * D);
     for (int sl = 0; sl < NSLOT; sl++) {
@@ -2288,7 +2445,17 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   int np = T * TOPK;
   int nks = 1;
   if (is_mxfp8(layer)) {
-    if (getenv("XIK_OLD_FP8")) {
+    if (use_int8()) {
+      int slots = std::min(NE, np);
+      k_group(c, np, T);
+      k_quant_act16(c, c->in[0], D, D, T, c->ahi, c->alo, c->asx);
+      moe_i8g(c, lw.w13, lw.w13_s, c->ahi, c->alo, c->asx, D, true, T, slots, 2 * FI, D, c->gu_part, 2 * FI);
+      phase(c, P_MOE_W13);
+      nks = 1;
+      k_act(c, np, 1);
+      k_quant_act16(c, c->act, FI, FI, np, c->ahi, c->alo, c->asx);
+      moe_i8g(c, lw.w2, lw.w2_s, c->ahi, c->alo, c->asx, FI, false, T, slots, D, FI, c->yp_part, D);
+    } else if (getenv("XIK_OLD_FP8")) {
       expert_fp8<true>(c, lw, c->in[0], D, c->gu_part, 2 * FI, c->ridx, np, 2 * FI, D);
       phase(c, P_MOE_W13);
       k_act(c, np, 1);
