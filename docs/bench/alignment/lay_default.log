@@ -1,0 +1,329 @@
+load 8.3s
+layer 0 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55b94800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55b94800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55ba8e00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55bab800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55bab800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55bb5c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b0000/0xffffffffff6c0000
+  dense: wq tiles 0xffffd55b58e00000 mod256 0 | wo 0xffffd55b59e00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 1 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55bb7200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55bb7200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55bcb800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55bce200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55bce200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55bd8600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b0c00/0xffffffffff6c0400
+  dense: wq tiles 0xffffd55b5a600000 mod256 0 | wo 0xffffd55b5b600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 2 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55bd9c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55bd9c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55bee200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55bf0c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55bf0c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55bfb000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b9000/0xffffffffff6c3000
+  dense: wq tiles 0xffffd55b5be00000 mod256 0 | wo 0xffffd55b5ce00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 3 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55bfc600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55bfc600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55c10c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55c13600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55c13600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55c1da00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6bac00/0xffffffffff6c3400
+  dense: wq tiles 0xffffd55b5d600000 mod256 0 | wo 0xffffd55b5e600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 4 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55c1f000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55c1f000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55c33600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55c36000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55c36000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55c40400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6bb800/0xffffffffff6c3800
+  dense: wq tiles 0xffffd55b5ee00000 mod256 0 | wo 0xffffd55b5fe00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 5 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55c41a00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55c41a00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55c56000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55c58a00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55c58a00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55c62e00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6bc400/0xffffffffff6c3c00
+  dense: wq tiles 0xffffd55b60600000 mod256 0 | wo 0xffffd55b61600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 6 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55c64400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55c64400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55c78a00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55c7b400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55c7b400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55c85800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6bd000/0xffffffffff6c4000
+  dense: wq tiles 0xffffd55b61e00000 mod256 0 | wo 0xffffd55b62e00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 7 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55c86e00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55c86e00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55c9b400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55c9de00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55c9de00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55ca8200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6bdc00/0xffffffffff6c4400
+  dense: wq tiles 0xffffd55b63600000 mod256 0 | wo 0xffffd55b64600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 8 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55ca9800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55ca9800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55cbde00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55cc0800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55cc0800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55ccac00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6be800/0xffffffffff6c4800
+  dense: wq tiles 0xffffd55b64e00000 mod256 0 | wo 0xffffd55b65e00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 9 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55ccc200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55ccc200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55ce0800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55ce3200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55ce3200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55ced600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6bf400/0xffffffffff6c4c00
+  dense: wq tiles 0xffffd55b66600000 mod256 0 | wo 0xffffd55b67600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 10 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55ceec00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55ceec00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55d03200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55d05c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55d05c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55d10000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b1800/0xffffffffff6c0800
+  dense: wq tiles 0xffffd55b67e00000 mod256 0 | wo 0xffffd55b68e00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 11 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55d11600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55d11600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55d25c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55d28600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55d28600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55d32a00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b2400/0xffffffffff6c0c00
+  dense: wq tiles 0xffffd55b69600000 mod256 0 | wo 0xffffd55b6a600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 12 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55d34000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55d34000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55d48600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55d4b000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55d4b000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55d55400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b3000/0xffffffffff6c1000
+  dense: wq tiles 0xffffd55b6ae00000 mod256 0 | wo 0xffffd55b6be00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 13 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55d56a00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55d56a00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55d6b000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55d6da00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55d6da00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55d77e00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b3c00/0xffffffffff6c1400
+  dense: wq tiles 0xffffd55b6c600000 mod256 0 | wo 0xffffd55b6d600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 14 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55d79400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55d79400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55d8da00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55d90400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55d90400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55d9a800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b4800/0xffffffffff6c1800
+  dense: wq tiles 0xffffd55b6de00000 mod256 0 | wo 0xffffd55b6ee00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 15 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55d9be00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55d9be00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55db0400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55db2e00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55db2e00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55dbd200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b5400/0xffffffffff6c1c00
+  dense: wq tiles 0xffffd55b6f600000 mod256 0 | wo 0xffffd55b70600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 16 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55dbe800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55dbe800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55dd2e00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55dd5800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55dd5800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55ddfc00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b6000/0xffffffffff6c2000
+  dense: wq tiles 0xffffd55b70e00000 mod256 0 | wo 0xffffd55b71e00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 17 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55de1200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55de1200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55df5800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55df8200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55df8200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55e02600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b6c00/0xffffffffff6c2400
+  dense: wq tiles 0xffffd55b72600000 mod256 0 | wo 0xffffd55b73600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 18 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55e03c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55e03c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55e18200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55e1ac00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55e1ac00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55e25000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b7800/0xffffffffff6c2800
+  dense: wq tiles 0xffffd55b73e00000 mod256 0 | wo 0xffffd55b74e00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 19 (NVFP4)
+  NVFP4 w13 (rows 2304, K 2304, 144 row blocks x 36 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55e26600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55e26600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55e3ac00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  NVFP4 w2  (rows 2304, K 1152, 144 row blocks x 18 supertiles), per-thread streams:
+    weights tile[0:256)    base 0xffffd55e3d600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights tile[256:512)  base 0xffffd55e3d600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (64 B/supertile) base 0xffffd55e47a00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 64 B | common alignment 64 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den 0xffffffffff6b8400/0xffffffffff6c2c00
+  dense: wq tiles 0xffffd55b75600000 mod256 0 | wo 0xffffd55b76600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 20 (MXFP8)
+  MXFP8 w13 (rows 2304, K 2304), per-thread streams:
+    weights 4x256 B        base 0xffffd55e49000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 1024 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +64 dw (h=1)   base 0xffffd55e49000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +128 dw (h=2)  base 0xffffd55e49000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +192 dw (h=3)  base 0xffffd55e49000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (32 B/supertile) base 0xffffd55e71a00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 32 B | common alignment 32 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  MXFP8 w2  (rows 2304, K 1152), per-thread streams:
+    weights 4x256 B        base 0xffffd55e73000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 1024 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +64 dw (h=1)   base 0xffffd55e73000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +128 dw (h=2)  base 0xffffd55e73000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +192 dw (h=3)  base 0xffffd55e73000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (32 B/supertile) base 0xffffd55b4ea00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 32 B | common alignment 32 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den (nil)/(nil)
+  dense: wq tiles 0xffffd55b76e00000 mod256 0 | wo 0xffffd55b77e00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 21 (MXFP8)
+  MXFP8 w13 (rows 2304, K 2304), per-thread streams:
+    weights 4x256 B        base 0xffffd55e87600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 1024 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +64 dw (h=1)   base 0xffffd55e87600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +128 dw (h=2)  base 0xffffd55e87600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +192 dw (h=3)  base 0xffffd55e87600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (32 B/supertile) base 0xffffd55eb0000000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 32 B | common alignment 32 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  MXFP8 w2  (rows 2304, K 1152), per-thread streams:
+    weights 4x256 B        base 0xffffd55eb1600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 1024 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +64 dw (h=1)   base 0xffffd55eb1600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +128 dw (h=2)  base 0xffffd55eb1600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +192 dw (h=3)  base 0xffffd55eb1600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (32 B/supertile) base 0xffffd55a52400000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 32 B | common alignment 32 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den (nil)/(nil)
+  dense: wq tiles 0xffffd55b78600000 mod256 0 | wo 0xffffd55b79600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 22 (MXFP8)
+  MXFP8 w13 (rows 2304, K 2304), per-thread streams:
+    weights 4x256 B        base 0xffffd55ec5c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 1024 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +64 dw (h=1)   base 0xffffd55ec5c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +128 dw (h=2)  base 0xffffd55ec5c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +192 dw (h=3)  base 0xffffd55ec5c00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (32 B/supertile) base 0xffffd55eee600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 32 B | common alignment 32 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  MXFP8 w2  (rows 2304, K 1152), per-thread streams:
+    weights 4x256 B        base 0xffffd55eefc00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 1024 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +64 dw (h=1)   base 0xffffd55eefc00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +128 dw (h=2)  base 0xffffd55eefc00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +192 dw (h=3)  base 0xffffd55eefc00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (32 B/supertile) base 0xffffd55a54600000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 32 B | common alignment 32 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den (nil)/(nil)
+  dense: wq tiles 0xffffd55b79e00000 mod256 0 | wo 0xffffd55b7ae00000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0
+layer 23 (MXFP8)
+  MXFP8 w13 (rows 2304, K 2304), per-thread streams:
+    weights 4x256 B        base 0xffffd55f04200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 1024 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +64 dw (h=1)   base 0xffffd55f04200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +128 dw (h=2)  base 0xffffd55f04200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    weights +192 dw (h=3)  base 0xffffd55f04200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 663552/0/0/0 | mod128 in {0,64}: 663552/0 | not 16B aligned: 0
+    scales (32 B/supertile) base 0xffffd55f2cc00000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 663552 loads x 32 B | common alignment 32 B | addr mod256 in {0,64,128,192}: 165888/165888/165888/165888 | mod128 in {0,64}: 331776/331776 | not 16B aligned: 0
+    x16_in row stream      base 0xffffd55710440000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 288 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 144/0/144/0 | mod128 in {0,64}: 288/0 | not 16B aligned: 0
+  MXFP8 w2  (rows 2304, K 1152), per-thread streams:
+    weights 4x256 B        base 0xffffd55f2e200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 1024 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +64 dw (h=1)   base 0xffffd55f2e200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +128 dw (h=2)  base 0xffffd55f2e200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 512 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    weights +192 dw (h=3)  base 0xffffd55f2e200000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 256 B | common alignment 256 B | addr mod256 in {0,64,128,192}: 331776/0/0/0 | mod128 in {0,64}: 331776/0 | not 16B aligned: 0
+    scales (32 B/supertile) base 0xffffd55a56800000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 331776 loads x 32 B | common alignment 32 B | addr mod256 in {0,64,128,192}: 82944/82944/82944/82944 | mod128 in {0,64}: 165888/165888 | not 16B aligned: 0
+    x16_act row stream     base 0xffffd55b51680000 (mod 16/64/128/256/4096 = 0/0/0/0/0) | 144 loads x 128 B | common alignment 128 B | addr mod256 in {0,64,128,192}: 72/0/72/0 | mod128 in {0,64}: 144/0 | not 16B aligned: 0
+  outputs: gu_part 0xffffd55f72600000 mod256 0 | yp_part 0xffffd55f74a00000 mod256 0 | amax/den (nil)/(nil)
+  dense: wq tiles 0xffffd55b7b600000 mod256 0 | wo 0xffffd55b7c600000 mod256 0 | unembed 0xffffd55f8d000000 mod256 0

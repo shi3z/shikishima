@@ -2304,7 +2304,32 @@ void xik_destroy(xik_ctx *c) {
 }
 
 // Experiment: shift the start of every repacked expert tensor by XIK_WOFF bytes (content untouched).
-static size_t woff_bytes() { static const size_t v = getenv("XIK_WOFF") ? (size_t)atol(getenv("XIK_WOFF")) : 0; return v; }
+// Range: 0..4096 and a multiple of 16 (the ESIMD block loads below are compiled with alignment<16>; a shift that is not a
+// multiple of 16 would make that promise false).
+static size_t woff_bytes() {
+  static const size_t v = [] {
+    size_t w = getenv("XIK_WOFF") ? (size_t)atol(getenv("XIK_WOFF")) : 0;
+    if (w > 4096 || w % 16 != 0) throw std::runtime_error("XIK_WOFF must be a multiple of 16 in [0, 4096]");
+    return w;
+  }();
+  return v;
+}
+// Weight-tensor allocation.  Measured (docs/alignment.md): an expert tensor whose base is not a multiple of 256 B makes every 256 B
+// weight load straddle two 256 B regions: NVFP4 w13 T=1 61 -> 66 us (+192) / 114 us (+128) / 166 us (+64), DRAM bytes read up to 2.7x.
+// So the base alignment is guaranteed by the API (aligned_alloc_device, 4096) instead of being whatever the driver happens to return
+// (it currently returns 2 MiB-aligned blocks, identical addresses).  XIK_ALLOC=plain restores malloc_device.
+static void *alloc_expert(xik_ctx *c, size_t bytes) {
+  static const bool plain = getenv("XIK_ALLOC") && std::string(getenv("XIK_ALLOC")) == "plain";
+  return plain ? malloc_device(bytes, c->q) : sycl::aligned_alloc_device(4096, bytes, c->q.q);
+}
+// A pointer handed to an alignment<A> load must really be A-byte aligned.
+static void require_aligned(const void *p, size_t a, const char *what) {
+  if ((uintptr_t)p % a != 0) {
+    char b[160];
+    snprintf(b, sizeof b, "%s: address %p is not %zu-byte aligned (an alignment<%zu> load would be undefined)", what, p, a, a);
+    throw std::runtime_error(b);
+  }
+}
 
 int xik_upload(xik_ctx *c, const char *name, int dtype, const void *src, size_t bytes) {
   try {
@@ -2333,8 +2358,9 @@ int xik_finalize(xik_ctx *c) {
       bool mtp = name.rfind("mtp.", 0) == 0;
       bool want8 = !mtp && (name == "model.llm.unembed.weight" ? head_fp8 : dense_fp8);
       size_t nb = (size_t)rows_pad * K * (want8 ? 1 : 2);
-      uint32_t *nw = (uint32_t *)malloc_device(nb + 64, c->q);
+      uint32_t *nw = (uint32_t *)alloc_expert(c, nb + 64);
       if (!nw) throw std::runtime_error("repack alloc failed: " + name);
+      require_aligned(nw, 256, "dense repacked weights");
       if (want8) {
         float *sc = (float *)malloc_device((size_t)rows_pad * 4 + 64, c->q);
         k_quant_fp8(c, (const uint16_t *)it->second.p, nw, sc, rows, rows_pad, K);
@@ -2448,9 +2474,12 @@ int xik_finalize(xik_ctx *c) {
           int rows = m ? D : 2 * FI, K = m ? FI : D;
           Buf &wb = c->tensors.at(wn), &sb = c->tensors.at(sn);
           size_t wo = woff_bytes();
-          uint8_t *nw0 = (uint8_t *)malloc_device(wb.bytes + 64 + 4096, c->q), *ns0 = (uint8_t *)malloc_device(sb.bytes + 64 + 4096, c->q);
+          uint8_t *nw0 = (uint8_t *)alloc_expert(c, wb.bytes + 64 + 4096), *ns0 = (uint8_t *)alloc_expert(c, sb.bytes + 64 + 4096);
           if (!nw0 || !ns0) throw std::runtime_error("repack alloc failed");
           uint8_t *nw = nw0 + wo, *ns = ns0 + wo;
+          require_aligned(nw0, 256, "MXFP8 expert weights (allocation)"); require_aligned(ns0, 256, "MXFP8 expert scales (allocation)");
+          require_aligned(nw, 16, "MXFP8 expert weights"); require_aligned(ns, 16, "MXFP8 expert scales");
+          if (wo == 0) { require_aligned(nw, 256, "MXFP8 expert weights"); require_aligned(ns, 256, "MXFP8 expert scales"); }
           k_repack_mxfp8(c, (const uint8_t *)wb.p, (uint32_t *)nw, (const uint8_t *)sb.p, ns, rows, K);
           c->q.wait();
           sycl::free(wb.base ? wb.base : wb.p, c->q); sycl::free(sb.base ? sb.base : sb.p, c->q);
@@ -2464,9 +2493,12 @@ int xik_finalize(xik_ctx *c) {
           int rows = m ? D : 2 * FI, K = m ? FI : D;
           Buf &wb = c->tensors.at(wn), &sb = c->tensors.at(sn);
           size_t wo = woff_bytes();
-          uint8_t *nw0 = (uint8_t *)malloc_device(wb.bytes + 64 + 4096, c->q), *ns0 = (uint8_t *)malloc_device(sb.bytes + 64 + 4096, c->q);
+          uint8_t *nw0 = (uint8_t *)alloc_expert(c, wb.bytes + 64 + 4096), *ns0 = (uint8_t *)alloc_expert(c, sb.bytes + 64 + 4096);
           if (!nw0 || !ns0) throw std::runtime_error("repack alloc failed");
           uint8_t *nw = nw0 + wo, *ns = ns0 + wo;
+          require_aligned(nw0, 256, "NVFP4 expert weights (allocation)"); require_aligned(ns0, 256, "NVFP4 expert scales (allocation)");
+          require_aligned(nw, 16, "NVFP4 expert weights"); require_aligned(ns, 16, "NVFP4 expert scales");
+          if (wo == 0) { require_aligned(nw, 256, "NVFP4 expert weights"); require_aligned(ns, 256, "NVFP4 expert scales"); }
           k_repack_fp4(c, (const uint8_t *)wb.p, nw, (const uint8_t *)sb.p, ns, rows, K);
           c->q.wait();
           sycl::free(wb.base ? wb.base : wb.p, c->q); sycl::free(sb.base ? sb.base : sb.p, c->q);
@@ -2524,6 +2556,7 @@ int xik_finalize(xik_ctx *c) {
     c->yp_part = A((size_t)KSMAX * T * TOPK * D);
     c->x16_in = dalloc<sycl::half>(c, (size_t)T * D);
     c->x16_act = dalloc<sycl::half>(c, (size_t)T * TOPK * FI);
+    require_aligned(c->x16_in, 256, "x16_in"); require_aligned(c->x16_act, 256, "x16_act"); require_aligned(c->gu_part, 16, "gu_part"); require_aligned(c->yp_part, 16, "yp_part");
     c->rwt = A((size_t)T * TOPK);
     c->moe_o = A((size_t)T * D);
     c->convout = A((size_t)T * D);
@@ -3859,30 +3892,54 @@ extern "C" int xik_bench_dense(xik_ctx *c, int which, int T, int iters, double *
   }
 }
 
-// Layout report: real device addresses of the expert tensors and the start address (mod 256 / 4096) of every stream a
-// thread reads, for the NVFP4 and MXFP8 expert kernels and the dense tiles.
+// Layout report: real device addresses of every SEND stream an expert kernel issues.  For each stream the report enumerates every load
+// address of one launch (all experts, row blocks and supertiles) and gives: load count, logical bytes per load, the largest power of two
+// that divides ALL addresses (the alignment that can be promised), and how the addresses spread over mod-64/128/256 (so a 64 B scale load
+// is not mistaken for a 256 B weight load).  Memory alignment (this report) is not the DPAS GRF operand alignment (see docs/isa).
 extern "C" void xik_layout_report(xik_ctx *c, int layer) {
   const LayerW &lw = c->L[layer];
   auto m = [](const void *p, size_t a) { return (size_t)((uintptr_t)p % a); };
-  fprintf(stderr, "layer %d (%s)\\n", layer, is_mxfp8(layer) ? "MXFP8" : "NVFP4");
-  struct T { const char *n; const void *p; size_t unit; };
-  size_t nrb13 = 2 * FI / 16, nrb2 = D / 16;
-  if (!is_mxfp8(layer)) {
-    T ts[] = {{"w13 weights", lw.w13, 0}, {"w13 scales", lw.w13_s, 0}, {"w2 weights", lw.w2, 0}, {"w2 scales", lw.w2_s, 0}};
-    for (auto &t : ts) fprintf(stderr, "  %-12s base %p  mod256 %3zu  mod4096 %4zu\\n", t.n, t.p, m(t.p, 256), m(t.p, 4096));
-    // thread stream: (expert e, row-block rb) -> weights at ((e*nrb + rb) * nst) * 512 B ; scales at ... * 64 B
-    size_t nst13 = D / 64, nst2 = FI / 64;
-    size_t exs13 = nrb13 * nst13 * 512, rbs13 = nst13 * 512, exs2 = nrb2 * nst2 * 512, rbs2 = nst2 * 512;
-    fprintf(stderr, "  w13: expert stride %zu B (mod256 %zu, mod4096 %zu) | row-block (stream) pitch %zu B (mod256 %zu, mod4096 %zu) | tile pitch 512 B\\n", exs13, exs13 % 256, exs13 % 4096, rbs13, rbs13 % 256, rbs13 % 4096);
-    fprintf(stderr, "  w2 : expert stride %zu B (mod256 %zu, mod4096 %zu) | row-block (stream) pitch %zu B (mod256 %zu, mod4096 %zu) | tile pitch 512 B\\n", exs2, exs2 % 256, exs2 % 4096, rbs2, rbs2 % 256, rbs2 % 4096);
-    size_t ss13 = nst13 * 64, ss2 = nst2 * 64;
-    fprintf(stderr, "  scales: w13 stream pitch %zu B (mod64 %zu) | w2 stream pitch %zu B (mod64 %zu)\\n", ss13, ss13 % 64, ss2, ss2 % 64);
-  } else {
-    T ts[] = {{"w13 weights", lw.w13, 0}, {"w13 scales", lw.w13_s, 0}, {"w2 weights", lw.w2, 0}, {"w2 scales", lw.w2_s, 0}};
-    for (auto &t : ts) fprintf(stderr, "  %-12s base %p  mod256 %3zu  mod4096 %4zu\\n", t.n, t.p, m(t.p, 256), m(t.p, 4096));
-    size_t nst13 = D / 64, nst2 = FI / 64;
-    size_t rbs13 = nst13 * 1024, rbs2 = nst2 * 1024;
-    fprintf(stderr, "  w13: row-block pitch %zu B (mod256 %zu, mod4096 %zu), tile pitch 256 B | w2: %zu B (mod256 %zu, mod4096 %zu)\\n", rbs13, rbs13 % 256, rbs13 % 4096, rbs2, rbs2 % 256, rbs2 % 4096);
+  struct St { const char *name; const void *base; size_t off0, pitch_e, pitch_rb, pitch_s; size_t bytes; int nE, nRB, nS; };
+  auto stat = [&](const St &t) {
+    size_t n = 0; uintptr_t orall = 0; size_t h256[4] = {0, 0, 0, 0}; size_t h64[4] = {0, 0, 0, 0}; size_t h128[2] = {0, 0}; size_t m16 = 0;
+    for (int e = 0; e < t.nE; e++)
+      for (int rb = 0; rb < t.nRB; rb++)
+        for (int st = 0; st < t.nS; st++) {
+          uintptr_t a = (uintptr_t)t.base + t.off0 + e * t.pitch_e + rb * t.pitch_rb + st * t.pitch_s;
+          orall |= a; n++; h256[(a % 256) / 64]++; h128[(a % 128) / 64]++; h64[(a % 64) / 16]++; if (a % 16) m16++;
+        }
+    size_t al = orall ? (size_t)(orall & (~orall + 1)) : (size_t)1 << 20;  // lowest set bit of the OR of all addresses = common alignment
+    fprintf(stderr, "    %-22s base %p (mod 16/64/128/256/4096 = %zu/%zu/%zu/%zu/%zu) | %zu loads x %zu B | common alignment %zu B | addr mod256 in {0,64,128,192}: %zu/%zu/%zu/%zu | mod128 in {0,64}: %zu/%zu | not 16B aligned: %zu\n",
+            t.name, t.base, m(t.base, 16), m(t.base, 64), m(t.base, 128), m(t.base, 256), m(t.base, 4096), n, t.bytes, al, h256[0], h256[1], h256[2], h256[3], h128[0], h128[1], m16);
+  };
+  fprintf(stderr, "layer %d (%s)\n", layer, is_mxfp8(layer) ? "MXFP8" : "NVFP4");
+  for (int k = 0; k < 2; k++) {
+    int rows = k ? D : 2 * FI, K = k ? FI : D, nrb = rows / 16, nst = K / 64;
+    const char *kn = k ? "w2 " : "w13";
+    const void *W = k ? lw.w2 : lw.w13, *S = k ? lw.w2_s : lw.w13_s;
+    if (!is_mxfp8(layer)) {
+      size_t te = (size_t)nrb * nst;
+      St ws[] = {{"weights tile[0:256)", W, 0, te * 512, (size_t)nst * 512, 512, 256, NE, nrb, nst},
+                 {"weights tile[256:512)", W, 256, te * 512, (size_t)nst * 512, 512, 256, NE, nrb, nst},
+                 {"scales (64 B/supertile)", S, 0, te * 64, (size_t)nst * 64, 64, 64, NE, nrb, nst}};
+      fprintf(stderr, "  NVFP4 %s (rows %d, K %d, %d row blocks x %d supertiles), per-thread streams:\n", kn, rows, K, nrb, nst);
+      for (auto &t : ws) stat(t);
+    } else {
+      size_t te = (size_t)nrb * nst;
+      St ws[] = {{"weights 4x256 B", W, 0, te * 1024, (size_t)nst * 1024, 1024, 256, NE, nrb, nst},
+                 {"weights +64 dw (h=1)", W, 256, te * 1024, (size_t)nst * 1024, 1024, 256, NE, nrb, nst},
+                 {"weights +128 dw (h=2)", W, 512, te * 1024, (size_t)nst * 1024, 1024, 256, NE, nrb, nst},
+                 {"weights +192 dw (h=3)", W, 768, te * 1024, (size_t)nst * 1024, 1024, 256, NE, nrb, nst},
+                 {"scales (32 B/supertile)", S, 0, te * 32, (size_t)nst * 32, 32, 32, NE, nrb, nst}};
+      fprintf(stderr, "  MXFP8 %s (rows %d, K %d), per-thread streams:\n", kn, rows, K);
+      for (auto &t : ws) stat(t);
+    }
+    // activation stream: row r of x (ldx halves), 128 B per supertile (K=64 halves)
+    const void *X = k ? (const void *)c->x16_act : (const void *)c->x16_in;
+    size_t ldx = k ? FI : D;
+    St xs = {k ? "x16_act row stream" : "x16_in row stream", X, 0, 0, ldx * 2, 128, 128, 1, TOPK * (k ? 1 : 1), nst};
+    stat(xs);
   }
-  fprintf(stderr, "  dense wq tiles base %p mod256 %zu | wo %p mod256 %zu | unembed %p mod256 %zu\\n", lw.wq, m(lw.wq, 256), lw.wo, m(lw.wo, 256), c->unembed, m(c->unembed, 256));
+  fprintf(stderr, "  outputs: gu_part %p mod256 %zu | yp_part %p mod256 %zu | amax/den %p/%p\n", c->gu_part, m(c->gu_part, 256), c->yp_part, m(c->yp_part, 256), lw.w13_amax, lw.w13_den);
+  fprintf(stderr, "  dense: wq tiles %p mod256 %zu | wo %p mod256 %zu | unembed %p mod256 %zu\n", lw.wq, m(lw.wq, 256), lw.wo, m(lw.wo, 256), c->unembed, m(c->unembed, 256));
 }

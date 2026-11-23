@@ -256,7 +256,8 @@ fn main() {
         return;
     }
     if a.iter().any(|x| x == "--layout") {
-        for l in [3, 12, 21] { e.layout_report(l); }
+        let ls: Vec<i32> = std::env::var("XIK_LAYOUT_LAYERS").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or((0..24).collect());
+        for l in ls { e.layout_report(l); }
         return;
     }
     if a.iter().any(|x| x == "--bench-dense") {

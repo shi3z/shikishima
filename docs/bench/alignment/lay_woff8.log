@@ -1,0 +1,4 @@
+
+thread 'main' (1245392) panicked at src/bin/xi-run.rs:19:45:
+engine: "XIK_WOFF must be a multiple of 16 in [0, 4096]"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
