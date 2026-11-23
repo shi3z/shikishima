@@ -244,11 +244,58 @@ void k_repack_bf16(xik_ctx *c, const uint16_t *raw, uint32_t *dst, int rows, int
   });
 }
 
+inline uint32_t f2e4m3(float v) {  // round to nearest even, saturating at 448
+  uint32_t sgn = v < 0.f ? 0x80u : 0u;
+  float x = sycl::fabs(v);
+  if (x >= 448.f) return sgn | 0x7Eu;
+  if (x < 0.015625f) {  // subnormal range: m * 2^-9
+    float m = sycl::rint(x * 512.f);
+    return sgn | (uint32_t)m;  // m == 8 is exactly the smallest normal (e=1, m=0)
+  }
+  uint32_t bits = sycl::bit_cast<uint32_t>(x);
+  int e = (int)((bits >> 23) & 0xFF) - 127;
+  float mant = x * sycl::bit_cast<float>((uint32_t)(127 - e) << 23);  // x / 2^e in [1, 2)
+  int m = (int)sycl::rint((mant - 1.0f) * 8.0f);
+  if (m == 8) { m = 0; e++; }
+  int e4 = e + 7;
+  if (e4 > 15 || (e4 == 15 && m > 6)) return sgn | 0x7Eu;
+  return sgn | ((uint32_t)e4 << 3) | (uint32_t)m;
+}
+// per-row scale = max|w| / 448, then FP8 tiles: dst[(rb*nkt + kt)*4 + q][n]
+void k_quant_fp8(xik_ctx *c, const uint16_t *raw, uint32_t *dst, float *scale, int rows, int rows_pad, int K) {
+  c->q.parallel_for(nd_range<1>((size_t)rows_pad * 256, 256), [=](nd_item<1> it) {
+    int row = it.get_group(0), l = it.get_local_id(0);
+    float mx = 0.f;
+    if (row < rows)
+      for (int k = l; k < K; k += 256) mx = sycl::fmax(mx, sycl::fabs(bf2f(raw[(size_t)row * K + k])));
+    mx = reduce_over_group(it.get_group(), mx, maximum<float>());
+    if (l == 0) scale[row] = mx > 0.f ? mx / 448.0f : 1.0f;
+  });
+  int nkt = K / 16;
+  c->q.parallel_for(range<1>((size_t)rows_pad * nkt * 4), [=](id<1> id) {
+    size_t i = id[0];
+    int q = (int)(i % 4);
+    size_t t = i / 4;
+    int kt = (int)(t % nkt), row = (int)(t / nkt);
+    int rb = row / 16, n = row % 16;
+    float inv = 1.0f / scale[row];
+    uint32_t w = 0;
+    if (row < rows) {
+      const uint16_t *src = raw + (size_t)row * K + kt * 16 + 4 * q;
+      uint32_t b0 = f2e4m3(bf2f(src[0]) * inv), b1 = f2e4m3(bf2f(src[1]) * inv), b2 = f2e4m3(bf2f(src[2]) * inv), b3 = f2e4m3(bf2f(src[3]) * inv);
+      w = b0 | (b2 << 8) | (b1 << 16) | (b3 << 24);  // bytes: [k0, k2, k1, k3]
+    }
+    dst[(((size_t)rb * nkt + kt) * 4 + q) * 16 + n] = w;
+  });
+}
+
+static std::map<const void *, const float *> g_fp8_scale;  // weight tile pointer -> per-row scales (FP8 mode)
 struct DSeg {
   const uint32_t *Wt;
   const float *X;
   float *Y;
   int rows, nrb, K, ldx, ldy, round, wg0;
+  const float *scale;  // non-null: FP8 e4m3 tiles with this per-row scale
 };
 struct DArgs {
   DSeg s[8];
@@ -256,7 +303,8 @@ struct DArgs {
   int ksd = KSD_DEFAULT;
   void add(const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool round) {
     int nrb = (rows + 15) / 16;
-    s[n] = DSeg{reinterpret_cast<const uint32_t *>(W), X, Y, rows, nrb, K, ldx, ldy, (int)round, total_wg};
+    auto it = g_fp8_scale.find(W);
+    s[n] = DSeg{reinterpret_cast<const uint32_t *>(W), X, Y, rows, nrb, K, ldx, ldy, (int)round, total_wg, it == g_fp8_scale.end() ? nullptr : it->second};
     total_wg += nrb;
     n++;
   }
@@ -275,11 +323,40 @@ void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
     int per = (nkt + KSD - 1) / KSD;
     int k0 = tid * per, k1 = k0 + per < nkt ? k0 + per : nkt;
     simd<float, 16 * R> acc = 0.f;
-    const uint32_t *wp = sd.Wt + (size_t)rb * nkt * 128;
+    const bool fp8 = sd.scale != nullptr;
+    const uint32_t *wp = sd.Wt + (size_t)rb * nkt * (fp8 ? 64 : 128);
     const float *xr[R];
 #pragma unroll
     for (int r = 0; r < R; r++) xr[r] = sd.X + (size_t)(t0 + (r < nt ? r : 0)) * sd.ldx;
-    if (k0 < k1) {
+    if (k0 < k1 && fp8) {
+      // FP8 e4m3 weights: 256 B per 16x16 tile; bytes of dword (q, n) = elements [4q, 4q+2, 4q+1, 4q+3] of row n.
+      // (b & 0x7f) << 7 | (b & 0x80) << 8 is the fp16 bit pattern of value * 2^-8 (exact, also for subnormals).
+      simd<uint32_t, 64> bq, bqn;
+      bq.copy_from(wp + (size_t)k0 * 64);
+      for (int kt = k0; kt < k1; kt++) {
+        if (kt + 1 < k1) bqn.copy_from(wp + (size_t)(kt + 1) * 64);
+        simd<int32_t, 8 * R> av;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+          simd<float, 16> xv;
+          xv.copy_from(xr[r] + kt * 16);
+          simd<sycl::half, 16> xh = xv;
+          av.template select<8, 1>(8 * r) = xh.template bit_cast_view<int32_t>();
+        }
+        simd<uint32_t, 128> B;
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+          simd<uint32_t, 16> xq = bq.template select<16, 1>(16 * q);
+          simd<uint32_t, 16> m0 = xq & 0x00FF00FFu, m1 = (xq >> 8) & 0x00FF00FFu;
+          B.template select<16, 1>(16 * (2 * q)) = ((m0 & 0x007F007Fu) << 7) | ((m0 & 0x00800080u) << 8);
+          B.template select<16, 1>(16 * (2 * q + 1)) = ((m1 & 0x007F007Fu) << 7) | ((m1 & 0x00800080u) << 8);
+        }
+        simd<int32_t, 128> bi = B.template bit_cast_view<int32_t>();
+        acc = xmx::dpas<8, R, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16,
+                        xmx::dpas_argument_type::fp16>(acc, bi, av);
+        bq = bqn;
+      }
+    } else if (k0 < k1) {
       simd<uint32_t, 128> bcur, bnext;
       {
         simd<uint32_t, 64> t0v, t1v;
@@ -318,6 +395,13 @@ void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
       simd<float, 16 * R> sum = slm_block_load<float, 16 * R>(0);
 #pragma unroll
       for (int j = 1; j < KSD; j++) sum += slm_block_load<float, 16 * R>(j * 16 * R * 4);
+      if (fp8) {
+        simd<float, 16> sv;
+        sv.copy_from(sd.scale + rb * 16);
+        sv *= 256.0f;
+#pragma unroll
+        for (int r = 0; r < R; r++) sum.template select<16, 1>(16 * r) *= sv;
+      }
       if (sd.round) {
         simd<uint32_t, 16 * R> u = sum.template bit_cast_view<uint32_t>();
         u += 0x7FFFu + ((u >> 16) & 1u);
@@ -1315,14 +1399,23 @@ int xik_upload(xik_ctx *c, const char *name, int dtype, const void *src, size_t 
 
 int xik_finalize(xik_ctx *c) {
   try {
+    const bool dense_fp8 = getenv("XIK_DENSE_FP8") != nullptr, head_fp8 = getenv("XIK_HEAD_FP8") != nullptr;
     auto repack = [&](const std::string &name, int rows, int K) {
       auto it = c->tensors.find(name);
       if (it == c->tensors.end()) return;
       int rows_pad = (rows + 15) / 16 * 16;
-      size_t nb = (size_t)rows_pad * K * 2;
+      bool mtp = name.rfind("mtp.", 0) == 0;
+      bool want8 = !mtp && (name == "model.llm.unembed.weight" ? head_fp8 : dense_fp8);
+      size_t nb = (size_t)rows_pad * K * (want8 ? 1 : 2);
       uint32_t *nw = (uint32_t *)malloc_device(nb + 64, c->q);
       if (!nw) throw std::runtime_error("repack alloc failed: " + name);
-      k_repack_bf16(c, (const uint16_t *)it->second.p, nw, rows, rows_pad, K);
+      if (want8) {
+        float *sc = (float *)malloc_device((size_t)rows_pad * 4 + 64, c->q);
+        k_quant_fp8(c, (const uint16_t *)it->second.p, nw, sc, rows, rows_pad, K);
+        g_fp8_scale[nw] = sc;
+      } else {
+        k_repack_bf16(c, (const uint16_t *)it->second.p, nw, rows, rows_pad, K);
+      }
       c->q.wait();
       sycl::free(it->second.p, c->q);
       it->second.p = nw;
