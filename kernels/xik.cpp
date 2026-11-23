@@ -351,7 +351,23 @@ struct DArgs {
     n++;
   }
 };
-template <int R, int KSD, int AV>
+// LSC cache-control variants of a block load (diagnostic; P = 0 keeps the default encoding).
+// 1: L1 uncached/L2 cached  2: L1 streaming/L2 cached  3: L1 cached/L2 cached  4: L1 uncached/L2 uncached  5: L1 streaming/L2 uncached
+// 6: L1 cached/L2 uncached  7: L1 read_invalidate/L2 cached  8: same as 7 (legal L1/L2 pairs on this API: {uc,ca,st}x{uc,ca}, ri+ca)
+template <int P, int N>
+ESIMD_INLINE es::simd<uint32_t, N> ldp(const uint32_t *p) {
+  using namespace es;
+  if constexpr (P == 0) return block_load<uint32_t, N>(p);
+  else if constexpr (P == 1) return block_load<uint32_t, N>(p, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+  else if constexpr (P == 2) return block_load<uint32_t, N>(p, properties{cache_hint_L1<cache_hint::streaming>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+  else if constexpr (P == 3) return block_load<uint32_t, N>(p, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+  else if constexpr (P == 4) return block_load<uint32_t, N>(p, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::uncached>, alignment<16>});
+  else if constexpr (P == 5) return block_load<uint32_t, N>(p, properties{cache_hint_L1<cache_hint::streaming>, cache_hint_L2<cache_hint::uncached>, alignment<16>});
+  else if constexpr (P == 6) return block_load<uint32_t, N>(p, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::uncached>, alignment<16>});
+  else if constexpr (P == 7) return block_load<uint32_t, N>(p, properties{cache_hint_L1<cache_hint::read_invalidate>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+  else return block_load<uint32_t, N>(p, properties{cache_hint_L1<cache_hint::read_invalidate>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+}
+template <int R, int KSD, int AV, int PD = 0>
 void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
   q.parallel_for(nd_range<1>((size_t)a.total_wg * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
     using namespace es;
@@ -510,9 +526,9 @@ void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
       // FP8 e4m3 weights: 256 B per 16x16 tile; bytes of dword (q, n) = elements [4q, 4q+2, 4q+1, 4q+3] of row n.
       // (b & 0x7f) << 7 | (b & 0x80) << 8 is the fp16 bit pattern of value * 2^-8 (exact, also for subnormals).
       simd<uint32_t, 64> bq, bqn;
-      bq.copy_from(wp + (size_t)k0 * 64);
+      bq = ldp<PD, 64>(wp + (size_t)k0 * 64);
       for (int kt = k0; kt < k1; kt++) {
-        if (kt + 1 < k1) bqn.copy_from(wp + (size_t)(kt + 1) * 64);
+        if (kt + 1 < k1) bqn = ldp<PD, 64>(wp + (size_t)(kt + 1) * 64);
         simd<int32_t, 8 * R> av;
 #pragma unroll
         for (int r = 0; r < R; r++) {
@@ -538,9 +554,9 @@ void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
       // FP8 e4m3 weights: 256 B per 16x16 tile; bytes of dword (q, n) = elements [4q, 4q+2, 4q+1, 4q+3] of row n.
       // (b & 0x7f) << 7 | (b & 0x80) << 8 is the fp16 bit pattern of value * 2^-8 (exact, also for subnormals).
       simd<uint32_t, 64> bq, bqn;
-      bq.copy_from(wp + (size_t)k0 * 64);
+      bq = ldp<PD, 64>(wp + (size_t)k0 * 64);
       for (int kt = k0; kt < k1; kt++) {
-        if (kt + 1 < k1) bqn.copy_from(wp + (size_t)(kt + 1) * 64);
+        if (kt + 1 < k1) bqn = ldp<PD, 64>(wp + (size_t)(kt + 1) * 64);
         simd<int32_t, 8 * R> av;
 #pragma unroll
         for (int r = 0; r < R; r++) {
@@ -629,22 +645,23 @@ void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
   });
 }
 static int dg_addr() { static const int v = getenv("XIK_ADDR") ? atoi(getenv("XIK_ADDR")) : 0; return v; }
-template <int KSD, int AV>
+template <int KSD, int AV, int PD = 0>
 static void dgemm_k(xik_ctx *c, const DArgs &a, int T) {
   for (int t0 = 0; t0 < T; t0 += 8) {
     int n = std::min(8, T - t0);
-    if (n == 1) dgemm_t<1, KSD, AV>(c->q, a, t0, n);
-    else if (n == 2) dgemm_t<2, KSD, AV>(c->q, a, t0, n);
-    else if (n <= 4) dgemm_t<4, KSD, AV>(c->q, a, t0, n);
-    else dgemm_t<8, KSD, AV>(c->q, a, t0, n);
+    if (n == 1) dgemm_t<1, KSD, AV, PD>(c->q, a, t0, n);
+    else if (n == 2) dgemm_t<2, KSD, AV, PD>(c->q, a, t0, n);
+    else if (n <= 4) dgemm_t<4, KSD, AV, PD>(c->q, a, t0, n);
+    else dgemm_t<8, KSD, AV, PD>(c->q, a, t0, n);
   }
 }
-template <int AV>
+template <int AV, int PD = 0>
 static void dgemm_av(xik_ctx *c, const DArgs &a, int T) {
-  if (a.ksd == 8) dgemm_k<8, AV>(c, a, T);
-  else if (a.ksd == 32) dgemm_k<32, AV>(c, a, T);
-  else dgemm_k<16, AV>(c, a, T);
+  if (a.ksd == 8) dgemm_k<8, AV, PD>(c, a, T);
+  else if (a.ksd == 32) dgemm_k<32, AV, PD>(c, a, T);
+  else dgemm_k<16, AV, PD>(c, a, T);
 }
+static int dg_pol() { static const int v = getenv("XIK_DENSE_POL") ? atoi(getenv("XIK_DENSE_POL")) : 0; return v; }
 void dgemm(xik_ctx *c, const DArgs &a, int T) {
   switch (dg_addr()) {
     case 1: return dgemm_av<1>(c, a, T);
@@ -653,7 +670,15 @@ void dgemm(xik_ctx *c, const DArgs &a, int T) {
     case 4: return dgemm_av<4>(c, a, T);
     case 5: return dgemm_av<5>(c, a, T);
     case 6: return dgemm_av<6>(c, a, T);
-    default: return dgemm_av<0>(c, a, T);
+    default:
+      switch (dg_pol()) {  // cache-control variants of the weight loads (FP8 path only; see ldp)
+        case 1: return dgemm_av<0, 1>(c, a, T);
+        case 2: return dgemm_av<0, 2>(c, a, T);
+        case 3: return dgemm_av<0, 3>(c, a, T);
+        case 5: return dgemm_av<0, 5>(c, a, T);
+        case 6: return dgemm_av<0, 6>(c, a, T);
+        default: return dgemm_av<0>(c, a, T);
+      }
   }
 }
 
@@ -1004,7 +1029,7 @@ void k_group(xik_ctx *c, int np, int maxper) {
 // tokens routed to that expert (DPAS repeat count R = number of tokens, <= 8 per pass).
 // ---- v2: single descriptor load, aligned block loads for scales and x, NB-deep software pipeline.
 //   per supertile (64 K x 16 rows): W 512 B (2 x 256 B), scales 64 B, x 128 B per token row.
-template <int KS, int R, int NB>
+template <int KS, int R, int NB, int PW = 0, int PS = 0>
 ESIMD_INLINE void moe_fp4_body(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13,
                                const int32_t *ids, int cnt, int per, float g, float *Y, size_t ystride, int ldy, int rb,
                                int ks, int stage, uint64_t *tsq = nullptr) {
@@ -1021,11 +1046,11 @@ ESIMD_INLINE void moe_fp4_body(const uint32_t *wp, const uint32_t *sp, const syc
   simd<uint32_t, 16> sb[NB];
   simd<uint32_t, 32 * R> xb[NB];
   auto load = [&](int u, int s) {
-    simd<uint32_t, 64> t0 = block_load<uint32_t, 64>(wp + (size_t)s * 128);
-    simd<uint32_t, 64> t1 = block_load<uint32_t, 64>(wp + (size_t)s * 128 + 64);
+    simd<uint32_t, 64> t0 = ldp<PW, 64>(wp + (size_t)s * 128);
+    simd<uint32_t, 64> t1 = ldp<PW, 64>(wp + (size_t)s * 128 + 64);
     wb[u].template select<64, 1>(0) = t0;
     wb[u].template select<64, 1>(64) = t1;
-    sb[u] = block_load<uint32_t, 16>(sp + (size_t)s * 16);
+    sb[u] = ldp<PS, 16>(sp + (size_t)s * 16);
 #pragma unroll
     for (int r = 0; r < R; r++) xb[u].template select<32, 1>(32 * r) = block_load<uint32_t, 32>(xr[r] + (size_t)s * 32);
   };
@@ -1104,7 +1129,7 @@ ESIMD_INLINE void moe_fp4_body(const uint32_t *wp, const uint32_t *sp, const syc
 }
 
 uint64_t *g_ts = nullptr;  // diagnostic: per-thread start/end rdtsc of moe_fp4g (null = off)
-template <int KS, int NB>
+template <int KS, int NB, int PW = 0, int PS = 0>
 void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13,
                 const float *amax, const float *den, int maxper, int maxslots, int rows, int K, float *Y,
                 size_t ystride, int ldy) {
@@ -1153,10 +1178,10 @@ void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
       } else {
         for (int r = 0; r < 8; r++) ids[r] = elist[(size_t)e * maxper + g0 + (r < n ? r : 0)];
       }
-      if (n <= 1) moe_fp4_body<KS, 1, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
-      else if (n <= 2) moe_fp4_body<KS, 2, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
-      else if (n <= 4) moe_fp4_body<KS, 4, NB>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
-      else moe_fp4_body<KS, 8, (NB > 2 ? 2 : NB)>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
+      if (n <= 1) moe_fp4_body<KS, 1, NB, PW, PS>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
+      else if (n <= 2) moe_fp4_body<KS, 2, NB, PW, PS>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
+      else if (n <= 4) moe_fp4_body<KS, 4, NB, PW, PS>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
+      else moe_fp4_body<KS, 8, (NB > 2 ? 2 : NB), PW, PS>(wp, sp, X16, ldx, w13, ids, n, per, g, Y, ystride, ldy, rb, ks, stage, tsq);
     }
     if (ts) {
       simd<uint64_t, 2> v;
@@ -1233,6 +1258,20 @@ constexpr int NMOE_CFG = 8;
 void moe_fp4g(xik_ctx *c, int cfg, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13,
               const float *amax, const float *den, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride,
               int ldy) {
+  {
+    static const int pol_all = [] { const char *e = getenv("XIK_LSC_POL"); if (!e) return 5 * 16 + 0; /* default: weights L1-streaming + L2-uncached */ int w = 0, sc = 0; sscanf(e, "%d,%d", &w, &sc); return w * 16 + sc; }();
+    static const int pol13 = [] { const char *e = getenv("XIK_LSC_POL13"); if (!e) return -1; int w = 0, sc = 0; sscanf(e, "%d,%d", &w, &sc); return w * 16 + sc; }();
+    static const int pol2 = [] { const char *e = getenv("XIK_LSC_POL2"); if (!e) return -1; int w = 0, sc = 0; sscanf(e, "%d,%d", &w, &sc); return w * 16 + sc; }();
+    const int pol = (w13 ? pol13 : pol2) >= 0 ? (w13 ? pol13 : pol2) : pol_all;
+    if (pol != 0 && cfg == 1) {
+#define PC(W, S) case (W) * 16 + (S): return moe_fp4g_t<1, 2, W, S>(c, Wp, Sp, X16, ldx, w13, amax, den, maxper, maxslots, rows, K, Y, ystride, ldy);
+      switch (pol) {
+        PC(1, 0) PC(2, 0) PC(3, 0) PC(4, 0) PC(5, 0) PC(0, 1) PC(0, 2) PC(0, 3) PC(1, 1) PC(2, 2) PC(2, 3) PC(1, 3) PC(4, 4) PC(5, 1) PC(5, 2) PC(5, 3) PC(5, 5) PC(1, 5) PC(1, 2) PC(0, 5) PC(6, 0) PC(7, 0) PC(8, 0) PC(6, 1) PC(7, 1) PC(7, 2) PC(5, 6) PC(2, 1)
+        default: break;
+      }
+#undef PC
+    }
+  }
   if (dyn_threads() > 0) {
     if (cfg == 1) return moe_fp4g_dyn<1, 2>(c, dyn_threads(), Wp, Sp, X16, ldx, w13, amax, den, maxper, maxslots, rows, K, Y, ystride, ldy);
     if (cfg == 0) return moe_fp4g_dyn<2, 2>(c, dyn_threads(), Wp, Sp, X16, ldx, w13, amax, den, maxper, maxslots, rows, K, Y, ystride, ldy);
@@ -1279,7 +1318,7 @@ inline es::simd<uint32_t, 16> fp8_pair(es::simd<uint32_t, 16> m) {
   return ((m & 0x007F007Fu) << 7) | ((m & 0x00800080u) << 8);
 }
 
-template <int R, int NB, int PF>
+template <int R, int NB, int PF, int PW = 0, int PS = 0>
 ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13,
                                const int32_t *ids, int cnt, int nst, float *Y, int ldy, int rb) {
   using namespace es;
@@ -1296,10 +1335,10 @@ ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const syc
   auto load = [&](int u, int s) {
 #pragma unroll
     for (int h = 0; h < 4; h++) {
-      simd<uint32_t, 64> t0 = block_load<uint32_t, 64>(wp + (size_t)s * 256 + h * 64);
+      simd<uint32_t, 64> t0 = ldp<PW, 64>(wp + (size_t)s * 256 + h * 64);
       wb[u].template select<64, 1>(64 * h) = t0;
     }
-    sb[u] = block_load<uint32_t, 8>(sp + (size_t)s * 8);
+    sb[u] = ldp<PS, 8>(sp + (size_t)s * 8);
 #pragma unroll
     for (int r = 0; r < R; r++) xb[u].template select<32, 1>(32 * r) = block_load<uint32_t, 32>(xr[r] + (size_t)s * 32);
   };
@@ -1436,7 +1475,7 @@ static int fp8_ks() { static const int v = getenv("XIK_FP8_KS") ? atoi(getenv("X
 static int fp8_pf() { static const int v = getenv("XIK_FP8_PF") ? atoi(getenv("XIK_FP8_PF")) : 0; return v; }
 static int fp8_cfg() { static const int v = getenv("XIK_FP8_CFG") ? atoi(getenv("XIK_FP8_CFG")) : 1; return v; }
 
-template <int NB, bool G256, int PF = 0>
+template <int NB, bool G256, int PF = 0, int PW = 0, int PS = 0>
 void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper,
                 int maxslots, int rows, int K, float *Y, int ldy, size_t ystride) {
   const int KSV = fp8_ks();
@@ -1473,10 +1512,10 @@ void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
         else if (n <= 4) moe_fp8_body_split<4>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
         else moe_fp8_body_split<8>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
       } else {
-        if (n <= 1) moe_fp8_body<1, NB, PF>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-        else if (n <= 2) moe_fp8_body<2, NB, PF>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-        else if (n <= 4) moe_fp8_body<4, NB, PF>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-        else moe_fp8_body<8, NB, PF>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        if (n <= 1) moe_fp8_body<1, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        else if (n <= 2) moe_fp8_body<2, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        else if (n <= 4) moe_fp8_body<4, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        else moe_fp8_body<8, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
       }
     }
   };
@@ -1489,6 +1528,14 @@ void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
 }
 void moe_fp8g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper,
               int maxslots, int rows, int K, float *Y, int ldy, size_t ystride) {
+  {
+    static const int fpol = [] { const char *e = getenv("XIK_FP8E_POL"); if (!e) return 0; int w = 0, sc = 0; sscanf(e, "%d,%d", &w, &sc); return w * 16 + sc; }();
+    if (fpol != 0 && fp8_cfg() == 1 && fp8_pf() == 0) {
+#define FC(W, S) case (W) * 16 + (S): return moe_fp8g_t<1, false, 0, W, S>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
+      switch (fpol) { FC(1, 0) FC(2, 0) FC(3, 0) FC(5, 0) FC(6, 0) FC(0, 1) FC(0, 2) FC(1, 1) FC(5, 1) FC(2, 2) default: break; }
+#undef FC
+    }
+  }
   if (fp8_cfg() == 1 && fp8_pf() == 1) return moe_fp8g_t<1, false, 1>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
   if (fp8_cfg() == 1 && fp8_pf() == 2) return moe_fp8g_t<1, false, 2>(c, Wp, Sp, X16, ldx, w13, maxper, maxslots, rows, K, Y, ldy, ystride);
   switch (fp8_cfg()) {
