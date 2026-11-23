@@ -170,6 +170,17 @@ impl Engine {
         let n = unsafe { ffi::xik_prof_segments(self.ctx, buf.as_mut_ptr(), 4096) } as usize;
         (0..n).map(|i| [buf[i * 6], buf[i * 6 + 1], buf[i * 6 + 2], buf[i * 6 + 3], buf[i * 6 + 4], buf[i * 6 + 5]]).collect()
     }
+    /// cold single-projection benchmark: (us per call, logical bytes, fp8 weights?)
+    pub fn bench_dense(&mut self, which: i32, t: i32, iters: i32) -> Result<(f64, f64, bool), String> {
+        let (mut us, mut by, mut f8) = (0f64, 0f64, 0i32);
+        if unsafe { ffi::xik_bench_dense(self.ctx, which, t, iters, &mut us, &mut by, &mut f8) } != 0 {
+            return Err(last_error());
+        }
+        Ok((us, by, f8 != 0))
+    }
+    pub fn layout_report(&self, layer: i32) {
+        unsafe { ffi::xik_layout_report(self.ctx, layer) }
+    }
     pub fn prof(&mut self, on: bool) {
         unsafe { ffi::xik_prof_enable(self.ctx, on as i32) }
     }

@@ -73,6 +73,20 @@ fn main() {
         eprintln!("1-WG rmsnorm (T=1): {:.2} us/launch", e.bench_launch(4000, 0));
         return;
     }
+    if a.iter().any(|x| x == "--layout") {
+        for l in [3, 12, 21] { e.layout_report(l); }
+        return;
+    }
+    if a.iter().any(|x| x == "--bench-dense") {
+        let names = ["q   (3072x2304)", "k   (1024x2304)", "v   (1024x2304)", "r   ( 384x2304)", "gate(3072x2304)", "wo  (2304x3072)", "head(201024x2304)", "fused launch (q,r,sink,gate,k,v)"];
+        for t in [1usize, 8] {
+            for w in 0..8 {
+                let (us, by, f8) = e.bench_dense(w, t as i32, 300).unwrap();
+                eprintln!("T={t} {:34} {}: {:8.1} us  {:8.2} MB  = {:6.1} GB/s  (floor @456: {:7.1} us)", names[w as usize], if f8 { "fp8 " } else { "bf16" }, us, by / 1e6, by / us / 1e3, by / 456e3);
+            }
+        }
+        return;
+    }
     if a.iter().any(|x| x == "--bench-fp8") {
         // cold MXFP8 expert kernel (layers 20-23): T tokens x 8 experts
         for t in [1usize, 8] {

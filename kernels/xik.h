@@ -56,6 +56,10 @@ void xik_prof_rec(xik_ctx *, int on);
 void xik_prof_tag(xik_ctx *, int tag);
 int xik_prof_segments(xik_ctx *, double *out6, int max_seg);
 
+int xik_bench_dense(xik_ctx *, int which, int T, int iters, double *out_us, double *out_bytes, int *out_fp8);
+
+void xik_layout_report(xik_ctx *, int layer);
+
 /* Debug: capture the residual stream after every visit (48) of the next
  * forward into host buffer float[48][T][2304]. NULL disables. */
 void xik_trace(xik_ctx *, float *buf);

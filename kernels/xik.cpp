@@ -80,6 +80,7 @@ inline float softcap(float x, float c) { return sycl::tanh(x / c) * c; }
 inline float sigmoidf(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 
 struct Buf {
+  void *base = nullptr;  // allocation start when p was shifted (XIK_WOFF), else null
   void *p = nullptr;
   size_t bytes = 0;
   int dtype = 0;
@@ -312,7 +313,7 @@ struct DArgs {
     n++;
   }
 };
-template <int R, int KSD>
+template <int R, int KSD, int AV>
 void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
   q.parallel_for(nd_range<1>((size_t)a.total_wg * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
     using namespace es;
@@ -331,7 +332,171 @@ void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
     const float *xr[R];
 #pragma unroll
     for (int r = 0; r < R; r++) xr[r] = sd.X + (size_t)(t0 + (r < nt ? r : 0)) * sd.ldx;
-    if (k0 < k1 && fp8) {
+    if (k0 < k1 && fp8 && AV == 3) {
+      // synthetic ceiling: identical weight loads (one 256 B tile per step), no unpack, no DPAS, no x; a running sum keeps the loads alive
+      const uint32_t *p = wp + (size_t)k0 * 64;
+      simd<uint32_t, 64> sum = 0;
+      for (int kt = k0; kt < k1; kt++, p += 64) {
+        simd<uint32_t, 64> v;
+        v.copy_from(p);
+        sum ^= v;
+      }
+      simd<uint32_t, 16> g = sum.template select<16, 1>(0) ^ sum.template select<16, 1>(16) ^ sum.template select<16, 1>(32) ^ sum.template select<16, 1>(48);
+      simd<float, 16> f = g.template bit_cast_view<float>();
+      for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) = f;
+    } else if (k0 < k1 && fp8 && (AV == 4 || AV == 5)) {
+      // synthetic, same bytes as AV==3 but 4 tiles (1 KB) per step: AV==4 one 2D block load (64 B wide x 16 rows),
+      // AV==5 one 1D block load of 1 KB (control for the bytes in flight); tail tiles by 1D loads
+      const uint32_t *base = sd.Wt;
+      simd<uint32_t, 256> sum = 0;
+      simd<uint32_t, 64> sum1 = 0;
+      size_t t_first = (size_t)rb * nkt + k0;      // first tile (256 B) of this thread in the whole weight array
+      int kt = k0;
+      for (; kt + 4 <= k1; kt += 4) {
+        simd<uint32_t, 256> v;
+        if (AV == 4) {
+          // surface: all weights as rows of 64 B; row y = 4 consecutive dwords-of-16 -> tile t covers rows 4t..4t+3
+          v = sycl::ext::intel::experimental::esimd::lsc_load_2d<uint32_t, 16, 16, 1, false, false>(
+              base, 63u, (unsigned)(sd.nrb * nkt * 4 - 1), 63u, 0, (int)((t_first + (kt - k0)) * 4));
+        } else {
+          v.copy_from(base + (t_first + (kt - k0)) * 64);
+        }
+        sum ^= v;
+      }
+      for (; kt < k1; kt++) {
+        simd<uint32_t, 64> v;
+        v.copy_from(base + (t_first + (kt - k0)) * 64);
+        sum1 ^= v;
+      }
+      // every lane of every loaded block must feed the result, else the compiler narrows the loads
+      simd<uint32_t, 16> f16 = sum1.template select<16, 1>(0) ^ sum1.template select<16, 1>(16) ^ sum1.template select<16, 1>(32) ^ sum1.template select<16, 1>(48);
+#pragma unroll
+      for (int i = 0; i < 16; i++) f16 ^= sum.template select<16, 1>(16 * i);
+      simd<float, 16> f = f16.template bit_cast_view<float>();
+      for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) = f;
+    } else if (k0 < k1 && fp8 && AV == 6) {
+      // real kernel, U tiles loaded per step (one 1 KB block load = 4 x 256 B sends issued back to back), the next group is
+      // issued before the current group is unpacked.  DPAS order and accumulator are unchanged (k ascending), so results are identical.
+      constexpr int U = 4;
+      const uint32_t *p = wp + (size_t)k0 * 64;
+      const float *xp[R];
+#pragma unroll
+      for (int r = 0; r < R; r++) xp[r] = xr[r] + k0 * 16;
+      simd<uint32_t, 64 * U> bq, bqn;
+      int kt = k0;
+      int nfull = (k1 - k0) / U * U;
+      if (nfull > 0) bq.copy_from(p);
+      for (; kt < k0 + nfull; kt += U) {
+        if (kt + 2 * U <= k0 + nfull) bqn.copy_from(p + (size_t)(kt + U - k0) * 64);
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+          simd<int32_t, 8 * R> av;
+#pragma unroll
+          for (int r = 0; r < R; r++) {
+            simd<float, 16> xv;
+            xv.copy_from(xp[r] + (kt + u) * 16 - k0 * 16);
+            simd<sycl::half, 16> xh = xv;
+            av.template select<8, 1>(8 * r) = xh.template bit_cast_view<int32_t>();
+          }
+          simd<uint32_t, 128> B;
+#pragma unroll
+          for (int q = 0; q < 4; q++) {
+            simd<uint32_t, 16> xq = bq.template select<16, 1>(64 * u + 16 * q);
+            simd<uint32_t, 16> m0 = xq & 0x00FF00FFu, m1 = (xq >> 8) & 0x00FF00FFu;
+            B.template select<16, 1>(16 * (2 * q)) = ((m0 & 0x007F007Fu) << 7) | ((m0 & 0x00800080u) << 8);
+            B.template select<16, 1>(16 * (2 * q + 1)) = ((m1 & 0x007F007Fu) << 7) | ((m1 & 0x00800080u) << 8);
+          }
+          simd<int32_t, 128> bi = B.template bit_cast_view<int32_t>();
+          acc = xmx::dpas<8, R, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16,
+                          xmx::dpas_argument_type::fp16>(acc, bi, av);
+        }
+        bq = bqn;
+      }
+      for (; kt < k1; kt++) {  // tail tiles (fewer than U), one at a time
+        simd<uint32_t, 64> bt;
+        bt.copy_from(wp + (size_t)kt * 64);
+        simd<int32_t, 8 * R> av;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+          simd<float, 16> xv;
+          xv.copy_from(xr[r] + kt * 16);
+          simd<sycl::half, 16> xh = xv;
+          av.template select<8, 1>(8 * r) = xh.template bit_cast_view<int32_t>();
+        }
+        simd<uint32_t, 128> B;
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+          simd<uint32_t, 16> xq = bt.template select<16, 1>(16 * q);
+          simd<uint32_t, 16> m0 = xq & 0x00FF00FFu, m1 = (xq >> 8) & 0x00FF00FFu;
+          B.template select<16, 1>(16 * (2 * q)) = ((m0 & 0x007F007Fu) << 7) | ((m0 & 0x00800080u) << 8);
+          B.template select<16, 1>(16 * (2 * q + 1)) = ((m1 & 0x007F007Fu) << 7) | ((m1 & 0x00800080u) << 8);
+        }
+        simd<int32_t, 128> bi = B.template bit_cast_view<int32_t>();
+        acc = xmx::dpas<8, R, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16,
+                        xmx::dpas_argument_type::fp16>(acc, bi, av);
+      }
+    } else if (k0 < k1 && fp8 && AV >= 1) {
+      // B / C: base addresses fixed before the loop, the loop only adds constants
+      const uint32_t *p = wp + (size_t)k0 * 64;
+      const float *xp[R];
+#pragma unroll
+      for (int r = 0; r < R; r++) xp[r] = xr[r] + k0 * 16;
+      simd<uint32_t, 64> bq, bqn;
+      bq.copy_from(p);
+      for (int kt = k0; kt < k1; kt++) {
+        p += 64;
+        if (kt + 1 < k1) bqn.copy_from(p);
+        simd<int32_t, 8 * R> av;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+          simd<float, 16> xv;
+          xv.copy_from(xp[r]);
+          if (AV == 2) xp[r] += 16; else xp[r] = xr[r] + (kt + 1) * 16;
+          simd<sycl::half, 16> xh = xv;
+          av.template select<8, 1>(8 * r) = xh.template bit_cast_view<int32_t>();
+        }
+        simd<uint32_t, 128> B;
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+          simd<uint32_t, 16> xq = bq.template select<16, 1>(16 * q);
+          simd<uint32_t, 16> m0 = xq & 0x00FF00FFu, m1 = (xq >> 8) & 0x00FF00FFu;
+          B.template select<16, 1>(16 * (2 * q)) = ((m0 & 0x007F007Fu) << 7) | ((m0 & 0x00800080u) << 8);
+          B.template select<16, 1>(16 * (2 * q + 1)) = ((m1 & 0x007F007Fu) << 7) | ((m1 & 0x00800080u) << 8);
+        }
+        simd<int32_t, 128> bi = B.template bit_cast_view<int32_t>();
+        acc = xmx::dpas<8, R, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16,
+                        xmx::dpas_argument_type::fp16>(acc, bi, av);
+        bq = bqn;
+      }
+    } else if (k0 < k1 && fp8) {
+      // FP8 e4m3 weights: 256 B per 16x16 tile; bytes of dword (q, n) = elements [4q, 4q+2, 4q+1, 4q+3] of row n.
+      // (b & 0x7f) << 7 | (b & 0x80) << 8 is the fp16 bit pattern of value * 2^-8 (exact, also for subnormals).
+      simd<uint32_t, 64> bq, bqn;
+      bq.copy_from(wp + (size_t)k0 * 64);
+      for (int kt = k0; kt < k1; kt++) {
+        if (kt + 1 < k1) bqn.copy_from(wp + (size_t)(kt + 1) * 64);
+        simd<int32_t, 8 * R> av;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+          simd<float, 16> xv;
+          xv.copy_from(xr[r] + kt * 16);
+          simd<sycl::half, 16> xh = xv;
+          av.template select<8, 1>(8 * r) = xh.template bit_cast_view<int32_t>();
+        }
+        simd<uint32_t, 128> B;
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+          simd<uint32_t, 16> xq = bq.template select<16, 1>(16 * q);
+          simd<uint32_t, 16> m0 = xq & 0x00FF00FFu, m1 = (xq >> 8) & 0x00FF00FFu;
+          B.template select<16, 1>(16 * (2 * q)) = ((m0 & 0x007F007Fu) << 7) | ((m0 & 0x00800080u) << 8);
+          B.template select<16, 1>(16 * (2 * q + 1)) = ((m1 & 0x007F007Fu) << 7) | ((m1 & 0x00800080u) << 8);
+        }
+        simd<int32_t, 128> bi = B.template bit_cast_view<int32_t>();
+        acc = xmx::dpas<8, R, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16,
+                        xmx::dpas_argument_type::fp16>(acc, bi, av);
+        bq = bqn;
+      }
+    } else if (k0 < k1 && fp8) {
       // FP8 e4m3 weights: 256 B per 16x16 tile; bytes of dword (q, n) = elements [4q, 4q+2, 4q+1, 4q+3] of row n.
       // (b & 0x7f) << 7 | (b & 0x80) << 8 is the fp16 bit pattern of value * 2^-8 (exact, also for subnormals).
       simd<uint32_t, 64> bq, bqn;
@@ -425,20 +590,33 @@ void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
     }
   });
 }
-template <int KSD>
+static int dg_addr() { static const int v = getenv("XIK_ADDR") ? atoi(getenv("XIK_ADDR")) : 0; return v; }
+template <int KSD, int AV>
 static void dgemm_k(xik_ctx *c, const DArgs &a, int T) {
   for (int t0 = 0; t0 < T; t0 += 8) {
     int n = std::min(8, T - t0);
-    if (n == 1) dgemm_t<1, KSD>(c->q, a, t0, n);
-    else if (n == 2) dgemm_t<2, KSD>(c->q, a, t0, n);
-    else if (n <= 4) dgemm_t<4, KSD>(c->q, a, t0, n);
-    else dgemm_t<8, KSD>(c->q, a, t0, n);
+    if (n == 1) dgemm_t<1, KSD, AV>(c->q, a, t0, n);
+    else if (n == 2) dgemm_t<2, KSD, AV>(c->q, a, t0, n);
+    else if (n <= 4) dgemm_t<4, KSD, AV>(c->q, a, t0, n);
+    else dgemm_t<8, KSD, AV>(c->q, a, t0, n);
   }
 }
+template <int AV>
+static void dgemm_av(xik_ctx *c, const DArgs &a, int T) {
+  if (a.ksd == 8) dgemm_k<8, AV>(c, a, T);
+  else if (a.ksd == 32) dgemm_k<32, AV>(c, a, T);
+  else dgemm_k<16, AV>(c, a, T);
+}
 void dgemm(xik_ctx *c, const DArgs &a, int T) {
-  if (a.ksd == 8) dgemm_k<8>(c, a, T);
-  else if (a.ksd == 32) dgemm_k<32>(c, a, T);
-  else dgemm_k<16>(c, a, T);
+  switch (dg_addr()) {
+    case 1: return dgemm_av<1>(c, a, T);
+    case 2: return dgemm_av<2>(c, a, T);
+    case 3: return dgemm_av<3>(c, a, T);
+    case 4: return dgemm_av<4>(c, a, T);
+    case 5: return dgemm_av<5>(c, a, T);
+    case 6: return dgemm_av<6>(c, a, T);
+    default: return dgemm_av<0>(c, a, T);
+  }
 }
 
 // ------------------------------------------------- multi-matrix GEMV (one launch)
@@ -1775,9 +1953,12 @@ xik_ctx *xik_create(int max_ctx, int max_tokens) {
 
 void xik_destroy(xik_ctx *c) {
   if (!c) return;
-  for (auto &kv : c->tensors) sycl::free(kv.second.p, c->q);
+  for (auto &kv : c->tensors) sycl::free(kv.second.base ? kv.second.base : kv.second.p, c->q);
   delete c;
 }
+
+// Experiment: shift the start of every repacked expert tensor by XIK_WOFF bytes (content untouched).
+static size_t woff_bytes() { static const size_t v = getenv("XIK_WOFF") ? (size_t)atol(getenv("XIK_WOFF")) : 0; return v; }
 
 int xik_upload(xik_ctx *c, const char *name, int dtype, const void *src, size_t bytes) {
   try {
@@ -1920,12 +2101,14 @@ int xik_finalize(xik_ctx *c) {
           std::string sn = wn + "_scale";
           int rows = m ? D : 2 * FI, K = m ? FI : D;
           Buf &wb = c->tensors.at(wn), &sb = c->tensors.at(sn);
-          uint8_t *nw = (uint8_t *)malloc_device(wb.bytes + 64, c->q), *ns = (uint8_t *)malloc_device(sb.bytes + 64, c->q);
-          if (!nw || !ns) throw std::runtime_error("repack alloc failed");
+          size_t wo = woff_bytes();
+          uint8_t *nw0 = (uint8_t *)malloc_device(wb.bytes + 64 + 4096, c->q), *ns0 = (uint8_t *)malloc_device(sb.bytes + 64 + 4096, c->q);
+          if (!nw0 || !ns0) throw std::runtime_error("repack alloc failed");
+          uint8_t *nw = nw0 + wo, *ns = ns0 + wo;
           k_repack_mxfp8(c, (const uint8_t *)wb.p, (uint32_t *)nw, (const uint8_t *)sb.p, ns, rows, K);
           c->q.wait();
-          sycl::free(wb.p, c->q); sycl::free(sb.p, c->q);
-          wb.p = nw; sb.p = ns;
+          sycl::free(wb.base ? wb.base : wb.p, c->q); sycl::free(sb.base ? sb.base : sb.p, c->q);
+          wb.p = nw; sb.p = ns; wb.base = nw0; sb.base = ns0;
         }
       }
       if (!is_mxfp8(l)) {
@@ -1934,12 +2117,14 @@ int xik_finalize(xik_ctx *c) {
           std::string sn = wn + "_scale";
           int rows = m ? D : 2 * FI, K = m ? FI : D;
           Buf &wb = c->tensors.at(wn), &sb = c->tensors.at(sn);
-          uint8_t *nw = (uint8_t *)malloc_device(wb.bytes + 64, c->q), *ns = (uint8_t *)malloc_device(sb.bytes + 64, c->q);
-          if (!nw || !ns) throw std::runtime_error("repack alloc failed");
+          size_t wo = woff_bytes();
+          uint8_t *nw0 = (uint8_t *)malloc_device(wb.bytes + 64 + 4096, c->q), *ns0 = (uint8_t *)malloc_device(sb.bytes + 64 + 4096, c->q);
+          if (!nw0 || !ns0) throw std::runtime_error("repack alloc failed");
+          uint8_t *nw = nw0 + wo, *ns = ns0 + wo;
           k_repack_fp4(c, (const uint8_t *)wb.p, nw, (const uint8_t *)sb.p, ns, rows, K);
           c->q.wait();
-          sycl::free(wb.p, c->q); sycl::free(sb.p, c->q);
-          wb.p = nw; sb.p = ns;
+          sycl::free(wb.base ? wb.base : wb.p, c->q); sycl::free(sb.base ? sb.base : sb.p, c->q);
+          wb.p = nw; sb.p = ns; wb.base = nw0; sb.base = ns0;
         }
       }
       w.w13 = tp8(c, p + "mlp.experts.w13_weight");
@@ -2980,4 +3165,84 @@ extern "C" int xik_prof_segments(xik_ctx *c, double *out, int max_seg) {
     out[i * 6 + 5] = en[i];
   }
   return n;
+}
+
+// Per-projection micro-benchmark (cold: rotates over the 24 layers).  which: 0 q, 1 k, 2 v, 3 r, 4 gate, 5 wo,
+// 6 head, 7 the fused launch used by the engine (q,r,sink,gate,k,v).  Returns us/call and logical bytes/call.
+extern "C" int xik_bench_dense(xik_ctx *c, int which, int T, int iters, double *out_us, double *out_bytes, int *out_fp8) {
+  try {
+    int it = 0;
+    auto isfp8 = [&](const void *w) { return g_fp8_scale.count(w) > 0; };
+    struct M { int rows, K; };
+    M dims[8] = {{QD, D}, {KVD, D}, {KVD, D}, {RD, D}, {QD, D}, {D, QD}, {VOCAB, D}, {0, 0}};
+    auto wsel = [&](const LayerW &lw) -> const uint16_t * {
+      switch (which) { case 0: return lw.wq; case 1: return lw.wk; case 2: return lw.wv; case 3: return lw.wr; case 4: return lw.gate_attn; default: return lw.wo; }
+    };
+    const LayerW &l0 = c->L[0];
+    bool fp8 = isfp8(which == 6 ? (const void *)c->unembed : which == 7 ? (const void *)l0.wq : (const void *)wsel(l0));
+    *out_fp8 = fp8;
+    auto bytes_of = [&](int rows, int K) { return (double)rows * K * (fp8 ? 1.0 : 2.0) + (fp8 ? rows * 4.0 : 0.0); };
+    double by = 0;
+    if (which == 7) by = bytes_of(QD, D) * 2 + bytes_of(RD, D) + bytes_of(KVD, D) * 2 + bytes_of(32, D);
+    else by = bytes_of(dims[which].rows, dims[which].K);
+    auto run = [&]() {
+      const LayerW &lw = c->L[it++ % NLAYER];
+      DArgs d;
+      if (which == 7) {
+        d.add(lw.wq, c->in[0], D, c->qb, QD, QD, D, false);
+        d.add(lw.wr, c->in[0], D, c->rb, RD, RD, D, false);
+        d.add(lw.sink, c->in[0], D, c->sinkb, NH, NH, D, false);
+        d.add(lw.gate_attn, c->in[0], D, c->gateb, QD, QD, D, false);
+        d.add(lw.wk, c->in[0], D, c->kb, KVD, KVD, D, true);
+        d.add(lw.wv, c->in[0], D, c->vb, KVD, KVD, D, true);
+        d.ksd = 16;
+      } else if (which == 6) {
+        d.add(c->unembed, c->in[0], D, c->logits, VOCAB, VOCAB, D, false);
+      } else {
+        d.add(wsel(lw), which == 5 ? c->attn_o : c->in[0], which == 5 ? QD : D, which == 5 ? c->ao2 : c->qb, which == 5 ? D : dims[which].rows,
+              dims[which].rows, dims[which].K, false);
+        d.ksd = which == 5 ? 32 : 16;
+      }
+      dgemm(c, d, T);
+    };
+    for (int i = 0; i < 24; i++) run();
+    c->q.wait();
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; i++) run();
+    c->q.wait();
+    *out_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+    *out_bytes = by;
+    return 0;
+  } catch (std::exception &e) {
+    g_err = e.what();
+    return 1;
+  }
+}
+
+// Layout report: real device addresses of the expert tensors and the start address (mod 256 / 4096) of every stream a
+// thread reads, for the NVFP4 and MXFP8 expert kernels and the dense tiles.
+extern "C" void xik_layout_report(xik_ctx *c, int layer) {
+  const LayerW &lw = c->L[layer];
+  auto m = [](const void *p, size_t a) { return (size_t)((uintptr_t)p % a); };
+  fprintf(stderr, "layer %d (%s)\\n", layer, is_mxfp8(layer) ? "MXFP8" : "NVFP4");
+  struct T { const char *n; const void *p; size_t unit; };
+  size_t nrb13 = 2 * FI / 16, nrb2 = D / 16;
+  if (!is_mxfp8(layer)) {
+    T ts[] = {{"w13 weights", lw.w13, 0}, {"w13 scales", lw.w13_s, 0}, {"w2 weights", lw.w2, 0}, {"w2 scales", lw.w2_s, 0}};
+    for (auto &t : ts) fprintf(stderr, "  %-12s base %p  mod256 %3zu  mod4096 %4zu\\n", t.n, t.p, m(t.p, 256), m(t.p, 4096));
+    // thread stream: (expert e, row-block rb) -> weights at ((e*nrb + rb) * nst) * 512 B ; scales at ... * 64 B
+    size_t nst13 = D / 64, nst2 = FI / 64;
+    size_t exs13 = nrb13 * nst13 * 512, rbs13 = nst13 * 512, exs2 = nrb2 * nst2 * 512, rbs2 = nst2 * 512;
+    fprintf(stderr, "  w13: expert stride %zu B (mod256 %zu, mod4096 %zu) | row-block (stream) pitch %zu B (mod256 %zu, mod4096 %zu) | tile pitch 512 B\\n", exs13, exs13 % 256, exs13 % 4096, rbs13, rbs13 % 256, rbs13 % 4096);
+    fprintf(stderr, "  w2 : expert stride %zu B (mod256 %zu, mod4096 %zu) | row-block (stream) pitch %zu B (mod256 %zu, mod4096 %zu) | tile pitch 512 B\\n", exs2, exs2 % 256, exs2 % 4096, rbs2, rbs2 % 256, rbs2 % 4096);
+    size_t ss13 = nst13 * 64, ss2 = nst2 * 64;
+    fprintf(stderr, "  scales: w13 stream pitch %zu B (mod64 %zu) | w2 stream pitch %zu B (mod64 %zu)\\n", ss13, ss13 % 64, ss2, ss2 % 64);
+  } else {
+    T ts[] = {{"w13 weights", lw.w13, 0}, {"w13 scales", lw.w13_s, 0}, {"w2 weights", lw.w2, 0}, {"w2 scales", lw.w2_s, 0}};
+    for (auto &t : ts) fprintf(stderr, "  %-12s base %p  mod256 %3zu  mod4096 %4zu\\n", t.n, t.p, m(t.p, 256), m(t.p, 4096));
+    size_t nst13 = D / 64, nst2 = FI / 64;
+    size_t rbs13 = nst13 * 1024, rbs2 = nst2 * 1024;
+    fprintf(stderr, "  w13: row-block pitch %zu B (mod256 %zu, mod4096 %zu), tile pitch 256 B | w2: %zu B (mod256 %zu, mod4096 %zu)\\n", rbs13, rbs13 % 256, rbs13 % 4096, rbs2, rbs2 % 256, rbs2 % 4096);
+  }
+  fprintf(stderr, "  dense wq tiles base %p mod256 %zu | wo %p mod256 %zu | unembed %p mod256 %zu\\n", lw.wq, m(lw.wq, 256), lw.wo, m(lw.wo, 256), c->unembed, m(c->unembed, 256));
 }

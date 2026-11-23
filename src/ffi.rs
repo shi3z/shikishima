@@ -28,6 +28,8 @@ unsafe extern "C" {
     pub fn xik_prof_rec(c: *mut XikCtx, on: c_int);
     pub fn xik_prof_tag(c: *mut XikCtx, tag: c_int);
     pub fn xik_prof_segments(c: *mut XikCtx, out: *mut f64, max_seg: c_int) -> c_int;
+    pub fn xik_bench_dense(c: *mut XikCtx, which: c_int, t: c_int, iters: c_int, us: *mut f64, bytes: *mut f64, fp8: *mut c_int) -> c_int;
+    pub fn xik_layout_report(c: *mut XikCtx, layer: c_int);
     pub fn xik_trace(c: *mut XikCtx, buf: *mut f32);
     pub fn xik_prof_enable(c: *mut XikCtx, on: c_int);
     pub fn xik_prof_get(c: *mut XikCtx, us16: *mut f64);
