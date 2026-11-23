@@ -79,29 +79,35 @@ fn main() {
         let hybrid = a.iter().any(|x| x == "--hybrid");
         let blk: usize = a.iter().position(|x| x == "--block").map(|i| a[i + 1].parse().unwrap()).unwrap_or(8);
         let mut v = vec![];
+        let mut vd = vec![]; // decode-only
+        let mut pf = vec![];
         for rep in 0..=reps {
             e.reset();
             let t1 = Instant::now();
-            let toks = if hybrid {
+            let (toks, tpre) = if hybrid {
                 let (o, _st, hs) = xeinkling::spec::generate_hybrid(&mut e, &ids, n, blk, 31, true).unwrap();
                 if rep == reps {
                     eprintln!("{}", hs.copy_diag.report("copy  "));
                     eprintln!("{}", hs.dspark_diag.report("dspark"));
                     eprintln!("plain: rounds {} | copy rounds {} | dspark rounds {}", hs.plain.rounds, hs.copy.rounds, hs.dspark.rounds);
                 }
-                o.len()
+                (o.len(), hs.prefill_secs)
             } else if spec {
-                xeinkling::spec::generate_dspark(&mut e, &ids, n, blk).unwrap().0.len()
+                (xeinkling::spec::generate_dspark(&mut e, &ids, n, blk).unwrap().0.len(), 0.0)
             } else {
+                let tp = Instant::now();
                 let mut cur = e.prefill(&ids).unwrap();
+                let tpre = tp.elapsed().as_secs_f64();
                 for _ in 1..n { cur = e.forward(&[cur], false, true).unwrap()[0]; if e.pending() > 128 { e.discard_pending(); } }
-                n
+                (n, tpre)
             };
             let t = t1.elapsed().as_secs_f64();
-            if rep > 0 { v.push(toks as f64 / t); } // first run = warm-up
+            if rep > 0 { v.push(toks as f64 / t); vd.push(toks as f64 / (t - tpre).max(1e-6)); pf.push(tpre); } // first run = warm-up
         }
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        eprintln!("{} {n} tok x{reps}: median {:.2} min {:.2} max {:.2} tok/s (wall, prefill included)", if hybrid { "hybrid" } else if spec { "dspark" } else { "plain" }, v[v.len() / 2], v[0], v[v.len() - 1]);
+        vd.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        pf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!("{} {n} tok x{reps}: median {:.2} min {:.2} max {:.2} tok/s (wall, prefill included) | decode-only median {:.2} | prefill {} tok {:.0} ms", if hybrid { "hybrid" } else if spec { "dspark" } else { "plain" }, v[v.len() / 2], v[0], v[v.len() - 1], vd[vd.len() / 2], ids.len(), pf[pf.len() / 2] * 1e3);
         return;
     }
     if a.iter().any(|x| x == "--hybrid") {

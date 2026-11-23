@@ -291,6 +291,7 @@ pub struct HybridStats {
     pub plain: KindStats,
     pub dspark: KindStats,
     pub copy: KindStats,
+    pub prefill_secs: f64,
     pub ctl_secs: f64,
     pub draft_secs: f64,
     pub ingest_secs: f64,
@@ -305,7 +306,9 @@ pub fn generate_hybrid(e: &mut Engine, prompt: &[i32], n: usize, block: usize, m
     let mut hs = HybridStats::default();
     let mut ctl = Ctl::new(0.0225);
     let mut hist = prompt.to_vec();
+    let tpf = Instant::now();
     let mut bonus = e.prefill_drafting(prompt)?;
+    hs.prefill_secs = tpf.elapsed().as_secs_f64();
     let mut rounds = 0usize;
     let margin = 1.03;
     let trace = std::env::var("XIK_TRACE_CTL").is_ok();
