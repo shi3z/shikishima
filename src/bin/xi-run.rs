@@ -84,7 +84,11 @@ fn main() {
             let t1 = Instant::now();
             let toks = if hybrid {
                 let (o, _st, hs) = xeinkling::spec::generate_hybrid(&mut e, &ids, n, blk, 31, true).unwrap();
-                if rep == reps { eprintln!("hybrid stats: {hs:?}"); }
+                if rep == reps {
+                    eprintln!("{}", hs.copy_diag.report("copy  "));
+                    eprintln!("{}", hs.dspark_diag.report("dspark"));
+                    eprintln!("plain: rounds {} | copy rounds {} | dspark rounds {}", hs.plain.rounds, hs.copy.rounds, hs.dspark.rounds);
+                }
                 o.len()
             } else if spec {
                 xeinkling::spec::generate_dspark(&mut e, &ids, n, blk).unwrap().0.len()
