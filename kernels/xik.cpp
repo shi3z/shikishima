@@ -48,6 +48,7 @@ constexpr int QD = NH * HD, KVD = NKV * HD, RD = NH * DREL;
 constexpr int CORE0 = 6, CORE1 = 18, NCORE = 12, NPASS = 3, BLK = 6, RANK = 64;
 constexpr int NSLOT = NLAYER + (NPASS - 1) * NCORE;  // 48
 constexpr int RING = 2048;                           // local KV ring (>= WIN + max_tokens)
+constexpr int CAPR = 256;
 constexpr int KSMAX = 8, KS_FP4 = 2, DFF_ = 9216;
 constexpr float EPS = 1e-6f, QK_CLIP = 22.627416997969522f, REL_CLIP = 8.0f;
 constexpr float GATE_CAP = 4.0f, UP_CAP = 25.0f, FINAL_CAP = 30.0f, ROUTE_SCALE = 8.0f;
@@ -114,6 +115,7 @@ struct xik_ctx {
   std::vector<int> seg_tag;
   float *sv_k[NSLOT], *sv_v[NSLOT], *sv_a[NSLOT], *sv_m[NSLOT];
   float *cap = nullptr;
+  int cap_pos = 0, ing_pos = 0;  // hidden-state ring: rows written / rows already fed to the drafter
   int32_t *ecnt = nullptr, *elist = nullptr, *act_e = nullptr, *nact = nullptr, *desc = nullptr;
   int moe_cfg = -1;
   // ---- DSpark drafter
@@ -1571,7 +1573,7 @@ int xik_finalize(xik_ctx *c) {
     c->convout = A((size_t)T * D);
     c->scr = A(8192);
     c->ecnt = dalloc<int32_t>(c, NE); c->elist = dalloc<int32_t>(c, (size_t)NE * T); c->act_e = dalloc<int32_t>(c, NE); c->nact = dalloc<int32_t>(c, 4); c->desc = dalloc<int32_t>(c, (size_t)NE * 16);
-    c->cap = A((size_t)T * 4 * D);
+    c->cap = A((size_t)CAPR * 4 * D);
     for (int sl = 0; sl < NSLOT; sl++) {
       c->sv_k[sl] = A((size_t)T * KVD); c->sv_v[sl] = A((size_t)T * KVD);
       c->sv_a[sl] = A((size_t)T * D); c->sv_m[sl] = A((size_t)T * D);
@@ -1596,6 +1598,7 @@ int xik_finalize(xik_ctx *c) {
 void xik_reset(xik_ctx *c) {
   c->pos = 0;
   c->dpos = 0;
+  c->cap_pos = c->ing_pos = 0;
   // KV needs no clearing (positions are tracked); conv history must be zero.
   for (int s = 0; s < NSLOT; s++) {
     c->cpar[s] = 0;
@@ -1618,10 +1621,12 @@ enum { P_MIX = 0, P_NORM, P_GEMV_ATTN, P_KV, P_ATTN, P_WO, P_CONV, P_MOE_ROUTE, 
 
 void k_capture(xik_ctx *c, const float *src, int idx, int T) {
   float *dst = c->cap;
+  const int32_t *dpp = c->dparams;
   c->q.parallel_for(range<1>((size_t)T * D), [=](id<1> i) {
     size_t t = i[0] / D;
     int d = (int)(i[0] % D);
-    dst[(t * 4 + idx) * D + d] = src[i[0]];
+    size_t row = (size_t)((dpp[1] + (int)t) % CAPR);
+    dst[(row * 4 + idx) * D + d] = src[i[0]];
   });
 }
 
@@ -2212,7 +2217,9 @@ static int do_forward(xik_ctx *c, const int32_t *ids, int T, float *logits_last,
     if (c->prof) { c->q.wait(); c->tprev = std::chrono::steady_clock::now(); }
     int rows = out_argmax ? T : 1;
     c->q.memcpy(c->ids_d, ids, (size_t)T * 4);
-    c->q.memcpy(c->dparams, &pos0, 4);
+    if (c->cap_pos + T - c->ing_pos > CAPR) throw std::runtime_error("drafter hidden-state backlog overflow (ingest more often)");
+    int hdr[2] = {pos0, c->cap_pos};
+    c->q.memcpy(c->dparams, hdr, 8);
     static const bool want_graph = getenv("XIK_GRAPH") != nullptr;
     bool use_graph = want_graph && out_argmax && !c->prof && !c->trace_host && T <= 8 && !c->graph_failed;
     if (use_graph)
@@ -2255,7 +2262,7 @@ static int do_forward(xik_ctx *c, const int32_t *ids, int T, float *logits_last,
       c->prof_us[14] += std::chrono::duration<double, std::micro>(t_sub - t_fwd0).count();
       c->prof_us[15] += std::chrono::duration<double, std::micro>(t_end - t_fwd0).count();
     }
-    if (defer) c->pend_T = T; else c->pos += T;
+    if (defer) c->pend_T = T; else { c->pos += T; c->cap_pos += T; if (!c->has_dr) c->ing_pos = c->cap_pos; }
     c->defer = false;
     return 0;
   } catch (std::exception &e) {
@@ -2280,6 +2287,8 @@ extern "C" int xik_commit(xik_ctx *c, int n) {
     for (int sl = 0; sl < NSLOT; sl++) k_commit_slot(c, sl, n);
     c->q.wait();
     c->pos += n;
+    c->cap_pos += n;
+    if (!c->has_dr) c->ing_pos = c->cap_pos;
     c->pend_T = 0;
     return 0;
   } catch (std::exception &e) {
@@ -2288,24 +2297,37 @@ extern "C" int xik_commit(xik_ctx *c, int n) {
   }
 }
 
-// Feed the target hidden states of the first n tokens of the last forward/commit into the drafter's context.
-extern "C" int xik_ingest(xik_ctx *c, int n) {
+// Feed the next pending hidden-state rows (in order) into the drafter's context. Rows are kept in a ring, so plain
+// target steps can run without touching the drafter and the backlog is ingested in one batch before drafting.
+static void ingest_chunk(xik_ctx *c, int start, int n) {
+  const float *cap = c->cap + (size_t)start * 4 * D;
+  for (int i = 0; i < DNL; i++) {
+    auto &d = c->dl[i];
+    d_mix(c, cap, n, c->d_alpha + i * 4, d.dfl, c->dctxn);
+    GArgs g;
+    g.add(d.kpc, c->dctxn, D, c->dkctx, KVD, KVD, D, true);
+    g.add(d.vpc, c->dctxn, D, c->dvctx, KVD, KVD, D, true);
+    gemv_multi(c, g, n);
+    d_head_prep(c, c->dkctx, NKV, d.knc, true, c->dpos, n, c->dkc[i], d_local(i) ? RING : 0, true);
+    d_head_prep(c, c->dvctx, NKV, nullptr, false, c->dpos, n, c->dvc[i], d_local(i) ? RING : 0, true);
+  }
+  // f_rnn: mix of the last context hidden with the markov head's row/norm
+  d_mix(c, cap + (size_t)(n - 1) * 4 * D, 1, c->d_alpha + 12, c->mk_dfl, c->dfrnn);
+  c->dpos += n;
+  c->ing_pos += n;
+}
+extern "C" int xik_pending(xik_ctx *c) { return c->cap_pos - c->ing_pos; }
+// Drop pending hidden states without feeding them to the drafter (its context then has a gap: only valid when the
+// drafter will not be used again for this sequence).
+extern "C" void xik_discard_pending(xik_ctx *c) { c->ing_pos = c->cap_pos; }
+extern "C" int xik_ingest_pending(xik_ctx *c) {
   try {
     if (!c->has_dr) throw std::runtime_error("no drafter loaded");
-    if (n < 1 || n > c->max_tokens) throw std::runtime_error("bad ingest count");
-    for (int i = 0; i < DNL; i++) {
-      auto &d = c->dl[i];
-      d_mix(c, c->cap, n, c->d_alpha + i * 4, d.dfl, c->dctxn);
-      GArgs g;
-      g.add(d.kpc, c->dctxn, D, c->dkctx, KVD, KVD, D, true);
-      g.add(d.vpc, c->dctxn, D, c->dvctx, KVD, KVD, D, true);
-      gemv_multi(c, g, n);
-      d_head_prep(c, c->dkctx, NKV, d.knc, true, c->dpos, n, c->dkc[i], d_local(i) ? RING : 0, true);
-      d_head_prep(c, c->dvctx, NKV, nullptr, false, c->dpos, n, c->dvc[i], d_local(i) ? RING : 0, true);
+    while (c->cap_pos > c->ing_pos) {
+      int start = c->ing_pos % CAPR;
+      int n = std::min({c->cap_pos - c->ing_pos, c->max_tokens, CAPR - start});
+      ingest_chunk(c, start, n);
     }
-    // f_rnn: mix of the last context hidden with the markov head's row/norm
-    d_mix(c, c->cap + (size_t)(n - 1) * 4 * D, 1, c->d_alpha + 12, c->mk_dfl, c->dfrnn);
-    c->dpos += n;
     return 0;
   } catch (std::exception &e) {
     g_err = e.what();

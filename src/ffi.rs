@@ -17,7 +17,9 @@ unsafe extern "C" {
     pub fn xik_forward(c: *mut XikCtx, ids: *const i32, t: c_int, logits_last: *mut f32, out_argmax: *mut i32) -> c_int;
     pub fn xik_verify(c: *mut XikCtx, ids: *const i32, t: c_int, out_argmax: *mut i32) -> c_int;
     pub fn xik_commit(c: *mut XikCtx, n: c_int) -> c_int;
-    pub fn xik_ingest(c: *mut XikCtx, n: c_int) -> c_int;
+    pub fn xik_ingest_pending(c: *mut XikCtx) -> c_int;
+    pub fn xik_pending(c: *mut XikCtx) -> c_int;
+    pub fn xik_discard_pending(c: *mut XikCtx);
     pub fn xik_draft(c: *mut XikCtx, anchor: i32, out7: *mut i32) -> c_int;
     pub fn xik_mem(c: *mut XikCtx, out: *mut u64);
     pub fn xik_set_moe_cfg(c: *mut XikCtx, cfg: c_int);

@@ -41,7 +41,9 @@ int xik_commit(xik_ctx *, int n);
 /* DSpark drafter (needs the mtp.* tensors uploaded). ingest(n): feed the first n tokens' captured target
  * hidden states of the last forward/verify (call after every prefill chunk and every commit);
  * draft(anchor): 7 proposed tokens following `anchor`. */
-int xik_ingest(xik_ctx *, int n);
+int xik_ingest_pending(xik_ctx *);
+int xik_pending(xik_ctx *);
+void xik_discard_pending(xik_ctx *);
 int xik_draft(xik_ctx *, int32_t anchor, int32_t *out7);
 
 /* Memory report, see xik.cpp (8 x uint64). */

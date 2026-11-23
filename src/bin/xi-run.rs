@@ -84,13 +84,13 @@ fn main() {
             let t1 = Instant::now();
             let toks = if hybrid {
                 let (o, _st, hs) = xeinkling::spec::generate_hybrid(&mut e, &ids, n, blk, 31, true).unwrap();
-                if rep == reps { eprintln!("hybrid rounds: {hs:?}"); }
+                if rep == reps { eprintln!("hybrid stats: {hs:?}"); }
                 o.len()
             } else if spec {
                 xeinkling::spec::generate_dspark(&mut e, &ids, n, blk).unwrap().0.len()
             } else {
                 let mut cur = e.prefill(&ids).unwrap();
-                for _ in 1..n { cur = e.forward(&[cur], false, true).unwrap()[0]; }
+                for _ in 1..n { cur = e.forward(&[cur], false, true).unwrap()[0]; if e.pending() > 128 { e.discard_pending(); } }
                 n
             };
             let t = t1.elapsed().as_secs_f64();
@@ -150,6 +150,7 @@ fn main() {
     for _ in 1..n {
         cur = e.forward(&[cur], false, true).unwrap()[0];
         out.push(cur);
+        if e.pending() > 128 { e.discard_pending(); }
     }
     let td = t2.elapsed().as_secs_f64();
     let text = tok.decode(&out.iter().map(|&x| x as u32).collect::<Vec<_>>(), false).unwrap();

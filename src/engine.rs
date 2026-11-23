@@ -91,12 +91,23 @@ impl Engine {
         Ok(())
     }
 
-    /// Feed the first `n` tokens' captured hidden states of the last forward/verify to the drafter.
-    pub fn ingest(&mut self, n: usize) -> Result<(), String> {
-        if unsafe { ffi::xik_ingest(self.ctx, n as i32) } != 0 {
+    /// Feed all pending target hidden states (kept in a ring since the last call) to the drafter's context.
+    pub fn ingest_pending(&mut self) -> Result<(), String> {
+        if unsafe { ffi::xik_ingest_pending(self.ctx) } != 0 {
             return Err(last_error());
         }
         Ok(())
+    }
+    /// Compatibility: ingest everything pending (the argument is ignored).
+    pub fn ingest(&mut self, _n: usize) -> Result<(), String> {
+        self.ingest_pending()
+    }
+    /// Plain decoding never drafts: forget the backlog (the drafter context would have a gap afterwards).
+    pub fn discard_pending(&mut self) {
+        unsafe { ffi::xik_discard_pending(self.ctx) }
+    }
+    pub fn pending(&self) -> usize {
+        unsafe { ffi::xik_pending(self.ctx) as usize }
     }
     /// DSpark: 7 tokens proposed after `anchor`.
     pub fn draft(&mut self, anchor: i32) -> Result<[i32; 7], String> {
@@ -111,7 +122,7 @@ impl Engine {
         let mut last = 0;
         for ch in ids.chunks(self.max_tokens) {
             last = self.forward(ch, false, true)?.pop().unwrap();
-            self.ingest(ch.len())?;
+            self.ingest_pending()?;
         }
         Ok(last)
     }
@@ -121,6 +132,9 @@ impl Engine {
         let mut last = 0;
         for ch in ids.chunks(self.max_tokens) {
             last = self.forward(ch, false, true)?.pop().unwrap();
+            if self.pending() > 128 {
+                self.discard_pending(); // plain prefill: the drafter is not used for this sequence
+            }
         }
         Ok(last)
     }

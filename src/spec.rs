@@ -175,91 +175,179 @@ impl Adaptive {
     }
 }
 
-#[derive(Default, Debug)]
-pub struct HybridStats {
-    pub rounds_copy: usize,
-    pub rounds_draft: usize,
-    pub rounds_plain: usize,
-    pub copy_tokens: usize,
+/// Online controller: tracks the measured cost of a plain step, of verifying extra rows, and of drafting, and the
+/// acceptance of both proposal sources; picks the path with the best expected committed tokens per second.
+pub struct Ctl {
+    est: [f64; 7],    // DSpark: P(at least j of the first j drafts accepted)
+    copy_rate: f64,   // copy proposals: per-position acceptance (geometric model)
+    pub t_plain: f64, // s, plain step (T=1 forward)
+    pub slope: f64,   // s per extra verified row
+    pub t_draft: f64, // s, draft + pending ingest
+    since_probe: usize,
 }
 
-/// Copy proposals (long, from the request's own history) + the DSpark drafter (7 tokens): whichever the cost model
-/// predicts to be faster per round; plain steps when neither pays. Output equals plain greedy decoding.
+impl Ctl {
+    pub fn new(t_plain: f64) -> Self {
+        let f = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        Self { est: [0.6, 0.45, 0.3, 0.2, 0.15, 0.1, 0.08], copy_rate: 0.7, t_plain: f("XIK_C1", t_plain), slope: f("XIK_SLOPE", 0.0031), t_draft: f("XIK_CDRAFT", 0.0107), since_probe: 0 }
+    }
+    fn vcost(&self, rows: usize) -> f64 {
+        self.t_plain + self.slope * (rows as f64 - 1.0)
+    }
+    pub fn plan_dspark(&self, kmax: usize) -> (usize, f64) {
+        let (mut best, mut gain) = ((0usize, 0.0), 1.0);
+        for k in 1..=kmax.min(7) {
+            gain += self.est[k - 1];
+            let r = gain / (self.vcost(1 + k) + self.t_draft);
+            if r > best.1 { best = (k, r); }
+        }
+        best
+    }
+    pub fn plan_copy(&self, len: usize) -> (usize, f64) {
+        let (mut best, mut gain, mut p) = ((0usize, 0.0), 1.0, 1.0);
+        for k in 1..=len {
+            p *= self.copy_rate;
+            gain += p;
+            let r = gain / self.vcost(1 + k);
+            if r > best.1 { best = (k, r); }
+        }
+        best
+    }
+    pub fn upd_dspark(&mut self, k: usize, acc: usize) {
+        for j in 1..=k {
+            let hit = if acc >= j { 1.0 } else { 0.0 };
+            self.est[j - 1] += 0.12 * (hit - self.est[j - 1]);
+        }
+    }
+    pub fn upd_copy(&mut self, k: usize, acc: usize) {
+        let trials = acc + if acc < k { 1 } else { 0 };
+        let r = acc as f64 / trials.max(1) as f64;
+        self.copy_rate += 0.25 * (r.clamp(0.05, 0.98) - self.copy_rate);
+    }
+    pub fn obs_plain(&mut self, t: f64) { self.t_plain += 0.1 * (t - self.t_plain); }
+    pub fn obs_verify(&mut self, rows: usize, t: f64) {
+        if rows >= 2 {
+            let s = ((t - self.t_plain) / (rows as f64 - 1.0)).max(0.0005);
+            self.slope += 0.1 * (s - self.slope);
+        }
+    }
+    pub fn obs_draft(&mut self, t: f64) { self.t_draft += 0.15 * (t - self.t_draft); }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct KindStats {
+    pub rounds: usize,
+    pub tokens: usize, // committed tokens
+    pub secs: f64,
+}
+#[derive(Default, Debug)]
+pub struct HybridStats {
+    pub plain: KindStats,
+    pub dspark: KindStats,
+    pub copy: KindStats,
+    pub ctl_secs: f64,
+    pub draft_secs: f64,
+    pub ingest_secs: f64,
+}
+
+/// Plain steps, copy proposals (long, from the request's own history) and the DSpark drafter, whichever the
+/// controller predicts to commit the most tokens per second. Output equals plain greedy decoding of the same weights.
 pub fn generate_hybrid(e: &mut Engine, prompt: &[i32], n: usize, block: usize, max_copy: usize, use_dspark: bool) -> Result<(Vec<i32>, SpecStats, HybridStats), String> {
+    use std::time::Instant;
     let mut out = vec![];
     let mut st = SpecStats::default();
     let mut hs = HybridStats::default();
-    let mut pol = Adaptive::new();
+    let mut ctl = Ctl::new(0.0225);
     let mut hist = prompt.to_vec();
     let mut bonus = e.prefill_drafting(prompt)?;
+    let mut rounds = 0usize;
+    let margin = 1.03;
     while out.len() < n {
         out.push(bonus);
         hist.push(bonus);
         if out.len() >= n {
             break;
         }
-        let cp = copy_proposal(&hist, 3, 12, max_copy.min(e.max_tokens - 1));
-        let (ck, crate_) = if cp.len() >= 2 { pol.plan_copy(cp.len()) } else { (0, 0.0) };
-        let (dk, drate) = if use_dspark { pol.plan_draft((block - 1).min(7)) } else { (0, 1.0 / pol.c1) };
-        let (mut kind, mut k) = (0u8, 0usize); // 0 plain, 1 dspark, 2 copy
-        if ck > 0 && crate_ > drate && crate_ > 1.0 / pol.c1 {
-            kind = 2;
-            k = ck;
-        } else if dk > 0 {
-            kind = 1;
-            k = dk;
-        } else if use_dspark {
-            let c = pol.choose((block - 1).min(7));
-            if c > 0 {
+        let tc = Instant::now();
+        // 0 plain, 1 dspark, 2 copy
+        let (mut kind, mut k) = (0u8, 0usize);
+        if rounds >= 3 {
+            let cp = if max_copy > 0 { copy_proposal(&hist, 3, 12, max_copy.min(e.max_tokens - 1)) } else { vec![] };
+            let (ck, cr) = if cp.len() >= 2 { ctl.plan_copy(cp.len()) } else { (0, 0.0) };
+            let (dk, dr) = if use_dspark { ctl.plan_dspark((block - 1).min(7)) } else { (0, 0.0) };
+            let pr = margin / ctl.t_plain;
+            if ck > 0 && cr > dr && cr > pr {
+                kind = 2;
+                k = ck;
+            } else if dk > 0 && dr > pr {
                 kind = 1;
-                k = c;
+                k = dk;
+            } else if use_dspark {
+                ctl.since_probe += 1;
+                if ctl.since_probe >= 16 { // refresh the DSpark statistics now and then
+                    ctl.since_probe = 0;
+                    kind = 1;
+                    k = (block - 1).min(7).min(3);
+                }
+            }
+            if kind == 2 {
+                // proposals travel via `hist`-derived vector
+                let drafts = cp[..k].to_vec();
+                hs.ctl_secs += tc.elapsed().as_secs_f64();
+                let mut ids = vec![bonus];
+                ids.extend_from_slice(&drafts);
+                let t1 = Instant::now();
+                let am = e.verify(&ids)?;
+                let mut acc = 0;
+                while acc < drafts.len() && am[acc] == drafts[acc] { acc += 1; }
+                e.commit(1 + acc)?;
+                let dt = t1.elapsed().as_secs_f64();
+                ctl.obs_verify(ids.len(), dt);
+                ctl.upd_copy(k, acc);
+                hs.copy.rounds += 1; hs.copy.tokens += 1 + acc; hs.copy.secs += dt;
+                st.cycles += 1; st.hist[acc.min(8)] += 1; st.drafted += k; st.accepted += acc;
+                for j in 0..acc { out.push(drafts[j]); hist.push(drafts[j]); }
+                bonus = am[acc];
+                rounds += 1;
+                if e.has_drafter && e.pending() > 160 { e.ingest_pending()?; }
+                continue;
             }
         }
-        let mut ids = vec![bonus];
-        let mut drafts: Vec<i32> = vec![];
-        match kind {
-            2 => {
-                drafts = cp[..k].to_vec();
-                hs.rounds_copy += 1;
-            }
-            1 => {
-                let t0 = std::time::Instant::now();
-                let d7 = e.draft(bonus)?;
-                st.t_draft += t0.elapsed().as_secs_f64();
-                drafts = d7[..k].to_vec();
-                hs.rounds_draft += 1;
-            }
-            _ => hs.rounds_plain += 1,
+        hs.ctl_secs += tc.elapsed().as_secs_f64();
+        if kind == 1 {
+            let t0 = Instant::now();
+            e.ingest_pending()?;
+            let ti = t0.elapsed().as_secs_f64();
+            let d7 = e.draft(bonus)?;
+            let td = t0.elapsed().as_secs_f64();
+            hs.ingest_secs += ti; hs.draft_secs += td - ti;
+            ctl.obs_draft(td);
+            let drafts = d7[..k].to_vec();
+            let mut ids = vec![bonus];
+            ids.extend_from_slice(&drafts);
+            let t1 = Instant::now();
+            let am = e.verify(&ids)?;
+            let mut acc = 0;
+            while acc < drafts.len() && am[acc] == drafts[acc] { acc += 1; }
+            e.commit(1 + acc)?;
+            let dt = t1.elapsed().as_secs_f64();
+            ctl.obs_verify(ids.len(), dt);
+            ctl.upd_dspark(k, acc);
+            hs.dspark.rounds += 1; hs.dspark.tokens += 1 + acc; hs.dspark.secs += td + dt;
+            st.cycles += 1; st.hist[acc.min(8)] += 1; st.drafted += k; st.accepted += acc;
+            for j in 0..acc { out.push(drafts[j]); hist.push(drafts[j]); }
+            bonus = am[acc];
+        } else {
+            let t1 = Instant::now();
+            let am = e.forward(&[bonus], false, true)?;
+            let dt = t1.elapsed().as_secs_f64();
+            ctl.obs_plain(dt);
+            hs.plain.rounds += 1; hs.plain.tokens += 1; hs.plain.secs += dt;
+            st.cycles += 1; st.hist[0] += 1;
+            bonus = am[0];
+            if e.has_drafter && e.pending() > 160 { e.ingest_pending()?; }
         }
-        ids.extend_from_slice(&drafts);
-        let t1 = std::time::Instant::now();
-        let am = e.verify(&ids)?;
-        st.t_verify += t1.elapsed().as_secs_f64();
-        let mut acc = 0;
-        while acc < drafts.len() && am[acc] == drafts[acc] {
-            acc += 1;
-        }
-        let t2 = std::time::Instant::now();
-        e.commit(1 + acc)?;
-        e.ingest(1 + acc)?;
-        st.t_commit += t2.elapsed().as_secs_f64();
-        st.cycles += 1;
-        st.hist[acc.min(8)] += 1;
-        match kind {
-            1 => pol.update(k, acc),
-            2 => {
-                pol.update_copy(k, acc);
-                hs.copy_tokens += acc;
-            }
-            _ => {}
-        }
-        st.drafted += drafts.len();
-        st.accepted += acc;
-        for j in 0..acc {
-            out.push(drafts[j]);
-            hist.push(drafts[j]);
-        }
-        bonus = am[acc];
+        rounds += 1;
     }
     out.truncate(n);
     Ok((out, st, hs))
