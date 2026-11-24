@@ -138,3 +138,15 @@ Layout changes do not alter arithmetic: quality of K1/K3 is unchanged (same KL /
 Verification-width passes (`--bench-prefill`, ms per pass, K0 -> K3): T=2 18.2 -> 15.5, T=4 23.2 -> 19.5, T=8 29.9 -> 26.9, T=16 47.8 -> 44.1.
 
 State after this round: K3 plain 88.6 tok/s (11.3 ms/token), 1.3 ms above the 100 tok/s target.  Remaining: weight kernels about 1.6 ms above the 456 GB/s floor (W3 0.9, attention int4 0.5, MXFP8 0.2), about 4.4 ms in ~800 small kernels and about 1.4 ms of inter-kernel idle gaps.  The next lever is kernel fusion (router GEMV + routing, cvt/group, norm + mixer chains), not the INT3/INT4 weight loops.
+
+### Small-kernel fusion, first results (K3 plain, T = 1)
+
+Single-work-group fused kernels (`XIK_CHAIN` bit mask, default 0 = off; bit 1: attention mix + norm, bit 2: attention conv + MLP mix [+ norm]) are bit-identical to the separate kernels (md5 of 128 greedy tokens equal) but do not help:
+
+| `XIK_CHAIN` | tok/s |
+|---|---|
+| 0 (separate kernels) | 88.5 |
+| 1 (mix + norm, one launch less) | 88.4 |
+| 2 (conv + mix + norm in one work-group) | 82.5 |
+
+Removing a launch does not shorten the dependent chain (load, reduce, barrier, store) of these latency-bound kernels, and a single work-group with serial per-thread conv/state work is slower than the 36-group conv kernel.  Fusion has to shorten the critical path (more parallelism per stage, fewer dependent stages), not only the launch count.

@@ -2271,6 +2271,94 @@ void k_conv(xik_ctx *c, const ConvArgs &a) {
   });
 }
 
+// ---- fused single-work-group chains for T == 1 (same arithmetic as k_conv / k_mix_t / k_wnorm_t, one launch)
+//   CONV: the newest state stream is the output of the short conv (computed in registers, also stored and the conv history written);
+//   NN > 0: the NN mix outputs are RMS-normalised with the weights of NormArgs (as k_wnorm_t).
+template <int NS, int NQ, bool CONV, int NN>
+void k_chain_t(xik_ctx *c, const ConvArgs &ca, const MixArgs &a, const NormArgs &na) {
+  const float qscale = 1.0f / sycl::sqrt((float)D);
+  c->q.submit([&](handler &h) {
+    local_accessor<float, 1> red(range<1>(16 * 32), h);
+    h.parallel_for(nd_range<1>((size_t)256, 256), [=](nd_item<1> it) SUBGROUP16 {
+      int l = it.get_local_id(0);
+      auto sg = it.get_sub_group();
+      int sgid = l / 16, lane = l % 16;
+      float xv[NS][9];
+      float qv[NQ][9];
+      float part[5 + 5 * NQ];
+      for (int j = 0; j < NQ; j++)
+        for (int i = 0; i < 9; i++) qv[j][i] = a.qry[j][l + i * 256] * qscale;
+      for (int b = 0; b < NS; b++) {
+        float ss = 0.f;
+        if (CONV && b == NS - 1) {
+          for (int i = 0; i < 9; i++) {
+            int ch = l + i * 256;
+            float v = conv_one(ca, 0, ch);
+            float o = ca.add_to ? ca.add_to[ch] + v : v;
+            ca.out[ch] = o; xv[b][i] = o; ss += o * o;
+          }
+          if (ca.state_new) for (int idx = l; idx < 3 * D; idx += 256) conv_state_write(ca, idx);
+        } else {
+          for (int i = 0; i < 9; i++) { xv[b][i] = a.st[b][l + i * 256]; ss += xv[b][i] * xv[b][i]; }
+        }
+        part[b] = ss;
+        for (int j = 0; j < NQ; j++) {
+          float s2 = 0.f;
+          for (int i = 0; i < 9; i++) s2 += qv[j][i] * xv[b][i];
+          part[5 + b * NQ + j] = s2;
+        }
+      }
+      int nv = 5 + NS * NQ;
+      for (int v = 0; v < nv; v++) {
+        float r = reduce_over_group(sg, part[v], plus<float>());
+        if (lane == 0) red[sgid * 32 + v] = r;
+      }
+      group_barrier(it.get_group());
+      float tot[5 + 5 * NQ];
+      for (int v = 0; v < nv; v++) {
+        float s2 = 0.f;
+        for (int g = 0; g < 16; g++) s2 += red[g * 32 + v];
+        tot[v] = s2;
+      }
+      float inv[5];
+      for (int b = 0; b < NS; b++) inv[b] = sycl::rsqrt(tot[b] / D + EPS);
+      for (int j = 0; j < NQ; j++) {
+        float sc[5], mx = -3.0e38f;
+        for (int b = 0; b < NS; b++) { sc[b] = tot[5 + b * NQ + j] * inv[b]; mx = sycl::fmax(mx, sc[b]); }
+        float den = 0.f;
+        for (int b = 0; b < NS; b++) { sc[b] = sycl::exp(sc[b] - mx); den += sc[b]; }
+        for (int b = 0; b < NS; b++) sc[b] = sc[b] / den * inv[b];
+        float ov[9], ss = 0.f;
+        for (int i = 0; i < 9; i++) {
+          float o = 0.f;
+          for (int b = 0; b < NS; b++) o += sc[b] * xv[b][i];
+          ov[i] = o; a.out[j][l + i * 256] = o; ss += o * o;
+        }
+        if (NN > 0) {
+          ss = reduce_over_group(it.get_group(), ss, plus<float>());
+          float nr = sycl::rsqrt(ss / D + EPS);
+          for (int i = 0; i < 9; i++) na.out[j][l + i * 256] = rbf(ov[i] * nr * bf2f(na.w[j][l + i * 256]));
+        }
+      }
+    });
+  });
+}
+// returns false when the shape is not covered (caller runs the separate kernels)
+static int chain_mask() { static const int v = getenv("XIK_CHAIN") ? atoi(getenv("XIK_CHAIN")) : 0; return v; }
+static bool chain_on() { return chain_mask() != 0; }
+bool k_chain(xik_ctx *c, const ConvArgs *ca, const MixArgs &a, const NormArgs *na) {
+  if (!chain_on() || abl_mask()) return false;
+  ConvArgs cz{}; NormArgs nz{};
+  const int nn = na ? na->n : 0;
+  if (nn != 0 && nn != a.nq) return false;
+#define CH(S, Q, CV, NN) if (a.ns == S && a.nq == Q && (ca != nullptr) == CV && (nn > 0) == (NN > 0)) { k_chain_t<S, Q, CV, NN>(c, ca ? *ca : cz, a, na ? *na : nz); return true; }
+#define CHS(S) CH(S, 1, true, 0) CH(S, 1, true, 1) CH(S, 1, false, 1) CH(S, 3, false, 3) CH(S, 3, false, 0) CH(S, 1, false, 0)
+  CHS(2) CHS(3) CHS(4) CHS(5)
+#undef CHS
+#undef CH
+  return false;
+}
+
 // ------------------------------------------------------------- attention
 // per (t, head): q clip with scale; r clip with scale. One sub-group per (t,h).
 void k_qr_clip(xik_ctx *c, const LayerW &lw, int T) {
@@ -4339,6 +4427,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
 
   // ---- attention inputs via attention-residual mix
   const float *attn_src[3];
+  bool chained_norm = false;
   if (layer > 0) {
     int nq = local ? 1 : 3;
     MixArgs a{};
@@ -4348,8 +4437,16 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     a.nq = nq;
     const float *qp = c->attnres_q[layer - 1];
     for (int j = 0; j < nq; j++) { a.qry[j] = qp + (size_t)j * D; a.out[j] = c->mix[j]; }
-    if (!(abl_mask() & 256)) k_mix(c, a, T);
     for (int j = 0; j < 3; j++) attn_src[j] = c->mix[local ? 0 : j];
+    bool done = false;
+    if (T == 1 && !have_msg && (chain_mask() & 1) && !(abl_mask() & 256)) {  // fused mix + norm (one launch)
+      NormArgs na{};
+      na.n = nq;
+      const uint16_t *nw3[3] = {local ? lw.attn_norm : lw.q_norm, lw.k_norm, lw.v_norm};
+      for (int j = 0; j < nq; j++) { na.x[j] = attn_src[j]; na.w[j] = nw3[j]; na.out[j] = c->in[j]; }
+      done = chained_norm = k_chain(c, nullptr, a, &na);
+    }
+    if (!done && !(abl_mask() & 256)) k_mix(c, a, T);
   } else {
     for (int j = 0; j < 3; j++) attn_src[j] = f.cur;
   }
@@ -4364,6 +4461,9 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     run_ctl(c, lw, cid, 3, dest, msg, nw, out, T);
     for (int j = 0; j < 3; j++) inp[j] = c->in[j];
     phase(c, P_LOOP);
+  } else if (chained_norm) {
+    for (int j = 0; j < 3; j++) inp[j] = local ? c->in[0] : c->in[j];
+    phase(c, P_NORM);
   } else if (local) {
     NormArgs na{};
     na.n = 1; na.x[0] = attn_src[0]; na.w[0] = lw.attn_norm; na.out[0] = c->in[0];
@@ -4407,6 +4507,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   phase(c, P_WO);
 
   // ---- attn short conv, residual / block bookkeeping
+  ConvArgs ca_pending{}; bool have_ca = false;
   {
     float *dst;
     const float *addto = nullptr;
@@ -4419,11 +4520,12 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
       addto = f.cur;
     }
     ConvArgs a{c->ao2, st_old + 6 * KVD, st_new ? st_new + 6 * KVD : nullptr, dst, addto, D, T, lw.attn_conv, nullptr, nullptr, 0, 2.2360679775f};
-    k_conv(c, a);
+    if (T == 1 && (chain_mask() & 2) && !abl_mask()) { ca_pending = a; have_ca = true; } else k_conv(c, a);
   }
   phase(c, P_CONV);
 
   // ---- MLP input mix
+  bool chained2 = false;
   {
     MixArgs a{};
     for (int b = 0; b < f.nb; b++) a.st[b] = f.blk[b];
@@ -4432,10 +4534,17 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     a.nq = 1;
     a.qry[0] = c->attnres_mlp[layer];
     a.out[0] = c->mix[0];
-    if (!(abl_mask() & 512)) k_mix(c, a, T);
+    if (have_ca) {
+      NormArgs na{};
+      na.n = 1; na.x[0] = c->mix[0]; na.w[0] = lw.mlp_norm; na.out[0] = c->in[0];
+      if (k_chain(c, &ca_pending, a, have_msg ? nullptr : &na)) chained2 = !have_msg;
+      else { k_conv(c, ca_pending); if (!(abl_mask() & 512)) k_mix(c, a, T); }
+    } else if (!(abl_mask() & 512)) k_mix(c, a, T);
   }
   phase(c, P_MIX);
-  if (have_msg) {
+  if (chained2) {
+    phase(c, P_NORM);
+  } else if (have_msg) {
     int cid[1] = {3};
     const float *dest[1] = {c->mix[0]}, *msg[1] = {c->msg[3]};
     const uint16_t *nw[1] = {lw.mlp_norm};
