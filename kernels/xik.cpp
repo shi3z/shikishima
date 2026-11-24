@@ -109,6 +109,7 @@ struct xik_ctx {
   std::map<std::string, Buf> tensors;
   LayerW L[NLAYER];
   const uint16_t *embed = nullptr, *embed_norm = nullptr, *unembed = nullptr, *final_norm = nullptr;
+  uint32_t *head_w4 = nullptr; uint16_t *head_s4 = nullptr;  // int4 output head (XIK_HEAD_W4): packed nibbles + fp16 group scales (see w4_gemv)
   const float *attnres_q[NLAYER - 1], *attnres_mlp[NLAYER], *attnres_out = nullptr, *xpass_q = nullptr, *xpass_kvq = nullptr;
   // state
   float *kcache[NSLOT], *vcache[NSLOT];
@@ -2592,6 +2593,123 @@ static void k_w4sim(xik_ctx *c, uint16_t *w, int rows, int K, int G, int asym, i
     }
   });
 }
+}  // extern "C"
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Int4 output head: weights in the W4 tile layout (see w4_gemv), group 64, symmetric (nibble - 8) * scale, scale chosen by (activation-weighted) squared error.
+static void k_w4pack(xik_ctx *c, const uint16_t *w, int rows, int K, int obj, const float *h, uint32_t *out, uint16_t *sc) {
+  const int ngrp = K / 64;
+  c->q.parallel_for(range<1>((size_t)rows * ngrp), [=](id<1> id) {
+    const size_t r = id[0] / ngrp; const int g = (int)(id[0] % ngrp);
+    const uint16_t *p = w + r * K + (size_t)g * 64;
+    const float *hh = h ? h + (size_t)g * 64 : nullptr;
+    float amax = 0.f;
+    for (int i = 0; i < 64; i++) amax = sycl::fmax(amax, sycl::fabs(bf2f(p[i])));
+    float bs = (float)(sycl::half)(amax / 7.5f), be = 1e30f;
+    if (obj) {
+      for (int cdt = 0; cdt < 12; cdt++) {
+        float s2 = (float)(sycl::half)(amax * (1.f - 0.04f * cdt) / 7.5f); if (s2 == 0.f) continue;
+        float e = 0.f;
+        for (int i = 0; i < 64; i++) { float x = bf2f(p[i]); float q = sycl::fmin(15.f, sycl::fmax(0.f, sycl::rint(x / s2) + 8.f)); float d = x - (q - 8.f) * s2; e += (hh ? hh[i] : 1.f) * d * d; }
+        if (e < be) { be = e; bs = s2; }
+      }
+    }
+    const int rb = (int)(r / 16), n = (int)(r % 16);
+    sc[((size_t)rb * ngrp + g) * 16 + n] = sycl::bit_cast<uint16_t>((sycl::half)bs);
+    for (int bl = 0; bl < 2; bl++)
+      for (int q4 = 0; q4 < 4; q4++) {
+        uint32_t d = 0;
+        for (int j = 0; j < 8; j++) {
+          float x = bf2f(p[bl * 32 + q4 * 8 + j]);
+          uint32_t qv = bs == 0.f ? 8u : (uint32_t)sycl::fmin(15.f, sycl::fmax(0.f, sycl::rint(x / bs) + 8.f));
+          d |= (j & 1) ? (qv << (16 + 4 * (j / 2))) : (qv << (4 * (j / 2)));
+        }
+        out[((size_t)rb * (K / 32) + g * 2 + bl) * 64 + q4 * 16 + n] = d;
+      }
+  });
+}
+// W4A16 GEMV for R <= 8 tokens: Y[t][row] = sum_g scale[row][g] * sum_{k in g} (nibble - 8) * x_fp16[t][k]  (fp16 DPAS, fp32 accumulate per 64-K group)
+template <int KSD, int R>
+static void w4_gemv_r(xik_ctx *c, const uint32_t *W, const uint16_t *S, const float *X, int ldx, float *Y, int ldy, int rows, int K, int t0, int nt, bool rnd) {
+  const int nrb = rows / 16, ngrp = K / 64, per = ngrp / KSD;
+  c->q.parallel_for(nd_range<1>((size_t)nrb * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    slm_init<KSD * 16 * R * 4>();
+    const int rb = (int)it.get_group(0), tid = (int)it.get_local_id(0);
+    const int g0 = tid * per;
+    const uint32_t *wp = W + ((size_t)rb * (K / 32) + (size_t)g0 * 2) * 64;
+    const uint16_t *sp = S + ((size_t)rb * ngrp + g0) * 16;
+    simd<float, 16 * R> acc = 0.f;
+    simd<uint32_t, 128> cur, nxt;
+    cur.template select<64, 1>(0) = block_load<uint32_t, 64>(wp);
+    cur.template select<64, 1>(64) = block_load<uint32_t, 64>(wp + 64);
+    simd<uint16_t, 16> scur = block_load<uint16_t, 16>(sp);
+    for (int g = 0; g < per; g++) {
+      simd<uint16_t, 16> snx;
+      if (g + 1 < per) {
+        nxt.template select<64, 1>(0) = block_load<uint32_t, 64>(wp + (size_t)(g + 1) * 128);
+        nxt.template select<64, 1>(64) = block_load<uint32_t, 64>(wp + (size_t)(g + 1) * 128 + 64);
+        snx = block_load<uint16_t, 16>(sp + (size_t)(g + 1) * 16);
+      }
+      simd<float, 16 * R> ag = 0.f;
+#pragma unroll
+      for (int t = 0; t < 4; t++) {
+        simd<uint32_t, 128> B;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          simd<uint32_t, 16> x = cur.template select<16, 1>(64 * (t / 2) + 16 * (2 * (t % 2) + h));
+#pragma unroll
+          for (int pp = 0; pp < 4; pp++) {
+            simd<uint32_t, 16> v = (pp == 0 ? x : (x >> (4 * pp))) & 0x000F000Fu;
+            B.template select<16, 1>(16 * (4 * h + pp)) = v | 0x64006400u;
+          }
+        }
+        simd<sycl::half, 256> bh = B.template bit_cast_view<sycl::half>();
+        bh -= (sycl::half)1032.0f;
+        simd<int32_t, 128> bi = bh.template bit_cast_view<int32_t>();
+        simd<int32_t, 8 * R> av;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+          simd<float, 16> xv; xv.copy_from(X + (size_t)(t0 + (r < nt ? r : 0)) * ldx + (size_t)(g0 + g) * 64 + t * 16);
+          simd<sycl::half, 16> xh = xv;
+          av.template select<8, 1>(8 * r) = xh.template bit_cast_view<int32_t>();
+        }
+        simd<float, 16 * R> z = 0.f;
+        ag = xmx::dpas<8, R, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(t == 0 ? z : ag, bi, av);
+      }
+      simd<sycl::half, 16> sh = scur.template bit_cast_view<sycl::half>();
+      simd<float, 16> sf = sh;
+#pragma unroll
+      for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) += ag.template select<16, 1>(16 * r) * sf;
+      if (g + 1 < per) { cur = nxt; scur = snx; }
+    }
+    slm_block_store<float, 16 * R>(tid * 16 * R * 4, acc);
+    barrier();
+    if (tid == 0) {
+      simd<float, 16 * R> sum = slm_block_load<float, 16 * R>(0);
+      for (int j = 1; j < KSD; j++) sum += slm_block_load<float, 16 * R>(j * 16 * R * 4);
+      if (rnd) {
+        simd<uint32_t, 16 * R> u = sum.template bit_cast_view<uint32_t>();
+        u += 0x7FFFu + ((u >> 16) & 1u); u &= 0xFFFF0000u;
+        sum = u.template bit_cast_view<float>();
+      }
+#pragma unroll
+      for (int r = 0; r < R; r++)
+        if (r < nt) { simd<float, 16> o = sum.template select<16, 1>(16 * r); o.copy_to(Y + (size_t)(t0 + r) * ldy + rb * 16); }
+    }
+  });
+}
+// output head GEMV: int4 when XIK_HEAD_W4 is set, otherwise the dense path
+static void head_gemv(xik_ctx *c, const float *X, int ldx, float *Y, int T, bool rnd, int ksd, int cls) {
+  if (!c->head_w4) { gemv_bf16(c, c->unembed, X, ldx, Y, VOCAB, VOCAB, D, T, rnd, ksd, cls); return; }
+  for (int t0 = 0; t0 < T; t0 += 8) {
+    const int n = std::min(8, T - t0);
+    if (n == 1) w4_gemv_r<12, 1>(c, c->head_w4, c->head_s4, X, ldx, Y, VOCAB, VOCAB, D, t0, n, rnd);
+    else if (n == 2) w4_gemv_r<12, 2>(c, c->head_w4, c->head_s4, X, ldx, Y, VOCAB, VOCAB, D, t0, n, rnd);
+    else if (n <= 4) w4_gemv_r<12, 4>(c, c->head_w4, c->head_s4, X, ldx, Y, VOCAB, VOCAB, D, t0, n, rnd);
+    else w4_gemv_r<12, 8>(c, c->head_w4, c->head_s4, X, ldx, Y, VOCAB, VOCAB, D, t0, n, rnd);
+  }
+}
+extern "C" {
 int xik_upload(xik_ctx *c, const char *name, int dtype, const void *src, size_t bytes) {
   try {
     Buf b;
@@ -2866,8 +2984,30 @@ int xik_finalize(xik_ctx *c) {
     c->am_d = dalloc<int32_t>(c, T);
     c->trace_dev = A((size_t)NSLOT * T * D);
     init_drafter(c);
-    repack("model.llm.unembed.weight", VOCAB, D);
-    c->unembed = tp16(c, "model.llm.unembed.weight");
+    // int4 head is the head format of the approximate (FP8) mode: XIK_HEAD_FP8=1 now selects it; XIK_HEAD_W4=0 keeps the FP8 head, XIK_HEAD_W4=64 forces it
+    const int head_w4 = getenv("XIK_HEAD_W4") ? atoi(getenv("XIK_HEAD_W4")) : (getenv("XIK_HEAD_FP8") ? 64 : 0);
+    if (head_w4 == 64) {  // int4 head: quantise the bf16 checkpoint weights (group 64, symmetric, squared-error scale search)
+      auto it = c->tensors.find("model.llm.unembed.weight");
+      if (it == c->tensors.end()) throw std::runtime_error("unembed missing");
+      c->head_w4 = (uint32_t *)alloc_expert(c, (size_t)VOCAB * D / 2 + 64);
+      c->head_s4 = (uint16_t *)alloc_expert(c, (size_t)VOCAB / 16 * (D / 64) * 32 + 64);
+      require_aligned(c->head_w4, 256, "int4 head weights");
+      float *dh = nullptr;
+      if (getenv("XIK_ACT_STATS_FILE") && getenv("XIK_HEAD_W4_OBJ") && atoi(getenv("XIK_HEAD_W4_OBJ")) == 2) {  // activation-weighted error: needs the statistics file written by XIK_ACT_STATS runs
+        FILE *f = fopen(getenv("XIK_ACT_STATS_FILE"), "rb"); const int Ks[4] = {D, D, D, QD}; if (!f) throw std::runtime_error("cannot open XIK_ACT_STATS_FILE");
+        size_t skip = 0; for (int l = 0; l < 24; l++) for (int k = 0; k < 4; k++) skip += 4 + (size_t)Ks[k] * 4;
+        fseek(f, (long)skip, SEEK_SET); float n = 1; std::vector<float> hv(D); if (fread(&n, 4, 1, f) != 1 || fread(hv.data(), 4, D, f) != (size_t)D) throw std::runtime_error("short stats file"); fclose(f);
+        for (auto &v : hv) v /= std::max(n, 1.f);
+        dh = sycl::malloc_device<float>(D, c->q.q); c->q.memcpy(dh, hv.data(), D * 4).wait();
+      }
+      k_w4pack(c, (const uint16_t *)it->second.p, VOCAB, D, getenv("XIK_HEAD_W4_OBJ") ? std::min(1, atoi(getenv("XIK_HEAD_W4_OBJ"))) : 1, dh, c->head_w4, c->head_s4);
+      c->q.wait(); if (dh) sycl::free(dh, c->q);
+      sycl::free(it->second.p, c->q); it->second.p = nullptr; it->second.bytes = 0;
+      c->unembed = nullptr;
+    } else {
+      repack("model.llm.unembed.weight", VOCAB, D);
+      c->unembed = tp16(c, "model.llm.unembed.weight");
+    }
     c->q.wait();
     return 0;
   } catch (std::exception &e) {
@@ -3929,7 +4069,7 @@ static void enqueue_body(xik_ctx *c, int T, int rows, bool out_argmax, int pos0)
     const float *hx = out_argmax ? c->in[0] : c->in[0] + (size_t)(T - 1) * D;
     static const int ksd_head = getenv("XIK_KSD_HEAD") ? atoi(getenv("XIK_KSD_HEAD")) : KSD_DEFAULT;
     if (as_on()) as_rec(c, 0, 4, hx, D, rows);
-    gemv_bf16(c, c->unembed, hx, D, c->logits, VOCAB, VOCAB, D, rows, false, ksd_head, 3);
+    head_gemv(c, hx, D, c->logits, rows, false, ksd_head, 3);
     k_softcap_argmax(c, rows);
     phase(c, P_HEAD);
 }
@@ -4109,7 +4249,7 @@ extern "C" int xik_draft(xik_ctx *c, int32_t anchor, int32_t *out7) {
       nf.n = 1; nf.x[0] = c->dsum; nf.w[0] = c->d_norm; nf.out[0] = c->dxf;
       k_wnorm(c, nf, R);
     }
-    gemv_bf16(c, c->unembed, c->dxf + D, D, c->dbase, VOCAB, VOCAB, D, DCNT, true);
+    head_gemv(c, c->dxf + D, D, c->dbase, DCNT, true, KSD_DEFAULT, 0);
     d_mk_in(c);
     {
       GArgs g;

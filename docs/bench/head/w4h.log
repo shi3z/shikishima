@@ -1,0 +1,19 @@
+code | FP8dense+FP8head | top1 1.000 | KL(t||d) 0.0009 nats/token
+code | FP8dense+W4head(MSE) | top1 1.000 | KL(t||d) 0.0014 nats/token
+code | FP8dense+W4head(act-weighted) | top1 1.000 | KL(t||d) 0.0015 nats/token
+history | FP8dense+FP8head | top1 0.988 | KL(t||d) 0.0012 nats/token
+history | FP8dense+W4head(MSE) | top1 0.977 | KL(t||d) 0.0057 nats/token
+history | FP8dense+W4head(act-weighted) | top1 0.980 | KL(t||d) 0.0047 nats/token
+prose | FP8dense+FP8head | top1 0.965 | KL(t||d) 0.0038 nats/token
+prose | FP8dense+W4head(MSE) | top1 0.969 | KL(t||d) 0.0093 nats/token
+prose | FP8dense+W4head(act-weighted) | top1 0.969 | KL(t||d) 0.0088 nats/token
+repeat | FP8dense+FP8head | top1 0.984 | KL(t||d) 0.0020 nats/token
+repeat | FP8dense+W4head(MSE) | top1 0.980 | KL(t||d) 0.0057 nats/token
+repeat | FP8dense+W4head(act-weighted) | top1 0.980 | KL(t||d) 0.0047 nats/token
+edit_py | FP8dense+FP8head | top1 1.000 | KL(t||d) 0.0014 nats/token
+edit_py | FP8dense+W4head(MSE) | top1 1.000 | KL(t||d) 0.0016 nats/token
+edit_py | FP8dense+W4head(act-weighted) | top1 1.000 | KL(t||d) 0.0017 nats/token
+jsonl | FP8dense+FP8head | top1 0.992 | KL(t||d) 0.0034 nats/token
+jsonl | FP8dense+W4head(MSE) | top1 0.984 | KL(t||d) 0.0052 nats/token
+jsonl | FP8dense+W4head(act-weighted) | top1 0.992 | KL(t||d) 0.0046 nats/token
+W4HDONE

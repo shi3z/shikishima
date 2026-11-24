@@ -1,0 +1,4 @@
+{"label": "smoke", "env": {"XIK_HEAD_FP8": "1", "XIK_DENSE_FP8": "1"}, "code": {"pass_rate": 1.0, "n": 16}}
+{"label": "FP8 dense + FP8 head (current default)", "env": {"XIK_ACT_STATS_FILE": "/data/inkling/act_stats.bin", "XIK_DENSE_FP8": "1", "XIK_HEAD_FP8": "1"}, "gsm8k": {"acc": 0.85, "n": 60}, "mmlu": {"acc": 0.8583333333333333, "n": 120}, "code": {"pass_rate": 1.0, "n": 16}}
+{"label": "FP8 dense + W4 head g64 (MSE)", "env": {"XIK_ACT_STATS_FILE": "/data/inkling/act_stats.bin", "XIK_DENSE_FP8": "1", "XIK_HEAD_W4": "64"}, "gsm8k": {"acc": 0.85, "n": 60}, "mmlu": {"acc": 0.8583333333333333, "n": 120}, "code": {"pass_rate": 1.0, "n": 16}}
+{"label": "FP8 dense + W4 head g64 (act-weighted)", "env": {"XIK_ACT_STATS_FILE": "/data/inkling/act_stats.bin", "XIK_DENSE_FP8": "1", "XIK_HEAD_W4": "64", "XIK_HEAD_W4_OBJ": "2"}, "gsm8k": {"acc": 0.9, "n": 60}, "mmlu": {"acc": 0.8583333333333333, "n": 120}, "code": {"pass_rate": 1.0, "n": 16}}

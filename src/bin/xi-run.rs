@@ -20,6 +20,21 @@ fn main() {
     let mut e = Engine::new(&dir, max_ctx, 64).expect("engine");
     eprintln!("load {:.1}s", t0.elapsed().as_secs_f64());
     e.reset();
+    if let Some(i) = a.iter().position(|x| x == "--batch") {
+        // greedy generation of n new tokens for every prompt of a file (one prompt per line, "\\n" = newline, "\\\\" = backslash); output blocks
+        // "=====BEGIN <i>" / text / "=====END" on stdout.  Used by the quality benchmarks (GSM8K / MMLU / code), one model load for all prompts.
+        let text = std::fs::read_to_string(&a[i + 1]).unwrap();
+        for (pi, line) in text.lines().enumerate() {
+            let prompt = line.replace("\\n", "\n").replace("\\\\", "\\");
+            let pids: Vec<i32> = tok.encode(prompt.as_str(), false).unwrap().get_ids().iter().map(|&x| x as i32).collect();
+            e.reset();
+            let mut cur = e.prefill(&pids).unwrap();
+            let mut out = vec![cur];
+            for _ in 1..n { cur = e.forward(&[cur], false, true).unwrap()[0]; out.push(cur); if e.pending() > 128 { e.discard_pending(); } }
+            println!("=====BEGIN {pi}\n{}\n=====END", tok.decode(&out.iter().map(|&x| x as u32).collect::<Vec<_>>(), false).unwrap());
+        }
+        return;
+    }
     // Teacher-forced logits study (approximate-mode research).  --tf g BASE: greedy-generate n tokens with the current engine
     // configuration, store ids + full logits.  --tf r BASE: replay the stored ids through the current configuration (e.g.
     // XIK_PASSES=2) and compare its logits with the stored ones (draft = this run, target = stored).

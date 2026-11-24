@@ -1,0 +1,85 @@
+code | FP8 | top1 1.000 | KL(t||d) 0.0006 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.97/10.33/15.10; margin>=2.0:  | free: first_divergence=256 positionwise_match=1.000
+code | FP8dense+bf16head | top1 1.000 | KL(t||d) 0.0006 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.97/10.33/15.10; margin>=2.0:  | free: first_divergence=256 positionwise_match=1.000
+code | W4g128 attn+wo+head | top1 0.996 | KL(t||d) 0.0044 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.97/10.33/15.10; margin>=2.0:  | free: first_divergence=58 positionwise_match=0.238
+code | W4g64 attn+wo+head | top1 0.992 | KL(t||d) 0.0032 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.97/10.33/15.10; margin>=2.0:  | free: first_divergence=58 positionwise_match=0.242
+code | W4g32 attn+wo+head | top1 0.996 | KL(t||d) 0.0029 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.97/10.33/15.10; margin>=2.0:  | free: first_divergence=58 positionwise_match=0.234
+code | W4g64 attn+wo | top1 0.992 | KL(t||d) 0.0027 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.97/10.33/15.10; margin>=2.0:  | free: first_divergence=58 positionwise_match=0.242
+code | W4g64 head only | top1 1.000 | KL(t||d) 0.0004 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.97/10.33/15.10; margin>=2.0:  | free: first_divergence=256 positionwise_match=1.000
+history | FP8 | top1 0.996 | KL(t||d) 0.0013 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.31/2.61/9.86; margin>=2.0: 14 | free: first_divergence=29 positionwise_match=0.113
+history | FP8dense+bf16head | top1 0.996 | KL(t||d) 0.0011 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.31/2.61/9.86; margin>=2.0: 14 | free: first_divergence=29 positionwise_match=0.141
+history | W4g128 attn+wo+head | top1 0.941 | KL(t||d) 0.0208 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.31/2.61/9.86; margin>=2.0: 14 | free: first_divergence=1 positionwise_match=0.020
+history | W4g64 attn+wo+head | top1 0.953 | KL(t||d) 0.0120 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.31/2.61/9.86; margin>=2.0: 14 | free: first_divergence=18 positionwise_match=0.117
+history | W4g32 attn+wo+head | top1 0.961 | KL(t||d) 0.0124 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.31/2.61/9.86; margin>=2.0: 14 | free: first_divergence=24 positionwise_match=0.125
+history | W4g64 attn+wo | top1 0.961 | KL(t||d) 0.0093 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.31/2.61/9.86; margin>=2.0: 14 | free: first_divergence=1 positionwise_match=0.016
+history | W4g64 head only | top1 0.984 | KL(t||d) 0.0036 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.31/2.61/9.86; margin>=2.0: 14 | free: first_divergence=25 positionwise_match=0.121
+prose | FP8 | top1 0.984 | KL(t||d) 0.0030 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.39/2.72/10.65; margin>=2.0: 1 | free: first_divergence=77 positionwise_match=0.320
+prose | FP8dense+bf16head | top1 0.984 | KL(t||d) 0.0028 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.39/2.72/10.65; margin>=2.0: 1 | free: first_divergence=77 positionwise_match=0.320
+prose | W4g128 attn+wo+head | top1 0.938 | KL(t||d) 0.0284 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.39/2.72/10.65; margin>=2.0: 1 | free: first_divergence=11 positionwise_match=0.062
+prose | W4g64 attn+wo+head | top1 0.945 | KL(t||d) 0.0291 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.39/2.72/10.65; margin>=2.0: 1 | free: first_divergence=2 positionwise_match=0.035
+prose | W4g32 attn+wo+head | top1 0.941 | KL(t||d) 0.0164 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.39/2.72/10.65; margin>=2.0: 1 | free: first_divergence=1 positionwise_match=0.016
+prose | W4g64 attn+wo | top1 0.961 | KL(t||d) 0.0232 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.39/2.72/10.65; margin>=2.0: 1 | free: first_divergence=2 positionwise_match=0.012
+prose | W4g64 head only | top1 0.969 | KL(t||d) 0.0056 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.39/2.72/10.65; margin>=2.0: 1 | free: first_divergence=15 positionwise_match=0.215
+repeat | FP8 | top1 0.980 | KL(t||d) 0.0020 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.32/4.52/9.02; margin>=2.0: 17 | free: first_divergence=108 positionwise_match=0.430
+repeat | FP8dense+bf16head | top1 0.988 | KL(t||d) 0.0018 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.32/4.52/9.02; margin>=2.0: 17 | free: first_divergence=108 positionwise_match=0.430
+repeat | W4g128 attn+wo+head | top1 0.965 | KL(t||d) 0.0137 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.32/4.52/9.02; margin>=2.0: 17 | free: first_divergence=9 positionwise_match=0.059
+repeat | W4g64 attn+wo+head | top1 0.957 | KL(t||d) 0.0130 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.32/4.52/9.02; margin>=2.0: 17 | free: first_divergence=9 positionwise_match=0.047
+repeat | W4g32 attn+wo+head | top1 0.961 | KL(t||d) 0.0085 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.32/4.52/9.02; margin>=2.0: 17 | free: first_divergence=9 positionwise_match=0.047
+repeat | W4g64 attn+wo | top1 0.965 | KL(t||d) 0.0088 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.32/4.52/9.02; margin>=2.0: 17 | free: first_divergence=9 positionwise_match=0.059
+repeat | W4g64 head only | top1 0.988 | KL(t||d) 0.0033 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 0.32/4.52/9.02; margin>=2.0: 17 | free: first_divergence=102 positionwise_match=0.398
+edit_py | FP8 | top1 1.000 | KL(t||d) 0.0014 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 4.11/7.91/9.51; margin>=2.0: 25 | free: first_divergence=256 positionwise_match=1.000
+edit_py | FP8dense+bf16head | top1 1.000 | KL(t||d) 0.0014 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 4.11/7.91/9.51; margin>=2.0: 25 | free: first_divergence=256 positionwise_match=1.000
+edit_py | W4g128 attn+wo+head | top1 1.000 | KL(t||d) 0.0035 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 4.11/7.91/9.51; margin>=2.0: 25 | free: first_divergence=256 positionwise_match=1.000
+edit_py | W4g64 attn+wo+head | top1 1.000 | KL(t||d) 0.0029 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 4.11/7.91/9.51; margin>=2.0: 25 | free: first_divergence=256 positionwise_match=1.000
+edit_py | W4g32 attn+wo+head | top1 1.000 | KL(t||d) 0.0029 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 4.11/7.91/9.51; margin>=2.0: 25 | free: first_divergence=256 positionwise_match=1.000
+edit_py | W4g64 attn+wo | top1 1.000 | KL(t||d) 0.0026 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 4.11/7.91/9.51; margin>=2.0: 25 | free: first_divergence=256 positionwise_match=1.000
+edit_py | W4g64 head only | top1 1.000 | KL(t||d) 0.0004 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 4.11/7.91/9.51; margin>=2.0: 25 | free: first_divergence=256 positionwise_match=1.000
+jsonl | FP8 | top1 0.992 | KL(t||d) 0.0032 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.93/6.86/8.87; margin>=2.0: 22 | free: first_divergence=1 positionwise_match=0.070
+jsonl | FP8dense+bf16head | top1 0.996 | KL(t||d) 0.0031 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.93/6.86/8.87; margin>=2.0: 22 | free: first_divergence=30 positionwise_match=0.852
+jsonl | W4g128 attn+wo+head | top1 0.984 | KL(t||d) 0.0128 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.93/6.86/8.87; margin>=2.0: 22 | free: first_divergence=1 positionwise_match=0.016
+jsonl | W4g64 attn+wo+head | top1 0.992 | KL(t||d) 0.0104 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.93/6.86/8.87; margin>=2.0: 22 | free: first_divergence=1 positionwise_match=0.012
+jsonl | W4g32 attn+wo+head | top1 0.988 | KL(t||d) 0.0105 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.93/6.86/8.87; margin>=2.0: 22 | free: first_divergence=5 positionwise_match=0.254
+jsonl | W4g64 attn+wo | top1 0.992 | KL(t||d) 0.0088 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.93/6.86/8.87; margin>=2.0: 22 | free: first_divergence=1 positionwise_match=0.012
+jsonl | W4g64 head only | top1 0.996 | KL(t||d) 0.0017 nats/token
+TF margin(target top1-top2) quantiles 10/50/90 = 1.93/6.86/8.87; margin>=2.0: 22 | free: first_divergence=30 positionwise_match=0.352
+W4QDONE
