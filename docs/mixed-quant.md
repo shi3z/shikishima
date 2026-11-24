@@ -150,3 +150,13 @@ Single-work-group fused kernels (`XIK_CHAIN` bit mask, default 0 = off; bit 1: a
 | 2 (conv + mix + norm in one work-group) | 82.5 |
 
 Removing a launch does not shorten the dependent chain (load, reduce, barrier, store) of these latency-bound kernels, and a single work-group with serial per-thread conv/state work is slower than the 36-group conv kernel.  Fusion has to shorten the critical path (more parallelism per stage, fewer dependent stages), not only the launch count.
+
+### Parallel-structure round (router GEMV, key-split attention)
+
+Why plain decode was 11.3 ms/token while `--bench-prefill` T=1 shows 10.8 ms: the benchmark decodes 256 tokens, and the attention cost grows with the context (decode-only tok/s of the same K3 build: n=16 97.9, n=64 93.0, n=256 89.8, n=512 86.8). `k_attn_w` runs one 128-thread group per (token, head) = 24 groups at T=1 and accumulates P.V serially over the keys (17.2 us per call at length ~200 vs 7.7 us at 50).
+
+| change | effect | switch |
+|---|---|---|
+| router GEMV: one sub-group per (row, token) (was rows/4 sub-groups = 32 hardware threads), bit-identical (md5 equal) | T=8 pass 26.9 -> 24.6 ms, T=16 44.1 -> 39.9 ms, T=1 plain +1.0 tok/s | `XIK_RGV=0` restores |
+| key-split attention (`k_attn_p<4>`: 512 threads per (token, head), logits one key per thread, P.V in 4 chunks added in chunk order): approximate accumulation order, same for plain and verify passes | n=256: 89.7 -> 91.2 tok/s; KL unchanged (K3 mean 0.0281 -> 0.0286, K1 0.0129 -> 0.0124, per-task differences within +/-0.003) | `XIK_ATTNP=0` restores, 2/4/8 |
+| W3 T>1 kernel split into three launches by tokens per expert (one body per kernel) | T=8 24.5 -> 30.5 ms (worse): the spill is not what limits the T>1 W3 kernel | `XIK_W3SPLIT=1`, off |

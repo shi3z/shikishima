@@ -1465,7 +1465,7 @@ ESIMD_INLINE void moe_w3_store(es::simd<float, 16 * R> acc, int tid, const int32
     if (r < cnt) { simd<float, 16> o = acc.template select<16, 1>(16 * r); o.copy_to(Y + (size_t)ids[r] * ldy + rb * 16); }
 }
 // one work-group of KSD threads per (slot, 16-row block); each thread streams K/128/KSD tiles; K = 1 partial for the downstream kernels
-template <bool R1, int KSD, int NB = 2>
+template <bool R1, int KSD, int NB = 2, int RC = -1>
 void moe_w3g_t(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
   const int nrb = rows / 16, ntile = K / 128, per = ntile / KSD;
   const bool tm = !getenv("XIK_W3TM") || atoi(getenv("XIK_W3TM")) != 0;  // tile-major weight layout: [expert][tile][row block]
@@ -1496,10 +1496,17 @@ void moe_w3g_t(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl::h
       }
       if constexpr (R1) moe_w3_store<1, KSD>(moe_w3_body<1, 5, NB>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
       else {
-        if (n <= 1) moe_w3_store<1, KSD>(moe_w3_body<1, 5, NB>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
-        else if (n <= 2) moe_w3_store<2, KSD>(moe_w3_body<2, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
-        else if (n <= 4) moe_w3_store<4, KSD>(moe_w3_body<4, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
-        else moe_w3_store<8, KSD>(moe_w3_body<8, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
+        // RC >= 0: this launch only handles the chunks of its size class (0: n <= 2, 1: n 3-4, 2: n 5-8), so the kernel holds a single body (no spill)
+        if constexpr (RC < 0 || RC == 0) {
+          if (n <= 1) { moe_w3_store<1, KSD>(moe_w3_body<1, 5, NB>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb); continue; }
+          if (n <= 2) { moe_w3_store<2, KSD>(moe_w3_body<2, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb); continue; }
+        }
+        if constexpr (RC < 0 || RC == 1) {
+          if (n > 2 && n <= 4) { moe_w3_store<4, KSD>(moe_w3_body<4, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb); continue; }
+        }
+        if constexpr (RC < 0 || RC == 2) {
+          if (n > 4) moe_w3_store<8, KSD>(moe_w3_body<8, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
+        }
       }
     }
   });
@@ -1509,7 +1516,8 @@ void moe_w3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half 
   const uint32_t *W = (const uint32_t *)Wp, *S = (const uint32_t *)Sp;
   const int ntile = K / 128; const int ksd = (ntile % ksd_env == 0) ? ksd_env : 1;
   static const int nb_env = getenv("XIK_W3NB") ? atoi(getenv("XIK_W3NB")) : 2;
-#define W3G(KS) if (ksd == KS) { if (maxper <= 1) { if (nb_env == 3) return moe_w3g_t<true, KS, 3>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 6) return moe_w3g_t<true, KS, 6>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 8) return moe_w3g_t<true, KS, 8>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 4) return moe_w3g_t<true, KS, 4>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); return moe_w3g_t<true, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); } return moe_w3g_t<false, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); }
+  static const bool w3split = getenv("XIK_W3SPLIT") && atoi(getenv("XIK_W3SPLIT"));
+#define W3G(KS) if (ksd == KS) { if (maxper <= 1) { if (nb_env == 3) return moe_w3g_t<true, KS, 3>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 6) return moe_w3g_t<true, KS, 6>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 8) return moe_w3g_t<true, KS, 8>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 4) return moe_w3g_t<true, KS, 4>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); return moe_w3g_t<true, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); } if (w3split) { moe_w3g_t<false, KS, 2, 0>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (maxper > 2) moe_w3g_t<false, KS, 2, 1>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (maxper > 4) moe_w3g_t<false, KS, 2, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); return; } return moe_w3g_t<false, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); }
   W3G(3) W3G(9) W3G(1)
 #undef W3G
 }
@@ -2592,10 +2600,109 @@ void k_attn_w(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos
   });
 }
 
+// Key-split attention (APPROXIMATE accumulation order, XIK_ATTNP = NSPL, 0 = off): a work-group of NSPL x 128 threads per (token, head); the logits use all threads
+// (one key per thread), the P.V sum of each of the 128 dims is accumulated over NSPL contiguous key chunks in parallel (each chunk in ascending key order, as before)
+// and the NSPL partial sums are added in chunk order.  The split depends only on the number of keys of the token, so plain decode and verify passes agree.
+template <int NSPL>
+void k_attn_p(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
+  const float *q = c->qb, *r = c->rb, *sink = c->sinkb, *gate = c->gateb;
+  const float *kc = c->kcache[slot], *vc = c->vcache[slot];
+  const bool kbf = c->kbf16;
+  const uint16_t *rp = lw.rel_proj;
+  float *out = c->attn_o;
+  const int32_t *dpp = c->dparams;
+  int maxkeys = local ? WIN : c->max_ctx;
+  const float scale = 1.0f / sycl::sqrt((float)HD);
+  constexpr int WGS = NSPL * HD;
+  c->q.submit([&](handler &h) {
+    local_accessor<float, 1> lg(range<1>(maxkeys), h);
+    local_accessor<float, 1> qs(range<1>(HD), h);
+    local_accessor<float, 1> red(range<1>(WGS), h);
+    h.parallel_for(nd_range<1>((size_t)T * NH * WGS, WGS), [=](nd_item<1> it) {
+      int idx = it.get_group(0), tid = it.get_local_id(0);
+      int t = idx / NH, hh = idx % NH, kvh = hh / (NH / NKV);
+      auto g = it.get_group();
+      int pos = dpp[0] + t;
+      int lo = local ? sycl::max(0, pos - WIN + 1) : 0;
+      int nk = pos - lo + 1;
+      if (tid < HD) qs[tid] = q[(size_t)t * QD + hh * HD + tid];
+      float rv[DREL];
+      for (int e = 0; e < DREL; e++) rv[e] = r[(size_t)t * RD + hh * DREL + e];
+      float sk = sink[(size_t)t * NH + hh];
+      group_barrier(g);
+      float mx = 0.f;
+      for (int j = tid; j < nk; j += WGS) {
+        int kp = lo + j, dist = pos - kp;
+        size_t slotpos = local ? (kp % RING) : kp;
+        float s = 0.f;
+        if (kbf) {
+          const uint16_t *kb = reinterpret_cast<const uint16_t *>(kc) + slotpos * KVD + kvh * HD;
+          for (int d = 0; d < HD; d += 8) {
+            vec<uint16_t, 8> u = *reinterpret_cast<const vec<uint16_t, 8> *>(kb + d);
+            float k0 = sycl::bit_cast<float>((uint32_t)u[0] << 16), k1 = sycl::bit_cast<float>((uint32_t)u[1] << 16),
+                  k2 = sycl::bit_cast<float>((uint32_t)u[2] << 16), k3 = sycl::bit_cast<float>((uint32_t)u[3] << 16);
+            s += qs[d] * k0 + qs[d + 1] * k1 + qs[d + 2] * k2 + qs[d + 3] * k3;
+            float k4 = sycl::bit_cast<float>((uint32_t)u[4] << 16), k5 = sycl::bit_cast<float>((uint32_t)u[5] << 16),
+                  k6 = sycl::bit_cast<float>((uint32_t)u[6] << 16), k7 = sycl::bit_cast<float>((uint32_t)u[7] << 16);
+            s += qs[d + 4] * k4 + qs[d + 5] * k5 + qs[d + 6] * k6 + qs[d + 7] * k7;
+          }
+        } else {
+          const float *kr = kc + slotpos * KVD + kvh * HD;
+          for (int d = 0; d < HD; d += 4) {
+            vec<float, 4> kk = *reinterpret_cast<const vec<float, 4> *>(kr + d);
+            s += qs[d] * kk[0] + qs[d + 1] * kk[1] + qs[d + 2] * kk[2] + qs[d + 3] * kk[3];
+          }
+        }
+        float bias = 0.f;
+        if (dist < EXT)
+          for (int e = 0; e < DREL; e++) bias += rv[e] * bf2f(rp[(size_t)e * EXT + dist]);
+        float l = s * scale + bias - sk;
+        lg[j] = l;
+        mx = sycl::fmax(mx, l);
+      }
+      mx = reduce_over_group(g, mx, maximum<float>());
+      float den = 0.f;
+      for (int j = tid; j < nk; j += WGS) {
+        float e = sycl::exp(lg[j] - mx);
+        lg[j] = e;
+        den += e;
+      }
+      den = reduce_over_group(g, den, plus<float>()) + sycl::exp(-mx);
+      group_barrier(g);
+      const int cs = tid / HD, d = tid % HD;
+      const int j0 = (int)((long)nk * cs / NSPL), j1 = (int)((long)nk * (cs + 1) / NSPL);
+      float o = 0.f;
+      int j = j0;
+      for (; j + 8 <= j1; j += 8) {
+        float vv[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) { int kp = lo + j + u; vv[u] = vc[(local ? (kp % RING) : kp) * KVD + kvh * HD + d]; }
+#pragma unroll
+        for (int u = 0; u < 8; u++) o += lg[j + u] * vv[u];
+      }
+      for (; j < j1; j++) { int kp = lo + j; o += lg[j] * vc[(local ? (kp % RING) : kp) * KVD + kvh * HD + d]; }
+      red[tid] = o;
+      group_barrier(g);
+      if (tid < HD) {
+        float tot = red[tid];
+#pragma unroll
+        for (int k = 1; k < NSPL; k++) tot += red[k * HD + tid];
+        tot /= den;
+        float gt = sigmoidf(gate[(size_t)t * QD + hh * HD + tid]);
+        out[(size_t)t * QD + hh * HD + tid] = rbf(tot * gt);
+      }
+    });
+  });
+}
+
 void k_attn(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
   // XIK_ATTN = V prefetch width VW (0 = original loop, default 8); XIK_ATTN_UNR = outer-loop unroll (-1 compiler default, 0 none, 4 forced x4);
   // XIK_ATTN_ABL = timing-only ablation bits (1 no SLM read, 2 no V load) -- wrong numbers, benchmark only.
   // Default (measured fastest at every context, output bit-identical): VW=8 loads issued ahead, outer loop unrolled x4.  XIK_ATTN=0 = original loop.
+  static const int atp = getenv("XIK_ATTNP") ? atoi(getenv("XIK_ATTNP")) : 4;
+  if (atp == 2) return k_attn_p<2>(c, lw, slot, local, T, pos0);
+  if (atp == 4) return k_attn_p<4>(c, lw, slot, local, T, pos0);
+  if (atp == 8) return k_attn_p<8>(c, lw, slot, local, T, pos0);
   static const int vw = getenv("XIK_ATTN") ? atoi(getenv("XIK_ATTN")) : 8;
   static const int unr = getenv("XIK_ATTN_UNR") ? atoi(getenv("XIK_ATTN_UNR")) : (getenv("XIK_ATTN") ? -1 : 4);
   static const int abl = getenv("XIK_ATTN_ABL") ? atoi(getenv("XIK_ATTN_ABL")) : 0;
