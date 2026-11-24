@@ -2774,6 +2774,38 @@ void k_router(xik_ctx *c, const LayerW &lw, int T) {
   const float *bias = lw.router_bias;
   int32_t *ridx = c->ridx;
   float *rwt = c->rwt;
+  static const bool sg1 = !getenv("XIK_ROUTER1") || atoi(getenv("XIK_ROUTER1")) != 0;
+  if (sg1) {
+    // one sub-group (16 lanes x 8 experts) per token: the 8 arg-max rounds use register shuffles instead of work-group reductions; same result (ties -> lower index)
+    c->q.parallel_for(nd_range<1>((size_t)T * 16, 16), [=](nd_item<1> it) SUBGROUP16 {
+      auto sg = it.get_sub_group();
+      const int t = it.get_group(0), lane = sg.get_local_linear_id();
+      float s[8], cur[8];
+#pragma unroll
+      for (int j = 0; j < 8; j++) { s[j] = sigmoidf(logit[(size_t)t * NE + lane + 16 * j]); cur[j] = s[j] + bias[lane + 16 * j]; }
+      float chosen_w[TOPK]; int chosen_i[TOPK];
+      for (int k = 0; k < TOPK; k++) {
+        float lb = cur[0]; int le = lane;
+#pragma unroll
+        for (int j = 1; j < 8; j++) if (cur[j] > lb) { lb = cur[j]; le = lane + 16 * j; }
+        float m = reduce_over_group(sg, lb, maximum<float>());
+        int cand = (lb == m) ? le : NE;
+        int idx = reduce_over_group(sg, cand, minimum<int>());
+        float sv = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; j++) if (lane + 16 * j == idx) sv = s[j];
+        float sw = reduce_over_group(sg, sv, plus<float>());  // exactly one lane holds a non-zero contribution (others add 0.0f)
+        chosen_i[k] = idx; chosen_w[k] = sw;
+#pragma unroll
+        for (int j = 0; j < 8; j++) if (lane + 16 * j == idx) cur[j] = -3.0e38f;
+      }
+      if (lane == 0) {
+        float sum = 0.f;
+        for (int k = 0; k < TOPK; k++) sum += chosen_w[k];
+        for (int k = 0; k < TOPK; k++) { ridx[t * TOPK + k] = chosen_i[k]; rwt[t * TOPK + k] = chosen_w[k] / (sum + 1e-20f) * ROUTE_SCALE; }
+      }
+    });
+  } else
   c->q.parallel_for(nd_range<1>((size_t)T * NE, NE), [=](nd_item<1> it) {
     int t = it.get_group(0), e = it.get_local_id(0);
     auto g = it.get_group();
