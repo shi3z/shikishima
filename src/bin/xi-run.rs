@@ -242,19 +242,21 @@ fn main() {
     }
     if a.iter().any(|x| x == "--bench-prefill") {
         // time per forward pass of T new tokens (plain forward, state reset between sizes)
-        for t in [1usize, 2, 4, 8, 16, 32, 64] {
+        let tl: Vec<usize> = std::env::var("XIK_BENCH_TS").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or(vec![1usize, 2, 4, 8, 16, 32, 64]);
+        let nrep: usize = std::env::var("XIK_BENCH_REPS").ok().map(|v| v.parse().unwrap()).unwrap_or(5);
+        for t in tl {
             let toks: Vec<i32> = (0..t as i32).map(|i| 1000 + i * 37).collect();
             e.reset();
             e.forward(&toks, false, true).unwrap(); // warm-up
             let mut v = vec![];
-            for _ in 0..5 {
+            for _ in 0..nrep {
                 e.reset();
                 let t0 = Instant::now();
                 e.forward(&toks, false, true).unwrap();
                 v.push(t0.elapsed().as_secs_f64() * 1e3);
             }
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            eprintln!("T={t:3}: {:7.1} ms per pass = {:6.2} ms/token = {:7.0} tok/s", v[2], v[2] / t as f64, t as f64 / v[2] * 1e3);
+            eprintln!("T={t:3}: {:7.1} ms per pass = {:6.2} ms/token = {:7.0} tok/s", v[v.len() / 2], v[v.len() / 2] / t as f64, t as f64 / v[v.len() / 2] * 1e3);
         }
         return;
     }
