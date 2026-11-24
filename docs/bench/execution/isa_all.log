@@ -1,0 +1,163 @@
+dgemm_t<4, 8, 5, 0> | lines 834 | calls 0 | send 71 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<4, 8, 4, 0> | lines 828 | calls 0 | send 69 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<4, 8, 3, 0> | lines 770 | calls 0 | send 67 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<4, 8, 2, 0> | lines 822 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 8, 1, 0> | lines 836 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 8, 0, 6> | lines 836 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 8, 0, 5> | lines 836 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 8, 0, 3> | lines 836 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 8, 0, 2> | lines 836 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 8, 0, 1> | lines 836 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 8, 0, 0> | lines 836 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 32, 6, 0> | lines 1128 | calls 0 | send 119 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<4, 32, 5, 0> | lines 930 | calls 0 | send 95 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<4, 32, 4, 0> | lines 924 | calls 0 | send 93 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<4, 32, 3, 0> | lines 866 | calls 0 | send 91 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<4, 32, 2, 0> | lines 918 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 32, 1, 0> | lines 932 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 32, 0, 6> | lines 932 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 32, 0, 5> | lines 932 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 32, 0, 3> | lines 932 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 32, 0, 2> | lines 932 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 32, 0, 1> | lines 932 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 32, 0, 0> | lines 930 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 16, 6, 0> | lines 1064 | calls 0 | send 103 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<4, 16, 5, 0> | lines 866 | calls 0 | send 79 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<4, 16, 4, 0> | lines 860 | calls 0 | send 77 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<4, 16, 3, 0> | lines 802 | calls 0 | send 75 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<4, 16, 2, 0> | lines 854 | calls 0 | send 80 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 16, 1, 0> | lines 867 | calls 0 | send 80 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 16, 0, 6> | lines 868 | calls 0 | send 80 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 16, 0, 5> | lines 868 | calls 0 | send 80 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 16, 0, 3> | lines 868 | calls 0 | send 80 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 16, 0, 2> | lines 868 | calls 0 | send 80 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 16, 0, 1> | lines 868 | calls 0 | send 80 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 16, 0, 0> | lines 865 | calls 0 | send 80 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 8, 6, 0> | lines 863 | calls 0 | send 79 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<2, 8, 5, 0> | lines 685 | calls 0 | send 65 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<2, 8, 4, 0> | lines 679 | calls 0 | send 63 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<2, 8, 3, 0> | lines 619 | calls 0 | send 61 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<2, 8, 2, 0> | lines 669 | calls 0 | send 64 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 8, 1, 0> | lines 683 | calls 0 | send 64 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 8, 0, 6> | lines 682 | calls 0 | send 64 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 8, 0, 5> | lines 682 | calls 0 | send 64 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 8, 0, 3> | lines 682 | calls 0 | send 64 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 8, 0, 2> | lines 682 | calls 0 | send 64 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 8, 0, 1> | lines 682 | calls 0 | send 64 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 8, 0, 0> | lines 682 | calls 0 | send 64 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 32, 6, 0> | lines 932 | calls 0 | send 103 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<2, 32, 5, 0> | lines 760 | calls 0 | send 89 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<2, 32, 4, 0> | lines 754 | calls 0 | send 87 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<2, 32, 3, 0> | lines 692 | calls 0 | send 85 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<2, 32, 2, 0> | lines 741 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 32, 1, 0> | lines 755 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 32, 0, 6> | lines 751 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 32, 0, 5> | lines 751 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 32, 0, 3> | lines 751 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 32, 0, 2> | lines 751 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 32, 0, 1> | lines 751 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 32, 0, 0> | lines 751 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 16, 6, 0> | lines 887 | calls 0 | send 87 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<2, 16, 5, 0> | lines 709 | calls 0 | send 73 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<2, 16, 4, 0> | lines 703 | calls 0 | send 71 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<2, 16, 3, 0> | lines 643 | calls 0 | send 69 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<2, 16, 2, 0> | lines 693 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 16, 1, 0> | lines 707 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 16, 0, 6> | lines 706 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 16, 0, 5> | lines 706 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 16, 0, 3> | lines 706 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 16, 0, 2> | lines 706 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 16, 0, 1> | lines 706 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<2, 16, 0, 0> | lines 706 | calls 0 | send 72 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 8, 6, 0> | lines 778 | calls 0 | send 71 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<1, 8, 5, 0> | lines 614 | calls 0 | send 62 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<1, 8, 4, 0> | lines 607 | calls 0 | send 60 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<1, 8, 3, 0> | lines 550 | calls 0 | send 58 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<1, 8, 2, 0> | lines 590 | calls 0 | send 60 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 8, 1, 0> | lines 597 | calls 0 | send 60 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 8, 0, 6> | lines 605 | calls 0 | send 60 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 8, 0, 5> | lines 605 | calls 0 | send 60 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 8, 0, 3> | lines 605 | calls 0 | send 60 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 8, 0, 2> | lines 605 | calls 0 | send 60 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 8, 0, 1> | lines 605 | calls 0 | send 60 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 8, 0, 0> | lines 602 | calls 0 | send 60 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 32, 6, 0> | lines 850 | calls 0 | send 95 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<1, 32, 5, 0> | lines 686 | calls 0 | send 86 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<1, 32, 4, 0> | lines 679 | calls 0 | send 84 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<1, 32, 3, 0> | lines 622 | calls 0 | send 82 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<1, 32, 2, 0> | lines 662 | calls 0 | send 84 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 32, 1, 0> | lines 669 | calls 0 | send 84 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 32, 0, 6> | lines 677 | calls 0 | send 84 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 32, 0, 5> | lines 677 | calls 0 | send 84 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 32, 0, 3> | lines 677 | calls 0 | send 84 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 32, 0, 2> | lines 677 | calls 0 | send 84 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 32, 0, 1> | lines 677 | calls 0 | send 84 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 32, 0, 0> | lines 674 | calls 0 | send 84 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 16, 6, 0> | lines 802 | calls 0 | send 79 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<1, 16, 5, 0> | lines 638 | calls 0 | send 70 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<1, 16, 4, 0> | lines 631 | calls 0 | send 68 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<1, 16, 3, 0> | lines 574 | calls 0 | send 66 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<1, 16, 2, 0> | lines 614 | calls 0 | send 68 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 16, 1, 0> | lines 621 | calls 0 | send 68 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 16, 0, 6> | lines 629 | calls 0 | send 68 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 16, 0, 5> | lines 629 | calls 0 | send 68 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 16, 0, 3> | lines 629 | calls 0 | send 68 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 16, 0, 2> | lines 629 | calls 0 | send 68 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 16, 0, 1> | lines 629 | calls 0 | send 68 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<1, 16, 0, 0> | lines 626 | calls 0 | send 68 | spill.ss 0 | dpas 2 | grf 128
+moe_fp8g_t<2, true, 0, 0, 0> | lines 3508 | calls 2 | send 695 | spill.ss 531 | dpas 32 | grf 128
+moe_fp8g_t<2, false, 0, 0, 0> | lines 3508 | calls 2 | send 695 | spill.ss 531 | dpas 32 | grf 128
+moe_fp8g_t<1, true, 0, 0, 0> | lines 1470 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 2, 0, 0> | lines 1636 | calls 2 | send 142 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 1, 0, 0> | lines 1592 | calls 2 | send 126 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 6, 0> | lines 1494 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 5, 1> | lines 1494 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 5, 0> | lines 1494 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 3, 0> | lines 1494 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 2, 2> | lines 1494 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 2, 0> | lines 1494 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 1, 1> | lines 1494 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 1, 0> | lines 1494 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 0, 2> | lines 1470 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 0, 1> | lines 1470 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<1, false, 0, 0, 0> | lines 1470 | calls 2 | send 94 | spill.ss 0 | dpas 16 | grf 128
+moe_fp8g_t<0, false, 0, 0, 0> | lines 1349 | calls 2 | send 59 | spill.ss 0 | dpas 16 | grf 128
+moe_fp4g_t<1, 2, 5, 0, true, true> | lines 639 | calls 1 | send 24 | spill.ss 0 | dpas 8 | grf 128
+dgemm_t<8, 8, 6, 0> | lines 1373 | calls 0 | send 127 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<8, 8, 5, 0> | lines 1131 | calls 0 | send 83 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<8, 8, 4, 0> | lines 1123 | calls 0 | send 81 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<8, 8, 3, 0> | lines 1065 | calls 0 | send 79 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<8, 8, 2, 0> | lines 1128 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 8, 1, 0> | lines 1137 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 8, 0, 6> | lines 1135 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 8, 0, 5> | lines 1135 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 8, 0, 3> | lines 1135 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 8, 0, 2> | lines 1135 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 8, 0, 1> | lines 1135 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 8, 0, 0> | lines 1135 | calls 0 | send 88 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 32, 6, 0> | lines 1517 | calls 0 | send 151 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<8, 32, 5, 0> | lines 1275 | calls 0 | send 107 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<8, 32, 4, 0> | lines 1267 | calls 0 | send 105 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<8, 32, 3, 0> | lines 1209 | calls 0 | send 103 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<8, 32, 2, 0> | lines 1272 | calls 0 | send 112 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 32, 1, 0> | lines 1281 | calls 0 | send 112 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 32, 0, 6> | lines 1279 | calls 0 | send 112 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 32, 0, 5> | lines 1279 | calls 0 | send 112 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 32, 0, 3> | lines 1279 | calls 0 | send 112 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 32, 0, 2> | lines 1279 | calls 0 | send 112 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 32, 0, 1> | lines 1279 | calls 0 | send 112 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 32, 0, 0> | lines 1279 | calls 0 | send 112 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 16, 6, 0> | lines 1421 | calls 0 | send 135 | spill.ss 0 | dpas 6 | grf 128
+dgemm_t<8, 16, 5, 0> | lines 1179 | calls 0 | send 91 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<8, 16, 4, 0> | lines 1171 | calls 0 | send 89 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<8, 16, 3, 0> | lines 1113 | calls 0 | send 87 | spill.ss 0 | dpas 1 | grf 128
+dgemm_t<8, 16, 2, 0> | lines 1176 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 16, 1, 0> | lines 1185 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 16, 0, 6> | lines 1183 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 16, 0, 5> | lines 1183 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 16, 0, 3> | lines 1183 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 16, 0, 2> | lines 1183 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 16, 0, 1> | lines 1183 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<8, 16, 0, 0> | lines 1183 | calls 0 | send 96 | spill.ss 0 | dpas 2 | grf 128
+dgemm_t<4, 8, 6, 0> | lines 1032 | calls 0 | send 95 | spill.ss 0 | dpas 6 | grf 128
+ISAALLDONE

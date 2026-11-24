@@ -1,0 +1,28 @@
+parity K-bf16 vs fp32: logits+ids BITWISE-IDENTICAL (64 steps, ctx 512..576)
+kbf ctx=256 rep=1 KBF16=0 wall 15.55 ms
+kbf ctx=256 rep=1 KBF16=1 wall 15.53 ms
+kbf ctx=256 rep=2 KBF16=0 wall 15.55 ms
+kbf ctx=256 rep=2 KBF16=1 wall 15.51 ms
+kbf ctx=256 rep=3 KBF16=0 wall 15.58 ms
+kbf ctx=256 rep=3 KBF16=1 wall 15.49 ms
+kbf ctx=256 rep=4 KBF16=0 wall 15.55 ms
+kbf ctx=256 rep=4 KBF16=1 wall 15.53 ms
+kbf ctx=256 rep=5 KBF16=0 wall 15.54 ms
+kbf ctx=256 rep=5 KBF16=1 wall 15.52 ms
+kbf ctx=1024 rep=1 KBF16=0 wall 17.81 ms
+kbf ctx=1024 rep=1 KBF16=1 wall 17.62 ms
+kbf ctx=1024 rep=2 KBF16=0 wall 17.82 ms
+kbf ctx=1024 rep=2 KBF16=1 wall 17.64 ms
+kbf ctx=1024 rep=3 KBF16=0 wall 17.82 ms
+kbf ctx=1024 rep=3 KBF16=1 wall 17.61 ms
+kbf ctx=1024 rep=4 KBF16=0 wall 18.24 ms
+kbf ctx=1024 rep=4 KBF16=1 wall 17.68 ms
+kbf ctx=1024 rep=5 KBF16=0 wall 17.83 ms
+kbf ctx=1024 rep=5 KBF16=1 wall 17.65 ms
+kbf ctx=4000 rep=1 KBF16=0 wall 19.24 ms
+kbf ctx=4000 rep=1 KBF16=1 wall 18.90 ms
+kbf ctx=4000 rep=2 KBF16=0 wall 19.20 ms
+kbf ctx=4000 rep=2 KBF16=1 wall 18.90 ms
+kbf ctx=4000 rep=3 KBF16=0 wall 19.18 ms
+kbf ctx=4000 rep=3 KBF16=1 wall 18.90 ms
+KBFDONE

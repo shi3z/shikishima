@@ -110,6 +110,7 @@ struct xik_ctx {
   const float *attnres_q[NLAYER - 1], *attnres_mlp[NLAYER], *attnres_out = nullptr, *xpass_q = nullptr, *xpass_kvq = nullptr;
   // state
   float *kcache[NSLOT], *vcache[NSLOT];
+  bool kbf16 = false;  // K cache stored as bf16 bits (2 B) instead of fp32; lossless because every K value is already rounded to bf16 (rbf) before it is stored
   float *convst[NSLOT][2];  // ping-pong; each [3][KVD] k, [3][KVD] v, [3][D] attn, [3][D] mlp
   int cpar[NSLOT] = {0};
   bool defer = false;
@@ -255,8 +256,13 @@ void gemv_bf16_t(queue &q, const uint16_t *W, const float *X, int ldx, float *Y,
   });
 }
 
+// Timing-only ablation (WRONG NUMBERS, benchmark only): XIK_ABL bitmask removes whole kernel groups so the remaining step time bounds what any
+// fusion of that group could save.  1 loop controllers, 2 attention-residual mixes, 4 norms, 8 short convs, 16 MoE glue (cvt/act/combine; k_group stays so
+// the expert descriptors are valid), 32 router gemv, 64 q/r clip + kv store, 128 synthetic routing (use it in EVERY ablation run so the expert access pattern is identical).
+static int abl_mask() { static const int v = getenv("XIK_ABL") ? atoi(getenv("XIK_ABL")) : 0; return v; }
 void gemv_bf16_old(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, int T,
                bool round_out) {
+  if (abl_mask() & 32) return;
   for (int t0 = 0; t0 < T; t0 += 8) {
     int n = std::min(8, T - t0);
     const float *x = X + (size_t)t0 * ldx;
@@ -1718,6 +1724,7 @@ void moe_i8g(xik_ctx *c, const uint8_t *Wi, const uint8_t *Si, const int8_t *xhi
 static bool use_int8() { static const bool v = getenv("XIK_INT8") != nullptr; return v; }
 
 void k_cvt_f16(xik_ctx *c, const float *x, sycl::half *y, size_t n) {
+  if (abl_mask() & 16) return;
   c->q.parallel_for(range<1>(n), [=](id<1> i) { y[i[0]] = (sycl::half)x[i[0]]; });
 }
 
@@ -1802,6 +1809,7 @@ void k_mix_t(xik_ctx *c, const MixArgs &a, int T) {
 }
 
 void k_mix(xik_ctx *c, const MixArgs &a, int T) {
+  if (abl_mask() & 2) return;
 #define MIXCASE(S, Q) if (a.ns == S && a.nq == Q) return k_mix_t<S, Q>(c, a, T);
   MIXCASE(2, 1) MIXCASE(3, 1) MIXCASE(4, 1) MIXCASE(5, 1)
   MIXCASE(2, 3) MIXCASE(3, 3) MIXCASE(4, 3) MIXCASE(5, 3)
@@ -1829,7 +1837,7 @@ void k_wnorm_t(xik_ctx *c, const NormArgs &a, int T) {
     for (int i = 0; i < 9; i++) a.out[k][(size_t)t * D + l + i * 256] = rbf(v[i] * inv * bf2f(a.w[k][l + i * 256]));
   });
 }
-void k_wnorm(xik_ctx *c, const NormArgs &a, int T) { if (a.n == 1) k_wnorm_t<1>(c, a, T); else k_wnorm_t<3>(c, a, T); }
+void k_wnorm(xik_ctx *c, const NormArgs &a, int T) { if (abl_mask() & 4) return; if (a.n == 1) k_wnorm_t<1>(c, a, T); else k_wnorm_t<3>(c, a, T); }
 
 struct PairArgs {
   const float *dest[3];
@@ -1934,6 +1942,7 @@ inline void conv_state_write(const ConvArgs &a, int idx) {
   a.state_new[idx] = src >= 0 ? a.x[(size_t)src * a.C + ch] : a.state[(size_t)(a.T + s) * a.C + ch];
 }
 void k_conv(xik_ctx *c, const ConvArgs &a) {
+  if (abl_mask() & 8) return;
   size_t n = (size_t)a.T * a.C;
   size_t extra = a.state_new ? 3 * (size_t)a.C : 0;
   c->q.parallel_for(range<1>(n + extra), [=](id<1> i) {
@@ -1950,6 +1959,7 @@ void k_conv(xik_ctx *c, const ConvArgs &a) {
 // ------------------------------------------------------------- attention
 // per (t, head): q clip with scale; r clip with scale. One sub-group per (t,h).
 void k_qr_clip(xik_ctx *c, const LayerW &lw, int T) {
+  if (abl_mask() & 64) return;
   float *q = c->qb, *r = c->rb;
   const uint16_t *qs = lw.q_clip, *rs = lw.rel_clip;
   c->q.parallel_for(nd_range<1>((size_t)T * NH * 16, 16), [=](nd_item<1> it) SUBGROUP16 {
@@ -1981,6 +1991,7 @@ void k_kv(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
   ConvArgs av{c->vb, so + 3 * KVD, sn ? sn + 3 * KVD : nullptr, nullptr, nullptr, KVD, T, local ? lw.v_conv : nullptr, lw.v_static,
               c->dynv, NKV, local ? 2.2360679775f : 3.0f};
   float *kc = c->kcache[slot], *vc = c->vcache[slot];
+  const bool kbf = c->kbf16;
   const int32_t *dpp = c->dparams;
   int ngrp = T * NKV, nst = sn ? 3 * KVD / HD : 0;
   c->q.parallel_for(nd_range<1>((size_t)(ngrp + nst) * HD, HD), [=](nd_item<1> it) {
@@ -2001,7 +2012,8 @@ void k_kv(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
     float f = sycl::fmin(QK_CLIP / (sycl::sqrt(ks) + 1e-6f), 1.0f);
     int pos = dpp[0] + t;
     size_t slotpos = local ? (pos % RING) : pos;
-    kc[slotpos * KVD + ch] = rbf(kv * f);
+    if (kbf) reinterpret_cast<uint16_t *>(kc)[slotpos * KVD + ch] = (uint16_t)(sycl::bit_cast<uint32_t>(rbf(kv * f)) >> 16);  // exact: rbf() already cleared the low 16 bits
+    else kc[slotpos * KVD + ch] = rbf(kv * f);
     vc[slotpos * KVD + ch] = vv * sycl::rsqrt(vs / HD + EPS);
   });
 }
@@ -2010,6 +2022,7 @@ template <int VW, int UNR = -1, int ABL = 0>
 void k_attn_w(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
   const float *q = c->qb, *r = c->rb, *sink = c->sinkb, *gate = c->gateb;
   const float *kc = c->kcache[slot], *vc = c->vcache[slot];
+  const bool kbf = c->kbf16;
   const uint16_t *rp = lw.rel_proj;
   float *out = c->attn_o;
   const int32_t *dpp = c->dparams;
@@ -2035,11 +2048,24 @@ void k_attn_w(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos
       for (int j = tid; j < nk; j += HD) {
         int kp = lo + j, dist = pos - kp;
         size_t slotpos = local ? (kp % RING) : kp;
-        const float *kr = kc + slotpos * KVD + kvh * HD;
         float s = 0.f;
-        for (int d = 0; d < HD; d += 4) {
-          vec<float, 4> kk = *reinterpret_cast<const vec<float, 4> *>(kr + d);
-          s += qs[d] * kk[0] + qs[d + 1] * kk[1] + qs[d + 2] * kk[2] + qs[d + 3] * kk[3];
+        if (kbf) {  // bf16 K: 16 B (8 dims) per load; the dot product is accumulated in exactly the same order as the fp32 path (groups of 4 dims)
+          const uint16_t *kb = reinterpret_cast<const uint16_t *>(kc) + slotpos * KVD + kvh * HD;
+          for (int d = 0; d < HD; d += 8) {
+            vec<uint16_t, 8> u = *reinterpret_cast<const vec<uint16_t, 8> *>(kb + d);
+            float k0 = sycl::bit_cast<float>((uint32_t)u[0] << 16), k1 = sycl::bit_cast<float>((uint32_t)u[1] << 16),
+                  k2 = sycl::bit_cast<float>((uint32_t)u[2] << 16), k3 = sycl::bit_cast<float>((uint32_t)u[3] << 16);
+            s += qs[d] * k0 + qs[d + 1] * k1 + qs[d + 2] * k2 + qs[d + 3] * k3;
+            float k4 = sycl::bit_cast<float>((uint32_t)u[4] << 16), k5 = sycl::bit_cast<float>((uint32_t)u[5] << 16),
+                  k6 = sycl::bit_cast<float>((uint32_t)u[6] << 16), k7 = sycl::bit_cast<float>((uint32_t)u[7] << 16);
+            s += qs[d + 4] * k4 + qs[d + 5] * k5 + qs[d + 6] * k6 + qs[d + 7] * k7;
+          }
+        } else {
+          const float *kr = kc + slotpos * KVD + kvh * HD;
+          for (int d = 0; d < HD; d += 4) {
+            vec<float, 4> kk = *reinterpret_cast<const vec<float, 4> *>(kr + d);
+            s += qs[d] * kk[0] + qs[d + 1] * kk[1] + qs[d + 2] * kk[2] + qs[d + 3] * kk[3];
+          }
         }
         float bias = 0.f;
         if (dist < EXT)
@@ -2157,7 +2183,58 @@ void k_attn(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0)
 }
 
 // ------------------------------------------------------------------- MoE
+// Routing record / replay (benchmark infrastructure; T == 1 router calls only, i.e. one entry per logical visit of a decode step).
+//  XIK_ROUTE_REC=1      : record the expert ids and routing weights chosen by the real router (dump with xik_route_dump).
+//  XIK_ROUTE_REPLAY=file: replace the router by a copy of the recorded entry (call counter modulo the table size), so every configuration of an
+//                         ablation / dispatch experiment sees the identical expert sequence (same DRAM pattern, locality and cache reuse).
+struct RouteTab { int32_t *ids = nullptr; float *w = nullptr; size_t n = 0, cap = 0; };
+static RouteTab g_rec, g_rep;
+static size_t g_rr_ctr = 0;
+static void rr_load(xik_ctx *c, const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) throw std::runtime_error(std::string("XIK_ROUTE_REPLAY: cannot open ") + path);
+  uint64_t n = 0;
+  if (fread(&n, 8, 1, f) != 1 || n == 0) throw std::runtime_error("bad routing file");
+  std::vector<int32_t> ids(n * TOPK); std::vector<float> w(n * TOPK);
+  if (fread(ids.data(), 4, ids.size(), f) != ids.size() || fread(w.data(), 4, w.size(), f) != w.size()) throw std::runtime_error("short routing file");
+  fclose(f);
+  g_rep.ids = sycl::malloc_device<int32_t>(ids.size(), c->q.q); g_rep.w = sycl::malloc_device<float>(w.size(), c->q.q); g_rep.n = n;
+  c->q.memcpy(g_rep.ids, ids.data(), ids.size() * 4).wait(); c->q.memcpy(g_rep.w, w.data(), w.size() * 4).wait();
+  fprintf(stderr, "routing replay: %zu logical visits loaded from %s\n", (size_t)n, path);
+}
+extern "C" int xik_route_dump(xik_ctx *c, const char *path) {
+  try {
+    c->q.wait();
+    if (!g_rec.n) return 0;
+    std::vector<int32_t> ids(g_rec.n * TOPK); std::vector<float> w(g_rec.n * TOPK);
+    c->q.memcpy(ids.data(), g_rec.ids, ids.size() * 4).wait(); c->q.memcpy(w.data(), g_rec.w, w.size() * 4).wait();
+    FILE *f = fopen(path, "wb");
+    if (!f) throw std::runtime_error("cannot write routing file");
+    uint64_t n = g_rec.n; fwrite(&n, 8, 1, f); fwrite(ids.data(), 4, ids.size(), f); fwrite(w.data(), 4, w.size(), f); fclose(f);
+    fprintf(stderr, "routing record: %zu logical visits -> %s\n", g_rec.n, path);
+    return 0;
+  } catch (std::exception &e) { g_err = e.what(); return 1; }
+}
 void k_router(xik_ctx *c, const LayerW &lw, int T) {
+  static const char *rr_path = getenv("XIK_ROUTE_REPLAY");
+  static const bool rec = getenv("XIK_ROUTE_REC") && atoi(getenv("XIK_ROUTE_REC"));
+  if (T == 1 && rr_path) {
+    if (!g_rep.ids) rr_load(c, rr_path);
+    const size_t idx = g_rr_ctr++ % g_rep.n;
+    int32_t *ri = c->ridx; float *rw = c->rwt; const int32_t *si = g_rep.ids + idx * TOPK; const float *sw = g_rep.w + idx * TOPK;
+    c->q.single_task([=]() { for (int k = 0; k < TOPK; k++) { ri[k] = si[k]; rw[k] = sw[k]; } });
+    return;
+  }
+  if (abl_mask() & 128) {  // no replay file: synthetic, realistic-spread routing (8 distinct experts per token, varies per call)
+    static int ctr = 0;
+    const int cc = ctr++;
+    int32_t *ri = c->ridx; float *rw = c->rwt;
+    c->q.single_task([=]() {
+      for (int t = 0; t < T; t++)
+        for (int k = 0; k < TOPK; k++) { ri[t * TOPK + k] = (k * 7 + 3 + 11 * cc + 5 * t) % NE; rw[t * TOPK + k] = 0.125f; }
+    });
+    return;
+  }
   const float *logit = c->tmp1;  // [T, 128] router logits (fp32 gemv result)
   const float *bias = lw.router_bias;
   int32_t *ridx = c->ridx;
@@ -2189,6 +2266,14 @@ void k_router(xik_ctx *c, const LayerW &lw, int T) {
       }
     }
   });
+  if (rec && T == 1) {
+    if (!g_rec.ids) { g_rec.cap = 1 << 16; g_rec.ids = sycl::malloc_device<int32_t>(g_rec.cap * TOPK, c->q.q); g_rec.w = sycl::malloc_device<float>(g_rec.cap * TOPK, c->q.q); }
+    if (g_rec.n < g_rec.cap) {
+      int32_t *ri2 = g_rec.ids + g_rec.n * TOPK; float *rw2 = g_rec.w + g_rec.n * TOPK; const int32_t *src_i = c->ridx; const float *src_w = c->rwt;
+      c->q.single_task([=]() { for (int k = 0; k < TOPK; k++) { ri2[k] = src_i[k]; rw2[k] = src_w[k]; } });
+      g_rec.n++;
+    }
+  }
 }
 
 // T == 1 fusion of k_router + k_cvt_f16 + k_group (one work-group of NE items; same arithmetic, same results).
@@ -2252,6 +2337,7 @@ void k_route_fused1(xik_ctx *c, const LayerW &lw) {
 static bool fuse_route() { static const bool v = getenv("XIK_FUSE_ROUTE") && atoi(getenv("XIK_FUSE_ROUTE")); return v; }
 
 void k_act(xik_ctx *c, int npairs, int nks) {
+  if (abl_mask() & 16) return;
   const float *gu = c->gu_part;
   float *act = c->act;
   sycl::half *act16 = c->x16_act;
@@ -2271,6 +2357,7 @@ void k_act(xik_ctx *c, int npairs, int nks) {
 }
 
 void k_moe_combine(xik_ctx *c, int T, int nks) {
+  if (abl_mask() & 16) return;
   const float *y = c->yp_part, *w = c->rwt;
   float *out = c->moe_o;
   size_t stride = (size_t)T * TOPK * D;
@@ -2573,7 +2660,8 @@ int xik_finalize(xik_ctx *c) {
     for (int s = 0; s < NSLOT; s++) {
       int layer = s < NLAYER ? s : CORE0 + (s - NLAYER) % NCORE;
       size_t cap = is_local(layer) ? RING : (size_t)c->max_ctx;
-      c->kcache[s] = dalloc<float>(c, cap * KVD);
+      c->kbf16 = !(getenv("XIK_KBF16") && atoi(getenv("XIK_KBF16")) == 0);  // default on (lossless, see docs/attention-vprefetch.md); XIK_KBF16=0 = fp32 K cache
+      c->kcache[s] = c->kbf16 ? reinterpret_cast<float *>(dalloc<uint16_t>(c, cap * KVD)) : dalloc<float>(c, cap * KVD);
       c->vcache[s] = dalloc<float>(c, cap * KVD);
       for (int k = 0; k < 2; k++) c->convst[s][k] = dalloc<float>(c, 3 * (2 * KVD + 2 * D));
     }
@@ -3003,6 +3091,7 @@ struct Fwd {
 // controller blend for n parallel streams: dest[j] (+) msg[j] -> out[j]
 void run_ctl(xik_ctx *c, const LayerW &lw, const int *cid, int n, const float **dest, const float **msg,
              const uint16_t **nw, float **out, int T) {
+  if (abl_mask() & 1) return;
   PairArgs pa{};
   GArgs g1, g2;
   BlendArgs ba{};

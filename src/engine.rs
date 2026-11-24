@@ -167,6 +167,12 @@ impl Engine {
         }
         Ok((us, dur))
     }
+    /// Write the expert ids / routing weights recorded under XIK_ROUTE_REC=1 (one entry per T=1 router call) to a file.
+    pub fn route_dump(&mut self, path: &str) -> Result<(), String> {
+        let c = std::ffi::CString::new(path).unwrap();
+        if unsafe { ffi::xik_route_dump(self.ctx, c.as_ptr()) } != 0 { return Err(last_error()); }
+        Ok(())
+    }
     pub fn bench_launch(&mut self, n: i32, kind: i32) -> f64 {
         unsafe { ffi::xik_bench_launch(self.ctx, n, kind) }
     }

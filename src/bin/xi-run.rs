@@ -16,7 +16,8 @@ fn main() {
         tok.encode(a[2].as_str(), false).unwrap().get_ids().iter().map(|&x| x as i32).collect()
     };
     let t0 = Instant::now();
-    let mut e = Engine::new(&dir, 4096, 64).expect("engine");
+    let max_ctx: usize = std::env::var("XI_MAX_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(4096); // up to 8192 (log-scaling limit)
+    let mut e = Engine::new(&dir, max_ctx, 64).expect("engine");
     eprintln!("load {:.1}s", t0.elapsed().as_secs_f64());
     e.reset();
     // Teacher-forced logits study (approximate-mode research).  --tf g BASE: greedy-generate n tokens with the current engine
@@ -189,6 +190,7 @@ fn main() {
         for _ in 0..n { cur = e.forward(&[cur], false, true).unwrap()[0]; }
         let wall = t.elapsed().as_secs_f64() * 1e3 / n as f64;
         let after = e.prof_us();
+        if let Ok(p) = std::env::var("XIK_ROUTE_DUMP") { e.route_dump(&p).unwrap(); }
         eprintln!("T=1 step: wall {:.2} ms | host submit finished at {:.2} ms | complete at {:.2} ms (in-forward timers)", wall, (after[14] - before[14]) / n as f64 / 1e3, (after[15] - before[15]) / n as f64 / 1e3);
         return;
     }

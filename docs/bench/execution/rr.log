@@ -1,0 +1,53 @@
+routing record: 3264 logical visits -> /data/inkling/route512.bin
+T=1 step: wall 16.44 ms | host submit finished at 16.43 ms | complete at 16.44 ms (in-forward timers)
+rr rep=1 cfg=real wall 16.38 ms
+rr rep=1 cfg=replay mask=0 wall 16.20 ms
+rr rep=1 cfg=replay mask=1 wall 14.14 ms
+rr rep=1 cfg=replay mask=2 wall 14.74 ms
+rr rep=1 cfg=replay mask=4 wall 15.91 ms
+rr rep=1 cfg=replay mask=8 wall 15.95 ms
+rr rep=1 cfg=replay mask=16 wall 15.90 ms
+rr rep=1 cfg=replay mask=32 wall 15.67 ms
+rr rep=1 cfg=replay mask=64 wall 16.11 ms
+rr rep=1 cfg=replay mask=127 wall 11.59 ms
+rr rep=2 cfg=real wall 16.40 ms
+rr rep=2 cfg=replay mask=0 wall 16.17 ms
+rr rep=2 cfg=replay mask=1 wall 14.12 ms
+rr rep=2 cfg=replay mask=2 wall 14.72 ms
+rr rep=2 cfg=replay mask=4 wall 15.90 ms
+rr rep=2 cfg=replay mask=8 wall 15.95 ms
+rr rep=2 cfg=replay mask=16 wall 15.90 ms
+rr rep=2 cfg=replay mask=32 wall 15.65 ms
+rr rep=2 cfg=replay mask=64 wall 16.11 ms
+rr rep=2 cfg=replay mask=127 wall 11.58 ms
+rr rep=3 cfg=real wall 16.40 ms
+rr rep=3 cfg=replay mask=0 wall 16.18 ms
+rr rep=3 cfg=replay mask=1 wall 14.12 ms
+rr rep=3 cfg=replay mask=2 wall 14.72 ms
+rr rep=3 cfg=replay mask=4 wall 15.92 ms
+rr rep=3 cfg=replay mask=8 wall 15.95 ms
+rr rep=3 cfg=replay mask=16 wall 15.89 ms
+rr rep=3 cfg=replay mask=32 wall 15.65 ms
+rr rep=3 cfg=replay mask=64 wall 16.09 ms
+rr rep=3 cfg=replay mask=127 wall 11.58 ms
+rr rep=4 cfg=real wall 16.37 ms
+rr rep=4 cfg=replay mask=0 wall 16.20 ms
+rr rep=4 cfg=replay mask=1 wall 14.13 ms
+rr rep=4 cfg=replay mask=2 wall 14.72 ms
+rr rep=4 cfg=replay mask=4 wall 15.91 ms
+rr rep=4 cfg=replay mask=8 wall 15.96 ms
+rr rep=4 cfg=replay mask=16 wall 15.91 ms
+rr rep=4 cfg=replay mask=32 wall 15.66 ms
+rr rep=4 cfg=replay mask=64 wall 16.09 ms
+rr rep=4 cfg=replay mask=127 wall 11.58 ms
+rr rep=5 cfg=real wall 16.38 ms
+rr rep=5 cfg=replay mask=0 wall 16.17 ms
+rr rep=5 cfg=replay mask=1 wall 14.12 ms
+rr rep=5 cfg=replay mask=2 wall 14.74 ms
+rr rep=5 cfg=replay mask=4 wall 15.90 ms
+rr rep=5 cfg=replay mask=8 wall 15.97 ms
+rr rep=5 cfg=replay mask=16 wall 15.91 ms
+rr rep=5 cfg=replay mask=32 wall 15.67 ms
+rr rep=5 cfg=replay mask=64 wall 16.09 ms
+rr rep=5 cfg=replay mask=127 wall 11.58 ms
+RRDONE
