@@ -345,7 +345,7 @@ void k_quant_fp8(xik_ctx *c, const uint16_t *raw, uint32_t *dst, float *scale, i
 static std::map<const void *, const float *> g_fp8_scale;  // weight tile pointer -> per-row scales (FP8 mode)
 // int4 (W4A16) copies of attention matrices (XIK_AW4): FP8 weight pointer -> {packed nibble tiles, per (16 rows, 64 K) group dword per lane: fp16 scale | fp16 (1024 + zero point) << 16}.
 // Used for T <= 16 (decode, verify); prefill keeps the FP8 copy.
-struct W4Alt { const uint32_t *w; const uint32_t *sz; };
+struct W4Alt { const uint32_t *w; const uint32_t *sz; size_t wb = 0, sb = 0; };
 static std::map<const void *, W4Alt> g_w4alt;
 struct W4Seg { const uint32_t *W, *SZ; const float *X; float *Y; int rows, K, ldx, ldy, rnd, wg0; };
 struct W4Args {
@@ -3093,6 +3093,35 @@ static void w4z_run(xik_ctx *c, const W4Args &a, int T) {
   }
 }
 }  // namespace
+// L2 prefetch of the int4 attention weights of the NEXT visit, issued after the MoE of the current visit: the expert streams bypass L2 (ldp policy), the
+// small kernels in between leave DRAM idle, and the attention GEMV of the next visit then reads its weights from L2 (XIK_AWPF=1, T <= 16 only).
+struct PfArgs { const uint8_t *p[12]; uint32_t n256[12]; int n = 0; uint32_t total = 0; uint32_t start[12]; };
+static void w4_prefetch_layer(xik_ctx *c, int layer, bool side) {
+  if (layer < 0 || layer >= NLAYER || g_w4alt.empty()) return;
+  const LayerW &lw = c->L[layer];
+  const void *keys[6] = {lw.wq, lw.wk, lw.wv, lw.wo, lw.wr, lw.gate_attn};
+  PfArgs a;
+  for (int i = 0; i < 6; i++) {
+    auto it = g_w4alt.find(keys[i]);
+    if (it == g_w4alt.end()) continue;
+    for (int part = 0; part < 2; part++) {
+      const uint8_t *pp = (const uint8_t *)(part ? it->second.sz : it->second.w); size_t bytes = part ? it->second.sb : it->second.wb;
+      a.p[a.n] = pp; a.n256[a.n] = (uint32_t)((bytes + 255) / 256); a.start[a.n] = a.total; a.total += a.n256[a.n]; a.n++;
+    }
+  }
+  if (!a.total) return;
+  const uint32_t nthr = 4096;
+  static sycl::queue *q2 = nullptr;
+  if (side && !q2) q2 = new sycl::queue(c->q.q.get_context(), c->q.q.get_device(), sycl::property_list{sycl::property::queue::in_order{}});
+  auto body = [=](id<1> id) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    for (uint32_t u = id[0]; u < a.total; u += nthr) {
+      int s2 = 0; while (s2 + 1 < a.n && u >= a.start[s2 + 1]) s2++;
+      prefetch<uint32_t, 64>((const uint32_t *)(a.p[s2] + (size_t)(u - a.start[s2]) * 256), sycl::ext::oneapi::experimental::properties{es::cache_hint_L1<es::cache_hint::uncached>, es::cache_hint_L2<es::cache_hint::cached>});
+    }
+  };
+  if (side) q2->parallel_for(range<1>(nthr), body); else c->q.parallel_for(range<1>(nthr), body);
+}
 // activation statistics (XIK_ACT_STATS_FILE, written by XIK_ACT_STATS runs): mean squares per input channel, [layer][kind 0..3] and the head
 static std::vector<float> g_ast[24][4]; static bool g_ast_loaded = false;
 static void ensure_ast() {
@@ -3197,7 +3226,7 @@ int xik_finalize(xik_ctx *c) {
           require_aligned(w4, 256, "attention int4 weights");
           k_w4zpack(c, (const uint16_t *)it->second.p, rows, K, aasym, aobj, dh, w4, sz); c->q.wait();
           if (dh) sycl::free(dh, c->q);
-          g_w4alt[nw] = W4Alt{w4, sz};
+          g_w4alt[nw] = W4Alt{w4, sz, (size_t)rows * K / 2, (size_t)rows * (K / 64) * 4};
         }
       }
       if (want8) {
@@ -4477,6 +4506,10 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   if (!c->defer) c->cpar[slot] = 1 - par;
   c->kb = kb0; c->vb = vb0; c->ao2 = ao0; c->moe_o = mo0;
   phase(c, P_CONV);
+  {
+    static const int awpf = getenv("XIK_AWPF") ? atoi(getenv("XIK_AWPF")) : 0;  // 1: prefetch kernel in the main queue, 2: in a second queue
+    if (awpf && T <= 16) { const int nl = (layer == CORE1 - 1 && pass < NPASS - 1) ? CORE0 : layer + 1; w4_prefetch_layer(c, nl, awpf == 2); }
+  }
 }
 
 }  // namespace

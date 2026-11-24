@@ -125,3 +125,16 @@ MXFP8 experts (layers 20-23) in the same tile-major layout (`XIK_F8TM`, default 
 | K3 | 88.1 88.2 88.0 88.1 87.5 87.2 | **87.9** (was 85.4) | 150.0 |
 
 Layout changes do not alter arithmetic: quality of K1/K3 is unchanged (same KL / GSM8K / MMLU / code numbers as above; output identical to the previous layout). The MXFP8 tile-major build adds a further +0.3 tok/s (88.6 on the history/repeat prompts).
+
+### Further experiments of this round (K3 plain, history/repeat prompts)
+
+| experiment | tok/s | verdict |
+|---|---|---|
+| NB = 3 / 4 with the tile-major layout | 88.0 / 87.3 (NB = 2: 88.6) | NB = 2 stays |
+| `UR_L0_USE_IMMEDIATE_COMMANDLISTS` 0/1/2, `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1` | 88.5-88.8 | no effect (launches are already pipelined) |
+| L2 prefetch of the next visit's int4 attention weights in a prefetch kernel of the main queue (`XIK_AWPF=1`) | 78.5 | **-10 tok/s**: the kernel lasts as long as the memory transfer (prefetch issue blocks), the gain does not pay it back |
+| same kernel in a second in-order queue (`XIK_AWPF=2`, also `ZEX_NUMBER_OF_CCS=4`) | 80.0 | still serialised on the compute engine |
+
+Verification-width passes (`--bench-prefill`, ms per pass, K0 -> K3): T=2 18.2 -> 15.5, T=4 23.2 -> 19.5, T=8 29.9 -> 26.9, T=16 47.8 -> 44.1.
+
+State after this round: K3 plain 88.6 tok/s (11.3 ms/token), 1.3 ms above the 100 tok/s target.  Remaining: weight kernels about 1.6 ms above the 456 GB/s floor (W3 0.9, attention int4 0.5, MXFP8 0.2), about 4.4 ms in ~800 small kernels and about 1.4 ms of inter-kernel idle gaps.  The next lever is kernel fusion (router GEMV + routing, cvt/group, norm + mixer chains), not the INT3/INT4 weight loops.
