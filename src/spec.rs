@@ -312,6 +312,12 @@ pub fn generate_hybrid(e: &mut Engine, prompt: &[i32], n: usize, block: usize, m
     let mut rounds = 0usize;
     let margin = 1.03;
     let trace = std::env::var("XIK_TRACE_CTL").is_ok();
+    // XI_FORCE_REF=file (comma separated token ids of a reference output): every target prediction is replaced by the reference token at that position, so the
+    // committed text is identical in every configuration and speed differences are kernel time and drafter acceptance only (XI_DUMP_OUT=file writes `out`).
+    let force: Option<Vec<i32>> = std::env::var("XI_FORCE_REF").ok().map(|p| std::fs::read_to_string(p).unwrap().trim().split(',').map(|x| x.parse().unwrap()).collect());
+    let apply_force = |am: &mut Vec<i32>, base: usize| {
+        if let Some(r) = &force { for (j, v) in am.iter_mut().enumerate() { if let Some(&t) = r.get(base + j) { *v = t; } } }
+    };
     while out.len() < n {
         out.push(bonus);
         hist.push(bonus);
@@ -357,8 +363,9 @@ pub fn generate_hybrid(e: &mut Engine, prompt: &[i32], n: usize, block: usize, m
                 let mut ids = vec![bonus];
                 ids.extend_from_slice(&drafts);
                 let t1 = Instant::now();
-                let am = e.verify(&ids)?;
+                let mut am = e.verify(&ids)?;
                 let dv = t1.elapsed().as_secs_f64();
+                apply_force(&mut am, out.len());
                 let mut acc = 0;
                 while acc < drafts.len() && am[acc] == drafts[acc] { acc += 1; }
                 let t2 = Instant::now();
@@ -390,8 +397,9 @@ pub fn generate_hybrid(e: &mut Engine, prompt: &[i32], n: usize, block: usize, m
             let mut ids = vec![bonus];
             ids.extend_from_slice(&drafts);
             let t1 = Instant::now();
-            let am = e.verify(&ids)?;
+            let mut am = e.verify(&ids)?;
             let dv = t1.elapsed().as_secs_f64();
+            apply_force(&mut am, out.len());
             let mut acc = 0;
             while acc < drafts.len() && am[acc] == drafts[acc] { acc += 1; }
             let t2 = Instant::now();
@@ -413,8 +421,9 @@ pub fn generate_hybrid(e: &mut Engine, prompt: &[i32], n: usize, block: usize, m
             bonus = am[acc];
         } else {
             let t1 = Instant::now();
-            let am = e.forward(&[bonus], false, true)?;
+            let mut am = e.forward(&[bonus], false, true)?;
             let dt = t1.elapsed().as_secs_f64();
+            apply_force(&mut am, out.len());
             ctl.obs_plain(dt);
             hs.plain.rounds += 1; hs.plain.tokens += 1; hs.plain.secs += dt;
             st.cycles += 1; st.hist[0] += 1;
@@ -424,6 +433,7 @@ pub fn generate_hybrid(e: &mut Engine, prompt: &[i32], n: usize, block: usize, m
         rounds += 1;
     }
     out.truncate(n);
+    if let Ok(p) = std::env::var("XI_DUMP_OUT") { std::fs::write(p, out.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")).unwrap(); }
     Ok((out, st, hs))
 }
 

@@ -99,6 +99,7 @@ struct LayerW {
   const uint16_t *ctl_down[4], *ctl_gain[4], *ctl_forget[4];  // attn,k,v,mlp
   const uint8_t *w13, *w13_s, *w2, *w2_s;
   const float *w13_amax, *w2_amax, *w13_den, *w2_den;
+  bool w3_13 = false, w3_2 = false;  // experts stored as W3A16 (XIK_W3)
 };
 
 }  // namespace
@@ -342,6 +343,16 @@ void k_quant_fp8(xik_ctx *c, const uint16_t *raw, uint32_t *dst, float *scale, i
 }
 
 static std::map<const void *, const float *> g_fp8_scale;  // weight tile pointer -> per-row scales (FP8 mode)
+// int4 (W4A16) copies of attention matrices (XIK_AW4): FP8 weight pointer -> {packed nibble tiles, per (16 rows, 64 K) group dword per lane: fp16 scale | fp16 (1024 + zero point) << 16}.
+// Used for T <= 16 (decode, verify); prefill keeps the FP8 copy.
+struct W4Alt { const uint32_t *w; const uint32_t *sz; };
+static std::map<const void *, W4Alt> g_w4alt;
+struct W4Seg { const uint32_t *W, *SZ; const float *X; float *Y; int rows, K, ldx, ldy, rnd, wg0; };
+struct W4Args {
+  W4Seg s[8]; int n = 0, total_wg = 0;
+  void add(const W4Alt &w, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool rnd) { s[n] = W4Seg{w.w, w.sz, X, Y, rows, K, ldx, ldy, (int)rnd, total_wg}; total_wg += rows / 16; n++; }
+};
+static void w4z_run(xik_ctx *c, const W4Args &a, int T);
 struct DSeg {
   const uint32_t *Wt;
   const float *X;
@@ -783,11 +794,21 @@ void gemv_multi(xik_ctx *c, const GArgs &a, int T) {
   static const int ksd_proj = getenv("XIK_KSD_PROJ") ? atoi(getenv("XIK_KSD_PROJ")) : KSD_DEFAULT;
   d.ksd = ksd_proj;
   d.cls = a.cls;
-  for (int i = 0; i < a.n; i++) d.add(a.s[i].W, a.s[i].X, a.s[i].ldx, a.s[i].Y, a.s[i].ldy, a.s[i].rows, a.s[i].K, a.s[i].round);
-  dgemm(c, d, T);
+  W4Args wa;
+  for (int i = 0; i < a.n; i++) {
+    auto alt = (T <= 16 && !g_w4alt.empty()) ? g_w4alt.find(a.s[i].W) : g_w4alt.end();
+    if (alt != g_w4alt.end()) wa.add(alt->second, a.s[i].X, a.s[i].ldx, a.s[i].Y, a.s[i].ldy, a.s[i].rows, a.s[i].K, a.s[i].round);
+    else d.add(a.s[i].W, a.s[i].X, a.s[i].ldx, a.s[i].Y, a.s[i].ldy, a.s[i].rows, a.s[i].K, a.s[i].round);
+  }
+  if (d.n) dgemm(c, d, T);
+  if (wa.n) w4z_run(c, wa, T);
 }
 void gemv_bf16(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, int T,
                bool round_out, int ksd = KSD_DEFAULT, int cls = 0) {
+  if (T <= 16 && !g_w4alt.empty()) {
+    auto alt = g_w4alt.find(W);
+    if (alt != g_w4alt.end()) { W4Args wa; wa.add(alt->second, X, ldx, Y, ldy, rows, K, round_out); return w4z_run(c, wa, T); }
+  }
   DArgs d;
   d.ksd = ksd;
   d.cls = cls;
@@ -918,6 +939,50 @@ void expert_fp8(xik_ctx *c, const LayerW &lw, const float *X, int ldx, float *Y,
 //   Sp[e][rb][st][b=4][lane=16] bytes: the e4m3 block scales.
 // A fp16 DPAS then multiplies  e2m1 * 2^-14  (payload bits 11:9, sign bit 15; exact,
 // subnormal for e=0) with fp16 activations; the block scale is applied per 16 rows.
+// Expert quality simulation (XIK_E3SIM): requantise an NVFP4 expert tensor (e2m1 x e4m3 group-16 scale) to INT3 / INT2 with group G (multiple of 16), writing the result back
+// in NVFP4 form so the production kernels run it unchanged.  Integer levels -qmax-1..qmax (qmax = 3 for 3 bit, 1 for 2 bit) are all exact e2m1 values (0,1,2,3,4 -> codes 0,2,4,5,6), the
+// group scale is rounded to e4m3 and replicated over the G/16 sub-groups.  Scale candidates: amax/qmax * (1 - 0.05 c), c = 0..NC-1 (squared-error search).  err[2*(e*rows+row)] = sum (w-q)^2, [+1] = sum w^2.
+inline float e4m3_dec(uint32_t b) { uint32_t e = (b >> 3) & 15, m = b & 7; return e == 0 ? (float)m * (1.f / 512.f) : (1.f + (float)m * 0.125f) * sycl::ldexp(1.f, (int)e - 7); }
+static void k_e3sim(xik_ctx *c, uint8_t *w, uint8_t *sc, int rows, int K, int G, int bits, int NC, float *err) {
+  c->q.parallel_for(range<1>((size_t)NE * rows), [=](id<1> id) {
+    const size_t row = id[0];
+    uint8_t *wr = w + row * (K / 2); uint8_t *sr = sc + row * (K / 16);
+    const float qm = bits == 3 ? 3.f : 1.f;
+    static const float lv[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    float eacc = 0.f, wacc = 0.f; float v[128];
+    for (int g0 = 0; g0 < K; g0 += G) {
+      float amax = 0.f;
+      for (int i = 0; i < G; i++) {
+        uint32_t byte = wr[(g0 + i) / 2]; uint32_t nib = (i & 1) ? (byte >> 4) : (byte & 15);
+        float x = lv[nib & 7] * ((nib & 8) ? -1.f : 1.f) * e4m3_dec(sr[(g0 + i) / 16] & 0x7F);
+        v[i] = x; amax = sycl::fmax(amax, sycl::fabs(x));
+      }
+      float best = 1e30f, bs = 0.f;
+      for (int cd = 0; cd < NC; cd++) {
+        float s = amax * (1.f - 0.05f * cd) / qm; if (s <= 0.f) break;
+        uint32_t cb = 1; float bd = 1e30f;   // nearest e4m3 code (positive, 1..126)
+        for (uint32_t k = 1; k < 127; k++) { float d = sycl::fabs(e4m3_dec(k) - s); if (d < bd) { bd = d; cb = k; } }
+        float sq = e4m3_dec(cb), e2 = 0.f;
+        for (int i = 0; i < G; i++) { float q = sycl::fmin(qm, sycl::fmax(-qm - 1.f, sycl::rint(v[i] / sq))); float d = v[i] - q * sq; e2 += d * d; }
+        if (e2 < best) { best = e2; bs = sq; }
+      }
+      uint32_t sb = 0; if (bs > 0.f) { float bd = 1e30f; for (uint32_t k = 1; k < 127; k++) { float d = sycl::fabs(e4m3_dec(k) - bs); if (d < bd) { bd = d; sb = k; } } }
+      for (int i = 0; i < G / 16; i++) sr[g0 / 16 + i] = (uint8_t)sb;
+      for (int i = 0; i < G; i += 2) {
+        uint32_t nb2[2];
+        for (int j = 0; j < 2; j++) {
+          float q = bs > 0.f ? sycl::fmin(qm, sycl::fmax(-qm - 1.f, sycl::rint(v[i + j] / bs))) : 0.f;
+          float d = v[i + j] - q * bs; eacc += d * d; wacc += v[i + j] * v[i + j];
+          int m = (int)sycl::fabs(q); uint32_t code = m == 0 ? 0u : m == 1 ? 2u : m == 2 ? 4u : m == 3 ? 5u : 6u;
+          nb2[j] = code | (q < 0.f ? 8u : 0u);
+        }
+        wr[(g0 + i) / 2] = (uint8_t)(nb2[0] | (nb2[1] << 4));
+      }
+    }
+    err[2 * row] = eacc; err[2 * row + 1] = wacc;
+  });
+}
+
 void k_repack_fp4(xik_ctx *c, const uint8_t *raw, uint8_t *dst, const uint8_t *sraw, uint8_t *sdst, int rows, int K) {
   int nrb = rows / 16, nst = K / 64;
   size_t items = (size_t)NE * nrb * nst * 16;
@@ -1284,6 +1349,191 @@ int dyn_threads() { static const int v = getenv("XIK_DYN") ? atoi(getenv("XIK_DY
 struct MoeCfg { int ks, nb; };
 constexpr MoeCfg MOE_CFGS[] = {{2, 2}, {1, 2}, {4, 2}, {8, 2}, {2, 3}, {2, 4}, {4, 3}, {4, 4}};
 constexpr int NMOE_CFG = 8;
+// ---------------------------------------------------------------------------------------------------------------------------------
+// W3A16 experts (XIK_W3=1): 3-bit codes (q - 4) with fp16 group-64 scales, pre-permuted DPAS layout (see w3_gemv / "FMT 3"): per 16-row block and 128 K one 768 B super-tile = 12 dwords x 16 lanes
+// (3 x 256 B), 2 x 32 B... scales [e][rb][K/64][16] fp16.  The outer NVFP4 scale (amax / den) is folded into the fp16 scales, so outputs are natural dot products.
+namespace w3m {
+using namespace es;
+ESIMD_INLINE simd<uint32_t, 16> pair_reg(int rho, const simd<uint32_t, 16> &a, const simd<uint32_t, 16> &b, const simd<uint32_t, 16> &c) {
+  const uint32_t M = 0x64006400u;
+  if (rho < 15) { const int i = rho / 5, j = rho % 5; const simd<uint32_t, 16> &d = i == 0 ? a : i == 1 ? b : c; return ((j == 0 ? d : (d >> (3 * j))) & 0x00070007u) | M; }
+  return (((a >> 15) & 0x00010001u) | ((b >> 14) & 0x00020002u) | ((c >> 13) & 0x00040004u)) | M;
+}
+}  // namespace w3m
+template <int R, int PW, int NB = 2>
+ESIMD_INLINE es::simd<float, 16 * R> moe_w3_body(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13, const int32_t *ids, int cnt, int per, int kofs, size_t wst, size_t sst) {
+  using namespace es;
+  simd<float, 16 * R> acc = 0.f;
+  const uint32_t *xr[R];
+#pragma unroll
+  for (int r = 0; r < R; r++) { int pp = ids[r < cnt ? r : 0]; xr[r] = reinterpret_cast<const uint32_t *>(X16 + (size_t)(w13 ? pp / TOPK : pp) * ldx + (size_t)kofs * 128); }
+  constexpr bool XPRE = R <= 2;  // R >= 4: activations are loaded per 32-K group (register pressure: the T > 1 kernel holds all R bodies)
+  simd<uint32_t, 192> wb[NB]; simd<uint32_t, 16> sb[NB]; simd<uint32_t, (XPRE ? 64 * R : 16)> xb[NB];
+  auto load = [&](int u, int t) {
+    simd<uint32_t, 64> t0 = ldp<PW, 64>(wp + (size_t)t * wst), t1 = ldp<PW, 64>(wp + (size_t)t * wst + 64), t2 = ldp<PW, 64>(wp + (size_t)t * wst + 128);
+    wb[u].template select<64, 1>(0) = t0; wb[u].template select<64, 1>(64) = t1; wb[u].template select<64, 1>(128) = t2;
+    sb[u] = ldp<0, 16>(sp + (size_t)t * sst);
+    if constexpr (XPRE) {
+#pragma unroll
+      for (int r = 0; r < R; r++) xb[u].template select<64, 1>(64 * r) = block_load<uint32_t, 64>(xr[r] + (size_t)t * 64);
+    }
+  };
+  // loads are issued at the START of the tile that precedes their use by NB - 1 tiles (early issue: the unpack ALU work of tiles t .. t+NB-2 runs under the SENDs in flight)
+#pragma unroll
+  for (int u = 0; u < NB - 1; u++) if (u < per) load(u, u);
+  for (int t0 = 0; t0 < per; t0 += NB) {
+#pragma unroll
+    for (int u = 0; u < NB; u++) {
+      const int t = t0 + u;
+      if (t + NB - 1 < per) load((u + NB - 1) % NB, t + NB - 1);
+      if (t < per) {
+        simd<float, 16 * R> ag = 0.f;
+#pragma unroll
+        for (int g = 0; g < 4; g++) {
+          simd<uint32_t, 16> a = wb[u].template select<16, 1>(48 * g), b = wb[u].template select<16, 1>(48 * g + 16), cc = wb[u].template select<16, 1>(48 * g + 32);
+          simd<uint32_t, 256> B;
+#pragma unroll
+          for (int rho = 0; rho < 16; rho++) B.template select<16, 1>(16 * rho) = w3m::pair_reg(rho, a, b, cc);
+          simd<sycl::half, 512> bh = B.template bit_cast_view<sycl::half>();
+          bh -= (sycl::half)1028.0f;
+          simd<int32_t, 256> bi = bh.template bit_cast_view<int32_t>();
+#pragma unroll
+          for (int s2 = 0; s2 < 2; s2++) {
+            simd<int32_t, 8 * R> av;
+            if constexpr (XPRE) {
+#pragma unroll
+              for (int r = 0; r < R; r++) av.template select<8, 1>(8 * r) = xb[u].template select<8, 1>(64 * r + 16 * g + 8 * s2).template bit_cast_view<int32_t>();
+            } else {
+#pragma unroll
+              for (int r = 0; r < R; r++) av.template select<8, 1>(8 * r) = block_load<int32_t, 8>(reinterpret_cast<const int32_t *>(xr[r]) + (size_t)t * 64 + 16 * g + 8 * s2);
+            }
+            simd<float, 16 * R> z = 0.f;
+            simd<int32_t, 128> bs = bi.template select<128, 1>(128 * s2);
+            ag = xmx::dpas<8, R, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(((g & 1) == 0 && s2 == 0) ? z : ag, bs, av);
+          }
+          if (g & 1) {
+            simd<sycl::half, 16> sh = sb[u].template select<8, 1>(8 * (g >> 1)).template bit_cast_view<sycl::half>();
+            simd<float, 16> sf = sh;
+#pragma unroll
+            for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) += ag.template select<16, 1>(16 * r) * sf;
+          }
+        }
+      }
+    }
+  }
+  return acc;
+}
+// reduce the KSD partial accumulators of a work-group (fixed order, thread 0 writes)
+template <int R, int KSD>
+ESIMD_INLINE void moe_w3_store(es::simd<float, 16 * R> acc, int tid, const int32_t *ids, int cnt, float *Y, size_t ystride, int ldy, int rb) {
+  using namespace es;
+  if constexpr (KSD > 1) {
+    slm_block_store<float, 16 * R>(tid * 16 * R * 4, acc);
+    barrier();
+    if (tid != 0) { barrier(); return; }
+    acc = slm_block_load<float, 16 * R>(0);
+    for (int j = 1; j < KSD; j++) acc += slm_block_load<float, 16 * R>(j * 16 * R * 4);
+    barrier();
+  }
+#pragma unroll
+  for (int r = 0; r < R; r++)
+    if (r < cnt) { simd<float, 16> o = acc.template select<16, 1>(16 * r); o.copy_to(Y + (size_t)ids[r] * ldy + rb * 16); }
+}
+// one work-group of KSD threads per (slot, 16-row block); each thread streams K/128/KSD tiles; K = 1 partial for the downstream kernels
+template <bool R1, int KSD, int NB = 2>
+void moe_w3g_t(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
+  const int nrb = rows / 16, ntile = K / 128, per = ntile / KSD;
+  const bool tm = !getenv("XIK_W3TM") || atoi(getenv("XIK_W3TM")) != 0;  // tile-major weight layout: [expert][tile][row block]
+  const int32_t *desc = c->desc, *elist = c->elist;
+  const size_t nthreads = (size_t)maxslots * nrb * KSD;
+  c->q.parallel_for(nd_range<1>(nthreads, KSD == 1 ? expert_lws() : KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    if constexpr (KSD > 1) slm_init<KSD * 16 * 8 * 4>();
+    const size_t gid = it.get_global_id(0);
+    const int tid = (int)(gid % KSD); const size_t wg = gid / KSD;
+    const int rb = (int)(wg % nrb), j = (int)(wg / nrb);
+    simd<int32_t, 16> d = block_load<int32_t, 16>(desc + j * 16);
+    const int cnt = d[1];
+    if (cnt <= 0) return;
+    const int e = d[0];
+    const size_t wst = tm ? (size_t)nrb * 192 : 192, sst = tm ? (size_t)nrb * 16 : 16;
+    const uint32_t *wp = tm ? Wp + (((size_t)e * ntile + (size_t)tid * per) * nrb + rb) * 192 : Wp + (((size_t)e * nrb + rb) * ntile + (size_t)tid * per) * 192;
+    const uint32_t *sp = tm ? Sp + (((size_t)e * ntile + (size_t)tid * per) * nrb + rb) * 16 : Sp + (((size_t)e * nrb + rb) * ntile + (size_t)tid * per) * 16;
+    const int kofs = tid * per;
+    for (int g0 = 0; g0 < cnt; g0 += 8) {
+      const int n = cnt - g0 < 8 ? cnt - g0 : 8;
+      int32_t ids[8];
+      if (g0 == 0) {
+#pragma unroll
+        for (int r = 0; r < 8; r++) ids[r] = d[2 + r];
+      } else {
+        for (int r = 0; r < 8; r++) ids[r] = elist[(size_t)e * maxper + g0 + (r < n ? r : 0)];
+      }
+      if constexpr (R1) moe_w3_store<1, KSD>(moe_w3_body<1, 5, NB>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
+      else {
+        if (n <= 1) moe_w3_store<1, KSD>(moe_w3_body<1, 5, NB>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
+        else if (n <= 2) moe_w3_store<2, KSD>(moe_w3_body<2, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
+        else if (n <= 4) moe_w3_store<4, KSD>(moe_w3_body<4, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
+        else moe_w3_store<8, KSD>(moe_w3_body<8, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
+      }
+    }
+  });
+}
+void moe_w3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
+  static const int ksd_env = getenv("XIK_W3KSD") ? atoi(getenv("XIK_W3KSD")) : 1;  // threads per (slot, row block): 1, 3 or 9 (must divide K/128: 18 or 9)
+  const uint32_t *W = (const uint32_t *)Wp, *S = (const uint32_t *)Sp;
+  const int ntile = K / 128; const int ksd = (ntile % ksd_env == 0) ? ksd_env : 1;
+  static const int nb_env = getenv("XIK_W3NB") ? atoi(getenv("XIK_W3NB")) : 2;
+#define W3G(KS) if (ksd == KS) { if (maxper <= 1) { if (nb_env == 3) return moe_w3g_t<true, KS, 3>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 6) return moe_w3g_t<true, KS, 6>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 8) return moe_w3g_t<true, KS, 8>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 4) return moe_w3g_t<true, KS, 4>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); return moe_w3g_t<true, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); } return moe_w3g_t<false, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); }
+  W3G(3) W3G(9) W3G(1)
+#undef W3G
+}
+
+// Quantise one NVFP4 expert tensor into the W3 layout (group 64, symmetric codes q = round(w / s) + 4 in 0..7, fp16 scale from a squared-error clipping search).
+// raw nibbles [e][row][K/2], raw e4m3 scales [e][row][K/16], outer scale amax[e] / den[0] (natural weight = e2m1 * e4m3 * amax / den).
+static void k_w3pack(xik_ctx *c, const uint8_t *raw, const uint8_t *sraw, const float *amax, const float *den, int rows, int K, uint32_t *W, uint16_t *S, int NC) {
+  const bool tm = !getenv("XIK_W3TM") || atoi(getenv("XIK_W3TM")) != 0;
+  const int nrb = rows / 16, ntile = K / 128;
+  c->q.parallel_for(range<1>((size_t)NE * nrb * ntile * 16), [=](id<1> id) {
+    size_t i = id[0];
+    const int n = (int)(i % 16); size_t t = i / 16;
+    const int tt = (int)(t % ntile); t /= ntile;
+    const int rb = (int)(t % nrb); const int e = (int)(t / nrb);
+    const size_t row = (size_t)e * rows + rb * 16 + n;
+    const float outer = amax[e] / den[0];
+    static const float lv[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    uint32_t d[12] = {0};
+    for (int gi = 0; gi < 2; gi++) {
+      float v[64]; float amx = 0.f;
+      for (int k = 0; k < 64; k++) {
+        const int kk = tt * 128 + gi * 64 + k;
+        uint32_t byte = raw[row * (K / 2) + kk / 2]; uint32_t nib = (kk & 1) ? (byte >> 4) : (byte & 15);
+        float x = lv[nib & 7] * ((nib & 8) ? -1.f : 1.f) * e4m3_dec(sraw[row * (K / 16) + kk / 16] & 0x7F) * outer;
+        v[k] = x; amx = sycl::fmax(amx, sycl::fabs(x));
+      }
+      float best = 1e30f, bs = amx / 3.f;
+      for (int cd = 0; cd < NC; cd++) {
+        float s2 = (float)(sycl::half)(amx * (1.f - 0.05f * cd) / 3.f); if (s2 <= 0.f) break;
+        float e2 = 0.f;
+        for (int k = 0; k < 64; k++) { float q = sycl::fmin(3.f, sycl::fmax(-4.f, sycl::rint(v[k] / s2))); float dd = v[k] - q * s2; e2 += dd * dd; }
+        if (e2 < best) { best = e2; bs = s2; }
+      }
+      S[(tm ? ((((size_t)e * ntile + tt) * nrb + rb) * 2 + gi) : ((size_t)(e * nrb + rb) * (K / 64) + tt * 2 + gi)) * 16 + n] = sycl::bit_cast<uint16_t>((sycl::half)bs);
+      for (int h2 = 0; h2 < 2; h2++) {
+        uint32_t *w = d + 3 * (gi * 2 + h2);
+        for (int rho = 0; rho < 16; rho++)
+          for (int h = 0; h < 2; h++) {
+            const int k = h2 * 32 + 2 * rho + h;
+            uint32_t qv = bs > 0.f ? (uint32_t)(sycl::fmin(3.f, sycl::fmax(-4.f, sycl::rint(v[k] / bs))) + 4.f) : 4u;
+            if (rho < 15) w[rho / 5] |= qv << (3 * (rho % 5) + 16 * h);
+            else for (int b = 0; b < 3; b++) w[b] |= ((qv >> b) & 1u) << (15 + 16 * h);
+          }
+      }
+    }
+    for (int dd = 0; dd < 12; dd++) W[(tm ? (((size_t)e * ntile + tt) * nrb + rb) : (((size_t)e * nrb + rb) * ntile + tt)) * 192 + dd * 16 + n] = d[dd];
+  });
+}
+
 void moe_fp4g(xik_ctx *c, int cfg, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13,
               const float *amax, const float *den, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride,
               int ldy) {
@@ -1331,6 +1581,7 @@ void moe_fp4g(xik_ctx *c, int cfg, const uint8_t *Wp, const uint8_t *Sp, const s
 // 2^(s-127) (times 2^8, undoing the fp16 bit trick) is applied once.
 void k_repack_mxfp8(xik_ctx *c, const uint8_t *raw, uint32_t *dst, const uint8_t *sraw, uint8_t *sdst, int rows, int K) {
   int nrb = rows / 16, nst = K / 64;
+  const bool tm = !getenv("XIK_F8TM") || atoi(getenv("XIK_F8TM")) != 0;
   size_t items = (size_t)NE * nrb * nst * 16;
   c->q.parallel_for(range<1>(items), [=](id<1> id) {
     size_t i = id[0];
@@ -1341,14 +1592,14 @@ void k_repack_mxfp8(xik_ctx *c, const uint8_t *raw, uint32_t *dst, const uint8_t
     int rb = (int)(t % nrb);
     int e = (int)(t / nrb);
     size_t row = (size_t)e * rows + rb * 16 + n;
-    uint32_t *wd = dst + (((size_t)e * nrb + rb) * nst + st) * 256;
+    uint32_t *wd = dst + (tm ? (((size_t)e * nst + st) * nrb + rb) : (((size_t)e * nrb + rb) * nst + st)) * 256;
     for (int tl = 0; tl < 4; tl++)
       for (int q = 0; q < 4; q++) {
         uint32_t w = *reinterpret_cast<const uint32_t *>(raw + row * K + (size_t)st * 64 + tl * 16 + 4 * q);
         uint32_t e0 = w & 0xFF, e1 = (w >> 8) & 0xFF, e2 = (w >> 16) & 0xFF, e3 = w >> 24;
         wd[(tl * 4 + q) * 16 + n] = e0 | (e2 << 8) | (e1 << 16) | (e3 << 24);
       }
-    uint8_t *sd = sdst + (((size_t)e * nrb + rb) * nst + st) * 32;
+    uint8_t *sd = sdst + (tm ? (((size_t)e * nst + st) * nrb + rb) : (((size_t)e * nrb + rb) * nst + st)) * 32;
     for (int b = 0; b < 2; b++) sd[b * 16 + n] = sraw[row * (K / 32) + st * 2 + b];
   });
 }
@@ -1359,7 +1610,7 @@ inline es::simd<uint32_t, 16> fp8_pair(es::simd<uint32_t, 16> m) {
 
 template <int R, int NB, int PF, int PW = 0, int PS = 0>
 ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13,
-                               const int32_t *ids, int cnt, int nst, float *Y, int ldy, int rb) {
+                               const int32_t *ids, int cnt, int nst, float *Y, int ldy, int rb, size_t wst = 256, size_t sst = 8) {
   using namespace es;
   simd<float, 16 * R> acc = 0.f;
   const uint32_t *xr[R];
@@ -1374,10 +1625,10 @@ ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const syc
   auto load = [&](int u, int s) {
 #pragma unroll
     for (int h = 0; h < 4; h++) {
-      simd<uint32_t, 64> t0 = ldp<PW, 64>(wp + (size_t)s * 256 + h * 64);
+      simd<uint32_t, 64> t0 = ldp<PW, 64>(wp + (size_t)s * wst + h * 64);
       wb[u].template select<64, 1>(64 * h) = t0;
     }
-    sb[u] = ldp<PS, 8>(sp + (size_t)s * 8);
+    sb[u] = ldp<PS, 8>(sp + (size_t)s * sst);
 #pragma unroll
     for (int r = 0; r < R; r++) xb[u].template select<32, 1>(32 * r) = block_load<uint32_t, 32>(xr[r] + (size_t)s * 32);
   };
@@ -1388,7 +1639,7 @@ ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const syc
 #pragma unroll
     for (int d = 0; d < PF; d++)
       if (d < nst) {
-        for (int h = 0; h < 4; h++) prefetch<uint32_t, 64>(wp + (size_t)(d + NB) * 256 + h * 64, sycl::ext::oneapi::experimental::properties{es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>});
+        for (int h = 0; h < 4; h++) prefetch<uint32_t, 64>(wp + (size_t)(d + NB) * wst + h * 64, sycl::ext::oneapi::experimental::properties{es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>});
       }
   }
   for (int s0 = 0; s0 < nst; s0 += NB) {
@@ -1428,7 +1679,7 @@ ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const syc
         if constexpr (PF > 0) {
           if (s + NB + PF < nst) {
 #pragma unroll
-            for (int h = 0; h < 4; h++) prefetch<uint32_t, 64>(wp + (size_t)(s + NB + PF) * 256 + h * 64, sycl::ext::oneapi::experimental::properties{es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>});
+            for (int h = 0; h < 4; h++) prefetch<uint32_t, 64>(wp + (size_t)(s + NB + PF) * wst + h * 64, sycl::ext::oneapi::experimental::properties{es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>});
           }
         }
         if (s + NB < nst) load(u, s + NB);
@@ -1448,7 +1699,7 @@ ESIMD_INLINE void moe_fp8_body(const uint32_t *wp, const uint32_t *sp, const syc
 // Block 0 is unpacked and multiplied while block 1 is still arriving; no extra register buffer (same 1 KB as NB=1).
 template <int R>
 ESIMD_INLINE void moe_fp8_body_split(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13,
-                                     const int32_t *ids, int cnt, int nst, float *Y, int ldy, int rb) {
+                                     const int32_t *ids, int cnt, int nst, float *Y, int ldy, int rb, size_t wst = 256, size_t sst = 8) {
   using namespace es;
   simd<float, 16 * R> acc = 0.f;
   const uint32_t *xr[R];
@@ -1461,8 +1712,8 @@ ESIMD_INLINE void moe_fp8_body_split(const uint32_t *wp, const uint32_t *sp, con
   simd<uint32_t, 8> sbuf;
   simd<uint32_t, 32 * R> xb;
   auto load_half = [&](int blk, int s) {
-    wh[blk].template select<64, 1>(0) = block_load<uint32_t, 64>(wp + (size_t)s * 256 + blk * 128);
-    wh[blk].template select<64, 1>(64) = block_load<uint32_t, 64>(wp + (size_t)s * 256 + blk * 128 + 64);
+    wh[blk].template select<64, 1>(0) = block_load<uint32_t, 64>(wp + (size_t)s * wst + blk * 128);
+    wh[blk].template select<64, 1>(64) = block_load<uint32_t, 64>(wp + (size_t)s * wst + blk * 128 + 64);
   };
   auto consume = [&](int blk) {
     simd<uint8_t, 32> s8 = sbuf.template bit_cast_view<uint8_t>();
@@ -1492,7 +1743,7 @@ ESIMD_INLINE void moe_fp8_body_split(const uint32_t *wp, const uint32_t *sp, con
   };
   for (int s = 0; s < nst; s++) {
     load_half(0, s);
-    sbuf = block_load<uint32_t, 8>(sp + (size_t)s * 8);
+    sbuf = block_load<uint32_t, 8>(sp + (size_t)s * sst);
 #pragma unroll
     for (int r = 0; r < R; r++) xb.template select<32, 1>(32 * r) = block_load<uint32_t, 32>(xr[r] + (size_t)s * 32);
     load_half(1, s);   // issued before block 0 is consumed: its latency overlaps the unpack + DPAS of block 0
@@ -1519,6 +1770,7 @@ void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
                 int maxslots, int rows, int K, float *Y, int ldy, size_t ystride) {
   const int KSV = fp8_ks();
   int nrb = rows / 16, nst = K / 64, per = nst / KSV;
+  const bool tm = !getenv("XIK_F8TM") || atoi(getenv("XIK_F8TM")) != 0;  // tile-major layout [expert][supertile][row block]
   const int32_t *desc = c->desc, *elist = c->elist;
   size_t nthreads = (size_t)maxslots * nrb * KSV;
   auto kernel = [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
@@ -1532,8 +1784,9 @@ void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
     int cnt = d[1];
     if (cnt <= 0) return;
     int e = d[0];
-    const uint32_t *wp = reinterpret_cast<const uint32_t *>(Wp) + (((size_t)e * nrb + rb) * nst + ks * per) * 256;
-    const uint32_t *sp = reinterpret_cast<const uint32_t *>(Sp) + (((size_t)e * nrb + rb) * nst + ks * per) * 8;
+    const size_t wst = tm ? (size_t)nrb * 256 : 256, sst = tm ? (size_t)nrb * 8 : 8;
+    const uint32_t *wp = reinterpret_cast<const uint32_t *>(Wp) + (tm ? (((size_t)e * nst + ks * per) * nrb + rb) : (((size_t)e * nrb + rb) * nst + ks * per)) * 256;
+    const uint32_t *sp = reinterpret_cast<const uint32_t *>(Sp) + (tm ? (((size_t)e * nst + ks * per) * nrb + rb) : (((size_t)e * nrb + rb) * nst + ks * per)) * 8;
     const sycl::half *xs = X16 + (size_t)ks * per * 64;
     float *Yk = Y + (size_t)ks * ystride;
     for (int g0 = 0; g0 < cnt; g0 += 8) {
@@ -1546,15 +1799,15 @@ void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
         for (int r = 0; r < 8; r++) ids[r] = elist[(size_t)e * maxper + g0 + (r < n ? r : 0)];
       }
       if constexpr (NB == 0) {
-        if (n <= 1) moe_fp8_body_split<1>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-        else if (n <= 2) moe_fp8_body_split<2>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-        else if (n <= 4) moe_fp8_body_split<4>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-        else moe_fp8_body_split<8>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        if (n <= 1) moe_fp8_body_split<1>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb, wst, sst);
+        else if (n <= 2) moe_fp8_body_split<2>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb, wst, sst);
+        else if (n <= 4) moe_fp8_body_split<4>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb, wst, sst);
+        else moe_fp8_body_split<8>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb, wst, sst);
       } else {
-        if (n <= 1) moe_fp8_body<1, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-        else if (n <= 2) moe_fp8_body<2, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-        else if (n <= 4) moe_fp8_body<4, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
-        else moe_fp8_body<8, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb);
+        if (n <= 1) moe_fp8_body<1, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb, wst, sst);
+        else if (n <= 2) moe_fp8_body<2, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb, wst, sst);
+        else if (n <= 4) moe_fp8_body<4, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb, wst, sst);
+        else moe_fp8_body<8, NB, PF, PW, PS>(wp, sp, xs, ldx, w13, ids, n, per, Yk, ldy, rb, wst, sst);
       }
     }
   };
@@ -2519,6 +2772,7 @@ static size_t woff_bytes() {
 // weight load straddle two 256 B regions: NVFP4 w13 T=1 61 -> 66 us (+192) / 114 us (+128) / 166 us (+64), DRAM bytes read up to 2.7x.
 // So the base alignment is guaranteed by the API (aligned_alloc_device, 4096) instead of being whatever the driver happens to return
 // (it currently returns 2 MiB-aligned blocks, identical addresses).  XIK_ALLOC=plain restores malloc_device.
+static bool g_w3sel[24][2];  // layer/matrix stored as W3A16
 static void *alloc_expert(xik_ctx *c, size_t bytes) {
   static const bool plain = getenv("XIK_ALLOC") && std::string(getenv("XIK_ALLOC")) == "plain";
   return plain ? malloc_device(bytes, c->q) : sycl::aligned_alloc_device(4096, bytes, c->q.q);
@@ -2709,6 +2963,159 @@ static void head_gemv(xik_ctx *c, const float *X, int ldx, float *Y, int T, bool
     else w4_gemv_r<12, 8>(c, c->head_w4, c->head_s4, X, ldx, Y, VOCAB, VOCAB, D, t0, n, rnd);
   }
 }
+// ---------------------------------------------------------------------------------------------------------------------------------
+// attention int4 (XIK_AW4): quantiser (group 64, optional zero point, squared-error / activation-weighted scale search) and the multi-segment GEMV
+static void k_w4zpack(xik_ctx *c, const uint16_t *w, int rows, int K, int asym, int obj, const float *h, uint32_t *out, uint32_t *sz) {
+  const int ngrp = K / 64, nrbp = rows / 16;
+  const bool tm = getenv("XIK_W4TM") != nullptr;
+  c->q.parallel_for(range<1>((size_t)rows * ngrp), [=](id<1> id) {
+    const size_t r = id[0] / ngrp; const int g = (int)(id[0] % ngrp);
+    const uint16_t *p = w + r * K + (size_t)g * 64;
+    const float *hh = h ? h + (size_t)g * 64 : nullptr;
+    float amax = 0.f, lo = 1e30f, hi = -1e30f;
+    for (int i = 0; i < 64; i++) { float x = bf2f(p[i]); amax = sycl::fmax(amax, sycl::fabs(x)); lo = sycl::fmin(lo, x); hi = sycl::fmax(hi, x); }
+    lo = sycl::fmin(lo, 0.f); hi = sycl::fmax(hi, 0.f);
+    float bs = 0.f, bz = 8.f, be = 1e30f;
+    const int ncand = obj ? 12 : 1;
+    for (int cdt = 0; cdt < ncand; cdt++) {
+      float sc, zp; const float shrink = 1.f - 0.04f * cdt;
+      if (asym) { sc = (float)(sycl::half)((hi - lo) * shrink / 15.f); if (sc == 0.f) continue; zp = sycl::fmin(15.f, sycl::fmax(0.f, sycl::rint(-lo * shrink / sc))); }
+      else { sc = (float)(sycl::half)(amax * shrink / 7.5f); if (sc == 0.f) continue; zp = 8.f; }
+      float e = 0.f;
+      for (int i = 0; i < 64; i++) { float x = bf2f(p[i]); float q = sycl::fmin(15.f, sycl::fmax(0.f, sycl::rint(x / sc) + zp)); float d = x - (q - zp) * sc; e += (obj == 2 && hh ? hh[i] : 1.f) * d * d; }
+      if (e < be) { be = e; bs = sc; bz = zp; }
+    }
+    const int rb = (int)(r / 16), n = (int)(r % 16);
+    sz[(tm ? ((size_t)g * nrbp + rb) : ((size_t)rb * ngrp + g)) * 16 + n] = (uint32_t)sycl::bit_cast<uint16_t>((sycl::half)bs) | ((uint32_t)sycl::bit_cast<uint16_t>((sycl::half)(1024.f + bz)) << 16);
+    for (int bl = 0; bl < 2; bl++)
+      for (int q4 = 0; q4 < 4; q4++) {
+        uint32_t d = 0;
+        for (int j = 0; j < 8; j++) {
+          float x = bf2f(p[bl * 32 + q4 * 8 + j]);
+          uint32_t qv = bs == 0.f ? (uint32_t)bz : (uint32_t)sycl::fmin(15.f, sycl::fmax(0.f, sycl::rint(x / bs) + bz));
+          d |= (j & 1) ? (qv << (16 + 4 * (j / 2))) : (qv << (4 * (j / 2)));
+        }
+        out[(tm ? (((size_t)g * nrbp + rb) * 2 + bl) : ((size_t)rb * (K / 32) + g * 2 + bl)) * 64 + q4 * 16 + n] = d;
+      }
+  });
+}
+namespace {
+// W4A16 GEMV over several matrices in one launch: one work-group of KSD = 12 threads per 16-row block, K split in KSD parts of K/64/12 groups (3 or 4), partials summed in thread order.
+template <int R>
+static void w4z_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
+  constexpr int KSD = 12;
+  const bool tm = getenv("XIK_W4TM") != nullptr;
+  c->q.parallel_for(nd_range<1>((size_t)a.total_wg * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    slm_init<KSD * 16 * R * 4>();
+    const int wgi = (int)it.get_group(0), tid = (int)it.get_local_id(0);
+    int si = 0;
+    while (si + 1 < a.n && wgi >= a.s[si + 1].wg0) si++;
+    const W4Seg &sd = a.s[si];
+    const int rb = wgi - sd.wg0, K = sd.K, ngrp = K / 64, per = ngrp / KSD, g0 = tid * per;
+    const int nrbw = sd.rows / 16;
+    const size_t wst = tm ? (size_t)nrbw * 128 : 128, sst = tm ? (size_t)nrbw * 16 : 16;  // tm: group-major layout [group][row block]
+    const uint32_t *wp = tm ? sd.W + ((size_t)g0 * nrbw + rb) * 128 : sd.W + ((size_t)rb * (K / 32) + (size_t)g0 * 2) * 64;
+    const uint32_t *sp = tm ? sd.SZ + ((size_t)g0 * nrbw + rb) * 16 : sd.SZ + ((size_t)rb * ngrp + g0) * 16;
+    simd<float, 16 * R> acc = 0.f;
+    simd<uint32_t, 128> cur, nxt;
+    cur.template select<64, 1>(0) = block_load<uint32_t, 64>(wp);
+    cur.template select<64, 1>(64) = block_load<uint32_t, 64>(wp + 64);
+    simd<uint32_t, 16> scur = block_load<uint32_t, 16>(sp);
+    for (int g = 0; g < per; g++) {
+      simd<uint32_t, 16> snx;
+      if (g + 1 < per) {
+        nxt.template select<64, 1>(0) = block_load<uint32_t, 64>(wp + (size_t)(g + 1) * wst);
+        nxt.template select<64, 1>(64) = block_load<uint32_t, 64>(wp + (size_t)(g + 1) * wst + 64);
+        snx = block_load<uint32_t, 16>(sp + (size_t)(g + 1) * sst);
+      }
+      simd<uint32_t, 16> zpair = (scur >> 16) * 0x10001u;  // (1024 + zero point) in both halves
+      simd<float, 16 * R> ag = 0.f;
+#pragma unroll
+      for (int t = 0; t < 4; t++) {
+        simd<uint32_t, 128> B;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          simd<uint32_t, 16> x = cur.template select<16, 1>(64 * (t / 2) + 16 * (2 * (t % 2) + h));
+#pragma unroll
+          for (int pp = 0; pp < 4; pp++) {
+            simd<uint32_t, 16> v = (pp == 0 ? x : (x >> (4 * pp))) & 0x000F000Fu;
+            B.template select<16, 1>(16 * (4 * h + pp)) = v | 0x64006400u;
+          }
+        }
+        simd<sycl::half, 256> bh = B.template bit_cast_view<sycl::half>();
+        simd<uint32_t, 128> Z;
+#pragma unroll
+        for (int i = 0; i < 8; i++) Z.template select<16, 1>(16 * i) = zpair;
+        bh -= Z.template bit_cast_view<sycl::half>();
+        simd<int32_t, 128> bi = bh.template bit_cast_view<int32_t>();
+        simd<int32_t, 8 * R> av;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+          simd<float, 16> xv; xv.copy_from(sd.X + (size_t)(t0 + (r < nt ? r : 0)) * sd.ldx + (size_t)(g0 + g) * 64 + t * 16);
+          simd<sycl::half, 16> xh = xv;
+          av.template select<8, 1>(8 * r) = xh.template bit_cast_view<int32_t>();
+        }
+        simd<float, 16 * R> z = 0.f;
+        ag = xmx::dpas<8, R, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(t == 0 ? z : ag, bi, av);
+      }
+      simd<uint16_t, 32> sv16 = scur.template bit_cast_view<uint16_t>();
+      simd<uint16_t, 16> slo = sv16.template select<16, 2>(0);
+      simd<sycl::half, 16> sh = slo.template bit_cast_view<sycl::half>();
+      simd<float, 16> sf = sh;
+#pragma unroll
+      for (int r = 0; r < R; r++) acc.template select<16, 1>(16 * r) += ag.template select<16, 1>(16 * r) * sf;
+      if (g + 1 < per) { cur = nxt; scur = snx; }
+    }
+    slm_block_store<float, 16 * R>(tid * 16 * R * 4, acc);
+    barrier();
+    if (tid == 0) {
+      simd<float, 16 * R> sum = slm_block_load<float, 16 * R>(0);
+      for (int j = 1; j < KSD; j++) sum += slm_block_load<float, 16 * R>(j * 16 * R * 4);
+      if (sd.rnd) {
+        simd<uint32_t, 16 * R> u = sum.template bit_cast_view<uint32_t>();
+        u += 0x7FFFu + ((u >> 16) & 1u); u &= 0xFFFF0000u;
+        sum = u.template bit_cast_view<float>();
+      }
+#pragma unroll
+      for (int r = 0; r < R; r++)
+        if (r < nt) { simd<float, 16> o = sum.template select<16, 1>(16 * r); o.copy_to(sd.Y + (size_t)(t0 + r) * sd.ldy + rb * 16); }
+    }
+  });
+}
+static void w4z_run(xik_ctx *c, const W4Args &a, int T) {
+  for (int t0 = 0; t0 < T; t0 += 8) {
+    const int n = std::min(8, T - t0);
+    if (n == 1) w4z_r<1>(c, a, t0, n);
+    else if (n == 2) w4z_r<2>(c, a, t0, n);
+    else if (n <= 4) w4z_r<4>(c, a, t0, n);
+    else w4z_r<8>(c, a, t0, n);
+  }
+}
+}  // namespace
+// activation statistics (XIK_ACT_STATS_FILE, written by XIK_ACT_STATS runs): mean squares per input channel, [layer][kind 0..3] and the head
+static std::vector<float> g_ast[24][4]; static bool g_ast_loaded = false;
+static void ensure_ast() {
+  if (g_ast_loaded || !getenv("XIK_ACT_STATS_FILE")) return;
+  g_ast_loaded = true; FILE *f = fopen(getenv("XIK_ACT_STATS_FILE"), "rb"); const int Ks[4] = {D, D, D, QD};
+  if (!f) throw std::runtime_error("cannot open XIK_ACT_STATS_FILE");
+  for (int l = 0; l < 24; l++) for (int k = 0; k < 4; k++) { float n; if (fread(&n, 4, 1, f) != 1) throw std::runtime_error("short stats file"); g_ast[l][k].resize(Ks[k]); if (fread(g_ast[l][k].data(), 4, Ks[k], f) != (size_t)Ks[k]) throw std::runtime_error("short stats file"); }
+  fclose(f);
+}
+// XIK_AW4 = "wq_du=0-23;wk_dv=0-23;wo_ud=0-5,18-23": matrices (name substring) and layers that get an int4 copy
+static bool aw4_selected(const std::string &name, int layer) {
+  const char *e = getenv("XIK_AW4"); if (!e || layer < 0) return false;
+  std::string spec = e; size_t b = 0;
+  while (b < spec.size()) {
+    size_t se = spec.find(';', b); if (se == std::string::npos) se = spec.size();
+    std::string item = spec.substr(b, se - b); b = se + 1;
+    size_t eq = item.find('='); if (eq == std::string::npos) continue;
+    if (name.find(item.substr(0, eq)) == std::string::npos) continue;
+    const char *q = item.c_str() + eq + 1;
+    while (*q) { int lo = 0, hi = -1, nn = 0; if (sscanf(q, "%d-%d%n", &lo, &hi, &nn) < 2) { if (sscanf(q, "%d%n", &lo, &nn) < 1) break; hi = lo; } if (layer >= lo && layer <= hi) return true; q += nn; if (*q == ',') q++; }
+  }
+  return false;
+}
 extern "C" {
 int xik_upload(xik_ctx *c, const char *name, int dtype, const void *src, size_t bytes) {
   try {
@@ -2753,6 +3160,13 @@ int xik_finalize(xik_ctx *c) {
         }
         auto has = [&](const char *sub) { return name.find(sub) != std::string::npos; };
         int bit = (has("attn.wq_du") || has("attn.wk_dv") || has("attn.wv_dv") || has("attn.wr_du") || has("attn.gate_attn")) ? 1 : has("attn.wo_ud") ? 2 : name == "model.llm.unembed.weight" ? 4 : 0;
+        if (w4g && getenv("XIK_W4SEL")) {  // per-matrix / per-layer selection: XIK_W4SEL=comma list of name substrings (wq_du,wk_dv,wv_dv,wr_du,gate_attn,wo_ud,unembed), XIK_W4LAYERS=lo-hi
+          bool hit = false; std::string sel = getenv("XIK_W4SEL"); size_t b0 = 0;
+          while (b0 <= sel.size()) { size_t e0 = sel.find(',', b0); if (e0 == std::string::npos) e0 = sel.size(); if (e0 > b0 && has(sel.substr(b0, e0 - b0).c_str())) hit = true; b0 = e0 + 1; }
+          size_t lp = name.find("layers."); int ly = lp == std::string::npos ? -1 : atoi(name.c_str() + lp + 7);
+          if (hit && getenv("XIK_W4LAYERS") && ly >= 0) { int lo = 0, hi = 99; sscanf(getenv("XIK_W4LAYERS"), "%d-%d", &lo, &hi); if (ly < lo || ly > hi) hit = false; }
+          bit = hit ? w4m : 0;
+        }
         if (w4g && (w4m & bit) && K % w4g == 0) {
           float *dh = nullptr;
           if (w4o == 2 && st_loaded) {
@@ -2767,6 +3181,23 @@ int xik_finalize(xik_ctx *c) {
           }
           k_w4sim(c, (uint16_t *)it->second.p, rows, K, w4g, w4a, w4o, dh); c->q.wait();
           if (dh) sycl::free(dh, c->q);
+        }
+      }
+      {
+        size_t lp = name.find("layers."); int ly = lp == std::string::npos ? -1 : atoi(name.c_str() + lp + 7);
+        if (!mtp && ly >= 0 && ly < 24 && K % 64 == 0 && rows % 16 == 0 && aw4_selected(name, ly)) {
+          static const int aasym = getenv("XIK_AW4_ASYM") ? atoi(getenv("XIK_AW4_ASYM")) : 1;
+          static const int aobj = getenv("XIK_AW4_OBJ") ? atoi(getenv("XIK_AW4_OBJ")) : (getenv("XIK_ACT_STATS_FILE") ? 2 : 1);
+          ensure_ast();
+          auto has2 = [&](const char *sub) { return name.find(sub) != std::string::npos; };
+          int kind = has2("attn.wo_ud") ? 3 : (has2("attn.wk_dv") && !is_local(ly)) ? 1 : (has2("attn.wv_dv") && !is_local(ly)) ? 2 : 0;
+          float *dh = nullptr;
+          if (aobj == 2 && g_ast_loaded) { dh = sycl::malloc_device<float>(K, c->q.q); c->q.memcpy(dh, g_ast[ly][kind].data(), K * 4).wait(); }
+          uint32_t *w4 = (uint32_t *)alloc_expert(c, (size_t)rows * K / 2 + 4096), *sz = (uint32_t *)alloc_expert(c, (size_t)rows * (K / 64) * 4 + 4096);
+          require_aligned(w4, 256, "attention int4 weights");
+          k_w4zpack(c, (const uint16_t *)it->second.p, rows, K, aasym, aobj, dh, w4, sz); c->q.wait();
+          if (dh) sycl::free(dh, c->q);
+          g_w4alt[nw] = W4Alt{w4, sz};
         }
       }
       if (want8) {
@@ -2900,6 +3331,25 @@ int xik_finalize(xik_ctx *c) {
           std::string sn = wn + "_scale";
           int rows = m ? D : 2 * FI, K = m ? FI : D;
           Buf &wb = c->tensors.at(wn), &sb = c->tensors.at(sn);
+          {  // W3A16 experts: XIK_W3=1, XIK_W3L=lo-hi layers (default all NVFP4 layers), XIK_W3W=1 w13 / 2 w2 / 3 both (default 3), XIK_W3NC clipping candidates
+            static const bool w3on = getenv("XIK_W3") && atoi(getenv("XIK_W3")) != 0;
+            static const int w3w = getenv("XIK_W3W") ? atoi(getenv("XIK_W3W")) : 3, w3nc = getenv("XIK_W3NC") ? atoi(getenv("XIK_W3NC")) : 8;
+            bool in3 = !getenv("XIK_W3L");  // XIK_W3L = comma separated layers / ranges, e.g. "0-5,7,9-11"
+            if (!in3) { const char *q = getenv("XIK_W3L"); while (*q) { int lo = 0, hi = -1, nn = 0; if (sscanf(q, "%d-%d%n", &lo, &hi, &nn) < 2) { if (sscanf(q, "%d%n", &lo, &nn) < 1) break; hi = lo; } if (l >= lo && l <= hi) in3 = true; q += nn; if (*q == ',') q++; } }
+            if (w3on && (w3w & (1 << m)) && in3) {
+              Buf &ab = c->tensors.at(wn + "_amax"), &db = c->tensors.at(wn + "_outer_scale_denominator");
+              const size_t nwb = (size_t)NE * (rows / 16) * (K / 128) * 768, nsb = (size_t)NE * (rows / 16) * (K / 64) * 32;
+              uint8_t *w0 = (uint8_t *)alloc_expert(c, nwb + 4096), *s0 = (uint8_t *)alloc_expert(c, nsb + 4096);
+              if (!w0 || !s0) throw std::runtime_error("W3 alloc failed");
+              require_aligned(w0, 256, "W3 expert weights"); require_aligned(s0, 256, "W3 expert scales");
+              k_w3pack(c, (const uint8_t *)wb.p, (const uint8_t *)sb.p, (const float *)ab.p, (const float *)db.p, rows, K, (uint32_t *)w0, (uint16_t *)s0, w3nc);
+              c->q.wait();
+              sycl::free(wb.base ? wb.base : wb.p, c->q); sycl::free(sb.base ? sb.base : sb.p, c->q);
+              wb.p = w0; sb.p = s0; wb.base = w0; sb.base = s0; wb.bytes = nwb; sb.bytes = nsb;
+              g_w3sel[l][m] = true;
+              continue;
+            }
+          }
           size_t wo = woff_bytes();
           uint8_t *nw0 = (uint8_t *)alloc_expert(c, wb.bytes + 64 + 4096), *ns0 = (uint8_t *)alloc_expert(c, sb.bytes + 64 + 4096);
           if (!nw0 || !ns0) throw std::runtime_error("repack alloc failed");
@@ -2907,12 +3357,53 @@ int xik_finalize(xik_ctx *c) {
           require_aligned(nw0, 256, "NVFP4 expert weights (allocation)"); require_aligned(ns0, 256, "NVFP4 expert scales (allocation)");
           require_aligned(nw, 16, "NVFP4 expert weights"); require_aligned(ns, 16, "NVFP4 expert scales");
           if (wo == 0) { require_aligned(nw, 256, "NVFP4 expert weights"); require_aligned(ns, 256, "NVFP4 expert scales"); }
+          {  // expert quantisation simulation: XIK_E3SIM=bits (3|2), XIK_E3G=group (default 64), XIK_E3W=1 w13 /2 w2 /3 both, XIK_E3L=lo-hi layers, XIK_E3NC scale candidates, XIK_E3MAP=file (bytes [l][m][e] = bits 4|3|2 overrides), XIK_E3ERR=csv path
+            static const int e3b = getenv("XIK_E3SIM") ? atoi(getenv("XIK_E3SIM")) : 0, e3g = getenv("XIK_E3G") ? atoi(getenv("XIK_E3G")) : 64;
+            static const int e3w = getenv("XIK_E3W") ? atoi(getenv("XIK_E3W")) : 3, e3nc = getenv("XIK_E3NC") ? atoi(getenv("XIK_E3NC")) : 8;
+            static std::vector<uint8_t> e3map; static bool e3loaded = false;
+            if (!e3loaded) { e3loaded = true; if (getenv("XIK_E3MAP")) { FILE *f = fopen(getenv("XIK_E3MAP"), "rb"); if (!f) throw std::runtime_error("XIK_E3MAP"); e3map.resize(24 * 2 * NE); if (fread(e3map.data(), 1, e3map.size(), f) != e3map.size()) throw std::runtime_error("short XIK_E3MAP"); fclose(f); } }
+            int lo = 0, hi = 99; if (getenv("XIK_E3L")) sscanf(getenv("XIK_E3L"), "%d-%d", &lo, &hi);
+            if ((e3b || !e3map.empty()) && (e3w & (1 << m)) && l >= lo && l <= hi) {
+              // MAP mode: per expert bits; uniform mode: all experts.  Run the kernel per bits class on the whole tensor, then restore other experts from a backup.
+              size_t nw_b = (size_t)NE * rows * (K / 2), ns_b = (size_t)NE * rows * (K / 16);
+              std::vector<uint8_t> bits_e(NE, (uint8_t)e3b);
+              if (!e3map.empty()) for (int e = 0; e < NE; e++) bits_e[e] = e3map[((size_t)l * 2 + m) * NE + e];
+              uint8_t *bw = nullptr, *bs2 = nullptr;
+              if (!e3map.empty()) { bw = sycl::malloc_device<uint8_t>(nw_b, c->q.q); bs2 = sycl::malloc_device<uint8_t>(ns_b, c->q.q); c->q.memcpy(bw, wb.p, nw_b); c->q.memcpy(bs2, sb.p, ns_b); c->q.wait(); }
+              float *derr = sycl::malloc_device<float>((size_t)NE * rows * 2, c->q.q);
+              int done_bits = 0;
+              for (int bt : {3, 2}) {
+                bool any = false; for (int e = 0; e < NE; e++) if (bits_e[e] == bt) any = true;
+                if (!any) continue; done_bits |= bt;
+                k_e3sim(c, (uint8_t *)wb.p, (uint8_t *)sb.p, rows, K, e3g, bt, e3nc, derr); c->q.wait();
+                if (!e3map.empty()) {  // keep only the experts of this class; others return to the backup (re-run overwrites in order: restore later)
+                  std::vector<uint8_t> hm(NE); for (int e = 0; e < NE; e++) hm[e] = bits_e[e] == bt;
+                  // copy this class's result to a side buffer by swapping: simple approach = process classes sequentially from the backup
+                  uint8_t *tw = sycl::malloc_device<uint8_t>(nw_b, c->q.q), *ts2 = sycl::malloc_device<uint8_t>(ns_b, c->q.q);
+                  c->q.memcpy(tw, wb.p, nw_b); c->q.memcpy(ts2, sb.p, ns_b); c->q.memcpy(wb.p, bw, nw_b); c->q.memcpy(sb.p, bs2, ns_b); c->q.wait();
+                  // merge: wb/sb currently original; write class experts from tw/ts2 into the backup arrays (bw/bs2 hold the running merge)
+                  for (int e = 0; e < NE; e++) if (hm[e]) { c->q.memcpy(bw + (size_t)e * rows * (K / 2), tw + (size_t)e * rows * (K / 2), (size_t)rows * (K / 2)); c->q.memcpy(bs2 + (size_t)e * rows * (K / 16), ts2 + (size_t)e * rows * (K / 16), (size_t)rows * (K / 16)); }
+                  c->q.wait(); sycl::free(tw, c->q); sycl::free(ts2, c->q);
+                }
+              }
+              if (!e3map.empty()) { c->q.memcpy(wb.p, bw, nw_b); c->q.memcpy(sb.p, bs2, ns_b); c->q.wait(); sycl::free(bw, c->q); sycl::free(bs2, c->q); }
+              if (getenv("XIK_E3ERR")) {
+                std::vector<float> he((size_t)NE * rows * 2); c->q.memcpy(he.data(), derr, he.size() * 4).wait();
+                FILE *f = fopen(getenv("XIK_E3ERR"), "a");
+                for (int e = 0; e < NE; e++) { double a = 0, b = 0; for (int r = 0; r < rows; r++) { a += he[2 * ((size_t)e * rows + r)]; b += he[2 * ((size_t)e * rows + r) + 1]; } fprintf(f, "%d,%d,%d,%d,%.6g\n", l, m, e, bits_e[e], b > 0 ? a / b : 0.0); }
+                fclose(f);
+              }
+              sycl::free(derr, c->q);
+              (void)done_bits;
+            }
+          }
           k_repack_fp4(c, (const uint8_t *)wb.p, nw, (const uint8_t *)sb.p, ns, rows, K);
           c->q.wait();
           sycl::free(wb.base ? wb.base : wb.p, c->q); sycl::free(sb.base ? sb.base : sb.p, c->q);
           wb.p = nw; sb.p = ns; wb.base = nw0; sb.base = ns0;
         }
       }
+      w.w3_13 = g_w3sel[l][0]; w.w3_2 = g_w3sel[l][1];
       w.w13 = tp8(c, p + "mlp.experts.w13_weight");
       w.w13_s = tp8(c, p + "mlp.experts.w13_weight_scale");
       w.w2 = tp8(c, p + "mlp.experts.w2_weight");
@@ -3968,11 +4459,13 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     if (!fr) { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
     k_group(c, np, T); }
     int slots = std::min(NE, np);
-    moe_fp4g(c, mcfg, lw.w13, lw.w13_s, c->x16_in, D, true, lw.w13_amax, lw.w13_den, T, slots, 2 * FI, D, c->gu_part,
+    if (lw.w3_13) moe_w3g(c, lw.w13, lw.w13_s, c->x16_in, D, true, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
+    else moe_fp4g(c, mcfg, lw.w13, lw.w13_s, c->x16_in, D, true, lw.w13_amax, lw.w13_den, T, slots, 2 * FI, D, c->gu_part,
              (size_t)np * 2 * FI, 2 * FI);
     phase(c, P_MOE_W13);
     k_act(c, np, nks);
-    moe_fp4g(c, mcfg, lw.w2, lw.w2_s, c->x16_act, FI, false, lw.w2_amax, lw.w2_den, T, slots, D, FI, c->yp_part,
+    if (lw.w3_2) moe_w3g(c, lw.w2, lw.w2_s, c->x16_act, FI, false, T, slots, D, FI, c->yp_part, (size_t)np * D, D);
+    else moe_fp4g(c, mcfg, lw.w2, lw.w2_s, c->x16_act, FI, false, lw.w2_amax, lw.w2_den, T, slots, D, FI, c->yp_part,
              (size_t)np * D, D);
   }
   k_moe_combine(c, T, nks);
@@ -4480,10 +4973,13 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
       }
       static const int nrot = getenv("XIK_BENCH_ROT") ? atoi(getenv("XIK_BENCH_ROT")) : 20;  // 20 = cold; 1 = same layer every call (TLB warm)
       const LayerW &lq = c->L[(layer + (it++ % nrot)) % 20];  // rotate over layers: weights are cold every call
-      if (kind == 0)
-        moe_fp4g(c, cfg, lq.w13, lq.w13_s, c->x16_in, D, true, lq.w13_amax, lq.w13_den, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
-      else
-        moe_fp4g(c, cfg, lq.w2, lq.w2_s, c->x16_act, FI, false, lq.w2_amax, lq.w2_den, T, slots, D, FI, c->yp_part, (size_t)np * D, D);
+      if (kind == 0) {
+        if (lq.w3_13) moe_w3g(c, lq.w13, lq.w13_s, c->x16_in, D, true, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
+        else moe_fp4g(c, cfg, lq.w13, lq.w13_s, c->x16_in, D, true, lq.w13_amax, lq.w13_den, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
+      } else {
+        if (lq.w3_2) moe_w3g(c, lq.w2, lq.w2_s, c->x16_act, FI, false, T, slots, D, FI, c->yp_part, (size_t)np * D, D);
+        else moe_fp4g(c, cfg, lq.w2, lq.w2_s, c->x16_act, FI, false, lq.w2_amax, lq.w2_den, T, slots, D, FI, c->yp_part, (size_t)np * D, D);
+      }
     };
     (void)nks;
     for (int i = 0; i < 20; i++) run();
@@ -4819,6 +5315,164 @@ void w4_gemv(xik_ctx *c, const uint32_t *W, const uint16_t *S, const float *X, f
       sum.copy_to(Y + rb * 16);
     }
   });
+}
+// ---------------------------------------------------------------------------------------------------------------------------------
+// W3A16 formats (benchmark).  A super-tile is 16 rows x 128 K = 768 B = 3 x 256 B, dword (d, n) d = 0..11, lane n = row.  Each group of 32 K uses 3 dwords (a, b, c) = (d, d+1, d+2), d = 3g,
+// and produces 16 fp16-pair registers (pair rho = K 2*rho, 2*rho+1 in the low / high half), 2 DPAS B operands.  Code q = 0..7 stands for (q - 4).
+//   FMT 0 plain      : element e at bit 3e of the 96-bit group stream (elements straddle dwords)
+//   FMT 1 split 2+1  : a, b = 2-bit planes (8 pairs each, pair q at bit 2q / 16 + 2q), c = 1-bit plane (pair rho at bit rho / 16 + rho)
+//   FMT 2 bitplanes  : a, b, c = bit 0, 1, 2 of the code, pair rho at bit rho / 16 + rho
+//   FMT 3 pre-permuted: pair rho = 5*i + j sits at bits 3j..3j+2 (low half) and 16 + 3j.. (high half) of dword i, i = 0..2 (15 pairs); pair 15 uses bits 15 / 31 of a, b, c
+namespace w3 {
+using namespace es;
+ESIMD_INLINE simd<uint32_t, 16> plain_elem(int e, const simd<uint32_t, 16> &a, const simd<uint32_t, 16> &b, const simd<uint32_t, 16> &c) {
+  const int bit = 3 * e, w = bit / 32, o = bit % 32;
+  const simd<uint32_t, 16> &d0 = w == 0 ? a : w == 1 ? b : c;
+  if (o <= 29) return (o == 0 ? d0 : (d0 >> o)) & 7u;
+  const simd<uint32_t, 16> &d1 = w == 0 ? b : c;
+  return ((d0 >> o) | (d1 << (32 - o))) & 7u;
+}
+template <int FMT>
+ESIMD_INLINE simd<uint32_t, 16> pair_reg(int rho, const simd<uint32_t, 16> &a, const simd<uint32_t, 16> &b, const simd<uint32_t, 16> &c) {
+  const uint32_t M = 0x64006400u;
+  if constexpr (FMT == 3) {
+    if (rho < 15) { const int i = rho / 5, j = rho % 5; const simd<uint32_t, 16> &d = i == 0 ? a : i == 1 ? b : c; return ((j == 0 ? d : (d >> (3 * j))) & 0x00070007u) | M; }
+    return (((a >> 15) & 0x00010001u) | ((b >> 14) & 0x00020002u) | ((c >> 13) & 0x00040004u)) | M;
+  } else if constexpr (FMT == 2) {
+    simd<uint32_t, 16> x = (rho == 0 ? a : (a >> rho)) & 0x00010001u;
+    x |= rho >= 1 ? ((b >> (rho - 1)) & 0x00020002u) : ((b << 1) & 0x00020002u);
+    x |= rho >= 2 ? ((c >> (rho - 2)) & 0x00040004u) : ((c << (2 - rho)) & 0x00040004u);
+    return x | M;
+  } else if constexpr (FMT == 1) {
+    const simd<uint32_t, 16> &l = rho < 8 ? a : b; const int q = rho & 7;
+    simd<uint32_t, 16> x = ((q == 0 ? l : (l >> (2 * q))) & 0x00030003u);
+    x |= rho >= 2 ? ((c >> (rho - 2)) & 0x00040004u) : ((c << (2 - rho)) & 0x00040004u);
+    return x | M;
+  } else {  // plain stream
+    return (plain_elem(2 * rho, a, b, c) | (plain_elem(2 * rho + 1, a, b, c) << 16)) | M;
+  }
+}
+}
+template <int FMT, int KSD, int GS>
+static void w3_gemv(xik_ctx *c, const uint32_t *W, const uint16_t *S, const sycl::half *X, float *Y, int rows, int K) {
+  const int nrb = rows / 16, ntile = K / 128, per = ntile / KSD, gpt = 128 / GS;  // scale groups per tile
+  c->q.parallel_for(nd_range<1>((size_t)nrb * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    slm_init<KSD * 16 * 4>();
+    const int rb = (int)it.get_group(0), tid = (int)it.get_local_id(0);
+    const int t0 = tid * per;
+    const uint32_t *wp = W + ((size_t)rb * ntile + t0) * 192;
+    const uint16_t *sp = S + ((size_t)rb * (K / GS) + (size_t)t0 * gpt) * 16;
+    const sycl::half *xp = X + (size_t)t0 * 128;
+    simd<float, 16> acc = 0.f;
+    simd<uint32_t, 192> cur, nxt;
+#define W3LD(d, t) do { (d).template select<64, 1>(0) = block_load<uint32_t, 64>(wp + (size_t)(t) * 192); (d).template select<64, 1>(64) = block_load<uint32_t, 64>(wp + (size_t)(t) * 192 + 64); (d).template select<64, 1>(128) = block_load<uint32_t, 64>(wp + (size_t)(t) * 192 + 128); } while (0)
+    W3LD(cur, 0);
+    for (int t = 0; t < per; t++) {
+      if (t + 1 < per) W3LD(nxt, t + 1);
+      simd<uint16_t, 16 * 4> sc4;  // up to 4 scale groups per tile (GS >= 32)
+#pragma unroll
+      for (int q = 0; q < gpt; q++) sc4.template select<16, 1>(16 * q) = block_load<uint16_t, 16>(sp + ((size_t)t * gpt + q) * 16);
+      simd<float, 16> ag = 0.f;
+#pragma unroll
+      for (int g = 0; g < 4; g++) {
+        simd<uint32_t, 16> a = cur.template select<16, 1>(48 * g), b = cur.template select<16, 1>(48 * g + 16), cc = cur.template select<16, 1>(48 * g + 32);
+        simd<uint32_t, 256> B;
+#pragma unroll
+        for (int rho = 0; rho < 16; rho++) B.template select<16, 1>(16 * rho) = w3::pair_reg<FMT>(rho, a, b, cc);
+        simd<sycl::half, 512> bh = B.template bit_cast_view<sycl::half>();
+        bh -= (sycl::half)1028.0f;
+        simd<int32_t, 256> bi = bh.template bit_cast_view<int32_t>();
+#pragma unroll
+        for (int s2 = 0; s2 < 2; s2++) {
+          simd<int32_t, 8> av = block_load<int32_t, 8>(reinterpret_cast<const int32_t *>(xp + (size_t)t * 128 + g * 32 + s2 * 16));
+          simd<float, 16> z = 0.f;
+          ag = xmx::dpas<8, 1, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(((g * 2 + s2) % (GS / 16)) == 0 ? z : ag, simd<int32_t, 128>(bi.template select<128, 1>(128 * s2)), av);
+        }
+        if ((g + 1) * 32 % GS == 0) {
+          simd<sycl::half, 16> sh = sc4.template select<16, 1>(16 * ((g * 32) / GS)).template bit_cast_view<sycl::half>();
+          simd<float, 16> sf = sh;
+          acc += ag * sf;
+        }
+      }
+      if (t + 1 < per) cur = nxt;
+    }
+    slm_block_store<float, 16>(tid * 64, acc);
+    barrier();
+    if (tid == 0) {
+      simd<float, 16> sum = slm_block_load<float, 16>(0);
+      for (int j = 1; j < KSD; j++) sum += slm_block_load<float, 16>(j * 64);
+      sum.copy_to(Y + rb * 16);
+    }
+  });
+}
+extern "C" int xik_bench_w3(xik_ctx *c, int rows, int K, int fmt, int ksd, int gs, int iters, int check, double *out_us, double *out_err) {
+  try {
+    const int nrb = rows / 16, ntile = K / 128, ngrp = K / gs;
+    std::mt19937 rng(11);
+    std::vector<uint8_t> q((size_t)rows * K);
+    for (auto &v : q) v = rng() & 7;
+    std::vector<uint32_t> hw((size_t)nrb * ntile * 192);
+    for (int rb = 0; rb < nrb; rb++)
+      for (int tt = 0; tt < ntile; tt++)
+        for (int n = 0; n < 16; n++) {
+          uint32_t d[12] = {0};
+          for (int g = 0; g < 4; g++) {
+            const uint8_t *e = &q[(size_t)(rb * 16 + n) * K + tt * 128 + g * 32];
+            uint32_t *w = d + 3 * g;
+            if (fmt == 0) {
+              for (int i = 0; i < 32; i++) { int bit = 3 * i; for (int b = 0; b < 3; b++) if ((e[i] >> b) & 1) w[(bit + b) / 32] |= 1u << ((bit + b) % 32); }
+            } else if (fmt == 1) {
+              for (int rho = 0; rho < 16; rho++) for (int h = 0; h < 2; h++) {
+                uint32_t v = e[2 * rho + h]; int qq = rho & 7; uint32_t *l = rho < 8 ? &w[0] : &w[1];
+                *l |= (v & 3) << (2 * qq + 16 * h); w[2] |= ((v >> 2) & 1) << (rho + 16 * h);
+              }
+            } else if (fmt == 2) {
+              for (int rho = 0; rho < 16; rho++) for (int h = 0; h < 2; h++) { uint32_t v = e[2 * rho + h]; for (int b = 0; b < 3; b++) w[b] |= ((v >> b) & 1) << (rho + 16 * h); }
+            } else {
+              for (int rho = 0; rho < 16; rho++) for (int h = 0; h < 2; h++) {
+                uint32_t v = e[2 * rho + h];
+                if (rho < 15) w[rho / 5] |= v << (3 * (rho % 5) + 16 * h);
+                else for (int b = 0; b < 3; b++) w[b] |= ((v >> b) & 1) << (15 + 16 * h);
+              }
+            }
+          }
+          for (int dd = 0; dd < 12; dd++) hw[((size_t)rb * ntile + tt) * 192 + dd * 16 + n] = d[dd];
+        }
+    std::vector<uint16_t> hs((size_t)nrb * ngrp * 16); std::vector<float> sf(hs.size());
+    for (size_t i = 0; i < hs.size(); i++) { sycl::half h = (sycl::half)(0.01f + 0.0001f * (float)(rng() % 100)); hs[i] = sycl::bit_cast<uint16_t>(h); sf[i] = (float)h; }
+    std::vector<sycl::half> hx(K); for (auto &v : hx) v = (sycl::half)(((int)(rng() % 2001) - 1000) / 1000.f);
+    uint32_t *dw = sycl::aligned_alloc_device<uint32_t>(256, hw.size(), c->q.q); uint16_t *ds = sycl::aligned_alloc_device<uint16_t>(256, hs.size(), c->q.q);
+    sycl::half *dx = sycl::aligned_alloc_device<sycl::half>(256, K, c->q.q); float *dy = sycl::aligned_alloc_device<float>(256, rows, c->q.q);
+    c->q.memcpy(dw, hw.data(), hw.size() * 4); c->q.memcpy(ds, hs.data(), hs.size() * 2); c->q.memcpy(dx, hx.data(), K * 2); c->q.wait();
+#define W3CALL(W) do { \
+      if (fmt == 0) { if (gs == 64) { if (ksd == 9) w3_gemv<0, 9, 64>(c, W, ds, dx, dy, rows, K); else w3_gemv<0, 3, 64>(c, W, ds, dx, dy, rows, K); } else { if (ksd == 9) w3_gemv<0, 9, 128>(c, W, ds, dx, dy, rows, K); else w3_gemv<0, 3, 128>(c, W, ds, dx, dy, rows, K); } } \
+      else if (fmt == 1) { if (gs == 64) { if (ksd == 9) w3_gemv<1, 9, 64>(c, W, ds, dx, dy, rows, K); else w3_gemv<1, 3, 64>(c, W, ds, dx, dy, rows, K); } else { if (ksd == 9) w3_gemv<1, 9, 128>(c, W, ds, dx, dy, rows, K); else w3_gemv<1, 3, 128>(c, W, ds, dx, dy, rows, K); } } \
+      else if (fmt == 2) { if (gs == 64) { if (ksd == 9) w3_gemv<2, 9, 64>(c, W, ds, dx, dy, rows, K); else w3_gemv<2, 3, 64>(c, W, ds, dx, dy, rows, K); } else { if (ksd == 9) w3_gemv<2, 9, 128>(c, W, ds, dx, dy, rows, K); else w3_gemv<2, 3, 128>(c, W, ds, dx, dy, rows, K); } } \
+      else { if (gs == 64) { if (ksd == 9) w3_gemv<3, 9, 64>(c, W, ds, dx, dy, rows, K); else w3_gemv<3, 3, 64>(c, W, ds, dx, dy, rows, K); } else { if (ksd == 9) w3_gemv<3, 9, 128>(c, W, ds, dx, dy, rows, K); else w3_gemv<3, 3, 128>(c, W, ds, dx, dy, rows, K); } } } while (0)
+    W3CALL(dw); c->q.wait();
+    *out_err = 0;
+    if (check) {
+      std::vector<float> hy(rows); c->q.memcpy(hy.data(), dy, rows * 4).wait();
+      double me = 0, mr = 0;
+      for (int r = 0; r < rows; r += 7) {
+        double ref = 0;
+        for (int g = 0; g < ngrp; g++) { double gs2 = 0; for (int k = 0; k < gs; k++) gs2 += ((double)q[(size_t)r * K + g * gs + k] - 4.0) * (double)(float)hx[g * gs + k]; ref += gs2 * sf[((size_t)(r / 16) * ngrp + g) * 16 + r % 16]; }
+        me = std::max(me, std::fabs(ref - hy[r])); mr = std::max(mr, std::fabs(ref));
+      }
+      *out_err = me / (mr + 1e-30);
+    }
+    const int NC = (int)std::max<size_t>(6, (size_t)(80u << 20) / (hw.size() * 4) + 1); std::vector<uint32_t *> cw(NC); cw[0] = dw;
+    for (int i = 1; i < NC; i++) { cw[i] = sycl::aligned_alloc_device<uint32_t>(256, hw.size(), c->q.q); c->q.memcpy(cw[i], hw.data(), hw.size() * 4); }
+    c->q.wait();
+    for (int i = 0; i < 20; i++) { uint32_t *w = cw[i % NC]; W3CALL(w); }
+    c->q.wait();
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; i++) { uint32_t *w = cw[i % NC]; W3CALL(w); }
+    c->q.wait();
+    *out_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+    return 0;
+  } catch (std::exception &e) { g_err = e.what(); return 1; }
 }
 extern "C" int xik_bench_w4(xik_ctx *c, int rows, int K, int ksd, int iters, int check, double *out_us, double *out_err) {
   try {

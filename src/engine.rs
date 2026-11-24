@@ -175,6 +175,7 @@ impl Engine {
     }
     pub fn test_ctl(&mut self) -> Result<(), String> { if unsafe { ffi::xik_test_ctl(self.ctx) } != 0 { return Err(last_error()); } Ok(()) }
     pub fn tanh_dump(&mut self, path: &str) -> Result<(), String> { let c = std::ffi::CString::new(path).unwrap(); if unsafe { ffi::xik_tanh_dump(self.ctx, c.as_ptr()) } != 0 { return Err(last_error()); } Ok(()) }
+    pub fn bench_w3(&mut self, rows: i32, k: i32, fmt: i32, ksd: i32, gs: i32, iters: i32, check: bool) -> Result<(f64, f64), String> { let (mut us, mut er) = (0f64, 0f64); if unsafe { ffi::xik_bench_w3(self.ctx, rows, k, fmt, ksd, gs, iters, check as i32, &mut us, &mut er) } != 0 { return Err(last_error()); } Ok((us, er)) }
     pub fn bench_w4(&mut self, rows: i32, k: i32, ksd: i32, iters: i32, check: bool) -> Result<(f64, f64), String> { let (mut us, mut er) = (0f64, 0f64); if unsafe { ffi::xik_bench_w4(self.ctx, rows, k, ksd, iters, check as i32, &mut us, &mut er) } != 0 { return Err(last_error()); } Ok((us, er)) }
     pub fn actstats_dump(&mut self, path: &str) -> Result<(), String> { let c = std::ffi::CString::new(path).unwrap(); if unsafe { ffi::xik_actstats_dump(self.ctx, c.as_ptr()) } != 0 { return Err(last_error()); } Ok(()) }
     pub fn probe_dpas(&mut self) { unsafe { ffi::xik_probe_dpas(self.ctx); } }

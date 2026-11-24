@@ -28,6 +28,7 @@ unsafe extern "C" {
     pub fn xik_route_dump(c: *mut XikCtx, path: *const std::os::raw::c_char) -> c_int;
     pub fn xik_test_ctl(c: *mut XikCtx) -> c_int;
     pub fn xik_tanh_dump(c: *mut XikCtx, path: *const std::os::raw::c_char) -> c_int;
+    pub fn xik_bench_w3(c: *mut XikCtx, rows: c_int, k: c_int, fmt: c_int, ksd: c_int, gs: c_int, iters: c_int, check: c_int, us: *mut f64, err: *mut f64) -> c_int;
     pub fn xik_bench_w4(c: *mut XikCtx, rows: c_int, k: c_int, ksd: c_int, iters: c_int, check: c_int, us: *mut f64, err: *mut f64) -> c_int;
     pub fn xik_actstats_dump(c: *mut XikCtx, path: *const std::os::raw::c_char) -> c_int;
     pub fn xik_probe_dpas(c: *mut XikCtx) -> c_int;

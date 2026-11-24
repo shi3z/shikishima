@@ -33,6 +33,7 @@ fn main() {
             for _ in 1..n { cur = e.forward(&[cur], false, true).unwrap()[0]; out.push(cur); if e.pending() > 128 { e.discard_pending(); } }
             println!("=====BEGIN {pi}\n{}\n=====END", tok.decode(&out.iter().map(|&x| x as u32).collect::<Vec<_>>(), false).unwrap());
         }
+        if let Ok(p) = std::env::var("XIK_ROUTE_DUMP") { e.route_dump(&p).unwrap(); }
         return;
     }
     // Teacher-forced logits study (approximate-mode research).  --tf g BASE: greedy-generate n tokens with the current engine
@@ -269,6 +270,20 @@ fn main() {
         return;
     }
     if a.iter().any(|x| x == "--test-ctl") { e.test_ctl().unwrap(); return; }
+    if a.iter().any(|x| x == "--bench-w3") {
+        // W3A16 formats: expert-like shapes (8 experts worth of rows), cold weights.  fmt 0 plain, 1 split 2+1, 2 bitplanes, 3 pre-permuted.
+        for (name, rows, k) in [("w13 8x2304x2304", 8 * 2304, 2304), ("w2  8x2304x1152", 8 * 2304, 1152)] {
+            for gs in [64, 128] {
+                for fmt in 0..4 {
+                    let ksd = 9;
+                    let (us, err) = e.bench_w3(rows, k, fmt, ksd, gs, 200, true).unwrap();
+                    let bytes = rows as f64 * k as f64 * 3.0 / 8.0 + rows as f64 * (k / gs) as f64 * 2.0;
+                    eprintln!("W3A16 {name} fmt {fmt} gs {gs}: {us:8.1} us {:7.2} MB {:6.1} GB/s  max rel err {err:.2e}", bytes / 1e6, bytes / us / 1e3);
+                }
+            }
+        }
+        return;
+    }
     if a.iter().any(|x| x == "--bench-w4") {
         for (name, rows, k, ksd) in [("q   3072x2304", 3072, 2304, 12), ("k   1024x2304", 1024, 2304, 12), ("wo  2304x3072", 2304, 3072, 16), ("gate3072x2304", 3072, 2304, 12), ("head201024x2304", 201024, 2304, 12)] {
             for kd in [ksd] {
