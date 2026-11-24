@@ -265,9 +265,34 @@ void gemv_bf16_t(queue &q, const uint16_t *W, const float *X, int ldx, float *Y,
 // the expert descriptors are valid), 32 router gemv, 64 q/r clip + kv store, 128 synthetic routing (use it in EVERY ablation run so the expert access pattern is identical).
 static int abl_mask() { static const int v = getenv("XIK_ABL") ? atoi(getenv("XIK_ABL")) : 0; return v; }
 static int expert_lws() { static const int v = getenv("XIK_LWS") ? atoi(getenv("XIK_LWS")) : 16; return v; }  // work-group size of the expert kernels (16 = default); smaller groups spread 1152 threads more evenly over the Xe cores
+// One sub-group per (row, token): the same per-lane accumulation order and the same sub-group reduction as gemv_bf16_t (bit-identical results for every T),
+// but rows * T sub-groups instead of rows / 4 (the 512-thread launch used 32 hardware threads: 57 us at T = 8).  XIK_RGV=0 restores the old launch.
+static void gemv_bf16_rs(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, int T, bool round_out) {
+  const int nsg = rows * T, wg = 128, nwg = (nsg * 16 + wg - 1) / wg;
+  c->q.parallel_for(nd_range<1>((size_t)nwg * wg, wg), [=](nd_item<1> it) SUBGROUP16 {
+    auto sg = it.get_sub_group();
+    const int lane = sg.get_local_linear_id();
+    const int g = (int)(it.get_global_linear_id() / 16);
+    if (g >= nsg) return;
+    const int t = g / rows, row = g % rows;
+    float acc = 0.f;
+    for (int k8 = lane; k8 < K / 8; k8 += 16) {
+      vec<float, 4> a = *reinterpret_cast<const vec<float, 4> *>(X + (size_t)t * ldx + k8 * 8);
+      vec<float, 4> b = *reinterpret_cast<const vec<float, 4> *>(X + (size_t)t * ldx + k8 * 8 + 4);
+      vec<uint32_t, 4> w = *reinterpret_cast<const vec<uint32_t, 4> *>(W + (size_t)row * K + k8 * 8);
+      float xv[8], wf[8];
+      for (int i = 0; i < 4; i++) { xv[i] = a[i]; xv[4 + i] = b[i]; wf[2 * i] = sycl::bit_cast<float>(w[i] << 16); wf[2 * i + 1] = sycl::bit_cast<float>(w[i] & 0xFFFF0000u); }
+      for (int i = 0; i < 8; i++) acc += wf[i] * xv[i];
+    }
+    float r = reduce_over_group(sg, acc, plus<float>());
+    if (lane == 0) Y[(size_t)t * ldy + row] = round_out ? rbf(r) : r;
+  });
+}
 void gemv_bf16_old(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, int T,
                bool round_out) {
   if (abl_mask() & 32) return;
+  static const bool rgv = !getenv("XIK_RGV") || atoi(getenv("XIK_RGV")) != 0;
+  if (rgv && T <= 64) return gemv_bf16_rs(c, W, X, ldx, Y, ldy, rows, K, T, round_out);
   for (int t0 = 0; t0 < T; t0 += 8) {
     int n = std::min(8, T - t0);
     const float *x = X + (size_t)t0 * ldx;
