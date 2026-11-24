@@ -1,0 +1,135 @@
+parity VW=8 UNR=4 BITWISE-IDENTICAL
+parity VW=0 UNR=4 BITWISE-IDENTICAL
+parity code plain IDENTICAL
+parity code hybrid IDENTICAL
+parity history plain IDENTICAL
+parity history hybrid IDENTICAL
+parity prose plain IDENTICAL
+parity prose hybrid IDENTICAL
+parity repeat plain IDENTICAL
+parity repeat hybrid IDENTICAL
+parity edit_py plain IDENTICAL
+parity edit_py hybrid IDENTICAL
+parity jsonl plain IDENTICAL
+parity jsonl hybrid IDENTICAL
+r1 code attn=0 plain: median 55.87 median 56.62
+r1 code attn=0 hybrid: median 82.38 median 84.02
+r1 code attn=1 plain: median 65.58 median 66.61
+r1 code attn=1 hybrid: median 87.20 median 89.03
+r1 history attn=0 plain: median 56.68 median 57.20
+r1 history attn=0 hybrid: median 76.14 median 77.08
+r1 history attn=1 plain: median 66.00 median 66.70
+r1 history attn=1 hybrid: median 82.23 median 83.33
+r1 prose attn=0 plain: median 55.81 median 56.56
+r1 prose attn=0 hybrid: median 58.33 median 59.15
+r1 prose attn=1 plain: median 65.45 median 66.49
+r1 prose attn=1 hybrid: median 66.99 median 68.08
+r1 repeat attn=0 plain: median 55.12 median 56.01
+r1 repeat attn=0 hybrid: median 144.27 median 150.57
+r1 repeat attn=1 plain: median 65.18 median 66.43
+r1 repeat attn=1 hybrid: median 152.14 median 159.14
+r1 edit_py attn=0 plain: median 52.65 median 54.13
+r1 edit_py attn=0 hybrid: median 198.63 median 221.48
+r1 edit_py attn=1 plain: median 64.00 median 66.18
+r1 edit_py attn=1 hybrid: median 210.58 median 236.19
+r1 jsonl attn=0 plain: median 51.99 median 53.60
+r1 jsonl attn=0 hybrid: median 138.42 median 150.46
+r1 jsonl attn=1 plain: median 63.63 median 66.03
+r1 jsonl attn=1 hybrid: median 152.08 median 166.56
+r2 code attn=0 plain: median 55.90 median 56.65
+r2 code attn=0 hybrid: median 81.94 median 83.56
+r2 code attn=1 plain: median 65.58 median 66.62
+r2 code attn=1 hybrid: median 87.15 median 88.98
+r2 history attn=0 plain: median 56.59 median 57.10
+r2 history attn=0 hybrid: median 76.11 median 77.04
+r2 history attn=1 plain: median 66.01 median 66.71
+r2 history attn=1 hybrid: median 82.27 median 83.36
+r2 prose attn=0 plain: median 55.80 median 56.55
+r2 prose attn=0 hybrid: median 58.47 median 59.29
+r2 prose attn=1 plain: median 65.53 median 66.57
+r2 prose attn=1 hybrid: median 66.10 median 67.15
+r2 repeat attn=0 plain: median 55.15 median 56.05
+r2 repeat attn=0 hybrid: median 144.17 median 150.46
+r2 repeat attn=1 plain: median 65.18 median 66.43
+r2 repeat attn=1 hybrid: median 151.85 median 158.82
+r2 edit_py attn=0 plain: median 52.71 median 54.20
+r2 edit_py attn=0 hybrid: median 198.59 median 221.44
+r2 edit_py attn=1 plain: median 64.01 median 66.19
+r2 edit_py attn=1 hybrid: median 210.50 median 236.12
+r2 jsonl attn=0 plain: median 51.96 median 53.57
+r2 jsonl attn=0 hybrid: median 138.36 median 150.39
+r2 jsonl attn=1 plain: median 63.63 median 66.03
+r2 jsonl attn=1 hybrid: median 152.02 median 166.49
+r3 code attn=0 plain: median 55.85 median 56.60
+r3 code attn=0 hybrid: median 82.38 median 84.02
+r3 code attn=1 plain: median 65.54 median 66.57
+r3 code attn=1 hybrid: median 87.22 median 89.06
+r3 history attn=0 plain: median 56.68 median 57.20
+r3 history attn=0 hybrid: median 76.15 median 77.09
+r3 history attn=1 plain: median 65.89 median 66.60
+r3 history attn=1 hybrid: median 82.27 median 83.37
+r3 prose attn=0 plain: median 55.77 median 56.52
+r3 prose attn=0 hybrid: median 58.50 median 59.32
+r3 prose attn=1 plain: median 65.53 median 66.57
+r3 prose attn=1 hybrid: median 66.94 median 68.03
+r3 repeat attn=0 plain: median 55.13 median 56.03
+r3 repeat attn=0 hybrid: median 144.55 median 150.87
+r3 repeat attn=1 plain: median 65.17 median 66.42
+r3 repeat attn=1 hybrid: median 152.09 median 159.08
+r3 edit_py attn=0 plain: median 52.71 median 54.20
+r3 edit_py attn=0 hybrid: median 198.58 median 221.43
+r3 edit_py attn=1 plain: median 63.99 median 66.17
+r3 edit_py attn=1 hybrid: median 210.73 median 236.40
+r3 jsonl attn=0 plain: median 52.00 median 53.61
+r3 jsonl attn=0 hybrid: median 138.34 median 150.37
+r3 jsonl attn=1 plain: median 63.61 median 66.01
+r3 jsonl attn=1 hybrid: median 152.07 median 166.56
+r4 code attn=0 plain: median 55.87 median 56.62
+r4 code attn=0 hybrid: median 81.99 median 83.62
+r4 code attn=1 plain: median 65.55 median 66.58
+r4 code attn=1 hybrid: median 87.15 median 88.99
+r4 history attn=0 plain: median 56.67 median 57.19
+r4 history attn=0 hybrid: median 76.08 median 77.01
+r4 history attn=1 plain: median 65.97 median 66.68
+r4 history attn=1 hybrid: median 83.22 median 84.35
+r4 prose attn=0 plain: median 55.81 median 56.57
+r4 prose attn=0 hybrid: median 58.47 median 59.29
+r4 prose attn=1 plain: median 65.54 median 66.58
+r4 prose attn=1 hybrid: median 67.00 median 68.09
+r4 repeat attn=0 plain: median 55.10 median 55.99
+r4 repeat attn=0 hybrid: median 144.16 median 150.45
+r4 repeat attn=1 plain: median 65.21 median 66.46
+r4 repeat attn=1 hybrid: median 151.69 median 158.66
+r4 edit_py attn=0 plain: median 52.66 median 54.14
+r4 edit_py attn=0 hybrid: median 198.47 median 221.31
+r4 edit_py attn=1 plain: median 64.00 median 66.18
+r4 edit_py attn=1 hybrid: median 210.72 median 236.39
+r4 jsonl attn=0 plain: median 51.93 median 53.54
+r4 jsonl attn=0 hybrid: median 138.43 median 150.46
+r4 jsonl attn=1 plain: median 63.61 median 66.01
+r4 jsonl attn=1 hybrid: median 152.05 median 166.52
+r5 code attn=0 plain: median 55.83 median 56.58
+r5 code attn=0 hybrid: median 82.43 median 84.07
+r5 code attn=1 plain: median 65.57 median 66.60
+r5 code attn=1 hybrid: median 87.21 median 89.05
+r5 history attn=0 plain: median 56.65 median 57.17
+r5 history attn=0 hybrid: median 76.08 median 77.01
+r5 history attn=1 plain: median 65.92 median 66.62
+r5 history attn=1 hybrid: median 82.24 median 83.33
+r5 prose attn=0 plain: median 55.82 median 56.57
+r5 prose attn=0 hybrid: median 58.46 median 59.29
+r5 prose attn=1 plain: median 65.52 median 66.56
+r5 prose attn=1 hybrid: median 66.16 median 67.22
+r5 repeat attn=0 plain: median 55.09 median 55.99
+r5 repeat attn=0 hybrid: median 144.55 median 150.88
+r5 repeat attn=1 plain: median 65.29 median 66.54
+r5 repeat attn=1 hybrid: median 151.83 median 158.81
+r5 edit_py attn=0 plain: median 52.71 median 54.20
+r5 edit_py attn=0 hybrid: median 198.45 median 221.28
+r5 edit_py attn=1 plain: median 63.99 median 66.17
+r5 edit_py attn=1 hybrid: median 210.77 median 236.45
+r5 jsonl attn=0 plain: median 51.99 median 53.60
+r5 jsonl attn=0 hybrid: median 138.35 median 150.39
+r5 jsonl attn=1 plain: median 63.61 median 66.01
+r5 jsonl attn=1 hybrid: median 152.14 median 166.64
+ATDDONE

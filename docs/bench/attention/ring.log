@@ -1,0 +1,98 @@
+parity VW=0 UNR=-1 logits+ids BITWISE-IDENTICAL (64 steps, ctx 512..576)
+parity VW=1 UNR=-1 logits+ids BITWISE-IDENTICAL (64 steps, ctx 512..576)
+parity VW=8 UNR=-1 logits+ids BITWISE-IDENTICAL (64 steps, ctx 512..576)
+parity VW=12 UNR=-1 logits+ids BITWISE-IDENTICAL (64 steps, ctx 512..576)
+parity VW=16 UNR=-1 logits+ids BITWISE-IDENTICAL (64 steps, ctx 512..576)
+parity VW=4 UNR=9 logits+ids BITWISE-IDENTICAL (64 steps, ctx 512..576)
+parity VW=6 UNR=9 logits+ids BITWISE-IDENTICAL (64 steps, ctx 512..576)
+parity VW=8 UNR=9 logits+ids BITWISE-IDENTICAL (64 steps, ctx 512..576)
+parity VW=12 UNR=9 logits+ids BITWISE-IDENTICAL (64 steps, ctx 512..576)
+ring ctx=256 rep=1 cfg=0,-1,0 wall 21.01 ms
+ring ctx=256 rep=1 cfg=8,-1,0 wall 15.95 ms
+ring ctx=256 rep=1 cfg=12,-1,0 wall 15.73 ms
+ring ctx=256 rep=1 cfg=16,-1,0 wall 15.67 ms
+ring ctx=256 rep=1 cfg=4,9,0 wall 15.81 ms
+ring ctx=256 rep=1 cfg=6,9,0 wall 15.66 ms
+ring ctx=256 rep=1 cfg=8,9,0 wall 15.74 ms
+ring ctx=256 rep=1 cfg=12,9,0 wall 15.86 ms
+ring ctx=256 rep=2 cfg=0,-1,0 wall 21.01 ms
+ring ctx=256 rep=2 cfg=8,-1,0 wall 15.95 ms
+ring ctx=256 rep=2 cfg=12,-1,0 wall 15.75 ms
+ring ctx=256 rep=2 cfg=16,-1,0 wall 15.66 ms
+ring ctx=256 rep=2 cfg=4,9,0 wall 15.81 ms
+ring ctx=256 rep=2 cfg=6,9,0 wall 15.65 ms
+ring ctx=256 rep=2 cfg=8,9,0 wall 15.72 ms
+ring ctx=256 rep=2 cfg=12,9,0 wall 15.85 ms
+ring ctx=256 rep=3 cfg=0,-1,0 wall 21.01 ms
+ring ctx=256 rep=3 cfg=8,-1,0 wall 15.95 ms
+ring ctx=256 rep=3 cfg=12,-1,0 wall 15.76 ms
+ring ctx=256 rep=3 cfg=16,-1,0 wall 15.66 ms
+ring ctx=256 rep=3 cfg=4,9,0 wall 15.82 ms
+ring ctx=256 rep=3 cfg=6,9,0 wall 15.66 ms
+ring ctx=256 rep=3 cfg=8,9,0 wall 15.72 ms
+ring ctx=256 rep=3 cfg=12,9,0 wall 15.84 ms
+ring ctx=256 rep=4 cfg=0,-1,0 wall 21.04 ms
+ring ctx=256 rep=4 cfg=8,-1,0 wall 15.97 ms
+ring ctx=256 rep=4 cfg=12,-1,0 wall 15.73 ms
+ring ctx=256 rep=4 cfg=16,-1,0 wall 15.66 ms
+ring ctx=256 rep=4 cfg=4,9,0 wall 15.83 ms
+ring ctx=256 rep=4 cfg=6,9,0 wall 15.65 ms
+ring ctx=256 rep=4 cfg=8,9,0 wall 15.72 ms
+ring ctx=256 rep=4 cfg=12,9,0 wall 15.84 ms
+ring ctx=256 rep=5 cfg=0,-1,0 wall 21.00 ms
+ring ctx=256 rep=5 cfg=8,-1,0 wall 15.95 ms
+ring ctx=256 rep=5 cfg=12,-1,0 wall 15.73 ms
+ring ctx=256 rep=5 cfg=16,-1,0 wall 15.69 ms
+ring ctx=256 rep=5 cfg=4,9,0 wall 15.80 ms
+ring ctx=256 rep=5 cfg=6,9,0 wall 15.66 ms
+ring ctx=256 rep=5 cfg=8,9,0 wall 15.73 ms
+ring ctx=256 rep=5 cfg=12,9,0 wall 15.84 ms
+ring ctx=1024 rep=1 cfg=0,-1,0 wall 37.15 ms
+ring ctx=1024 rep=1 cfg=8,-1,0 wall 19.32 ms
+ring ctx=1024 rep=1 cfg=12,-1,0 wall 18.49 ms
+ring ctx=1024 rep=1 cfg=16,-1,0 wall 18.03 ms
+ring ctx=1024 rep=1 cfg=4,9,0 wall 18.90 ms
+ring ctx=1024 rep=1 cfg=6,9,0 wall 18.28 ms
+ring ctx=1024 rep=1 cfg=8,9,0 wall 18.51 ms
+ring ctx=1024 rep=1 cfg=12,9,0 wall 18.85 ms
+ring ctx=1024 rep=2 cfg=0,-1,0 wall 37.14 ms
+ring ctx=1024 rep=2 cfg=8,-1,0 wall 19.33 ms
+ring ctx=1024 rep=2 cfg=12,-1,0 wall 18.47 ms
+ring ctx=1024 rep=2 cfg=16,-1,0 wall 18.04 ms
+ring ctx=1024 rep=2 cfg=4,9,0 wall 18.87 ms
+ring ctx=1024 rep=2 cfg=6,9,0 wall 18.31 ms
+ring ctx=1024 rep=2 cfg=8,9,0 wall 18.48 ms
+ring ctx=1024 rep=2 cfg=12,9,0 wall 18.86 ms
+ring ctx=1024 rep=3 cfg=0,-1,0 wall 37.15 ms
+ring ctx=1024 rep=3 cfg=8,-1,0 wall 19.33 ms
+ring ctx=1024 rep=3 cfg=12,-1,0 wall 18.50 ms
+ring ctx=1024 rep=3 cfg=16,-1,0 wall 18.03 ms
+ring ctx=1024 rep=3 cfg=4,9,0 wall 18.88 ms
+ring ctx=1024 rep=3 cfg=6,9,0 wall 18.28 ms
+ring ctx=1024 rep=3 cfg=8,9,0 wall 18.48 ms
+ring ctx=1024 rep=3 cfg=12,9,0 wall 18.85 ms
+ring ctx=4000 rep=1 cfg=0,-1,0 wall 47.86 ms
+ring ctx=4000 rep=1 cfg=8,-1,0 wall 21.42 ms
+ring ctx=4000 rep=1 cfg=12,-1,0 wall 20.19 ms
+ring ctx=4000 rep=1 cfg=16,-1,0 wall 19.50 ms
+ring ctx=4000 rep=1 cfg=4,9,0 wall 20.80 ms
+ring ctx=4000 rep=1 cfg=6,9,0 wall 19.91 ms
+ring ctx=4000 rep=1 cfg=8,9,0 wall 20.20 ms
+ring ctx=4000 rep=1 cfg=12,9,0 wall 20.71 ms
+ring ctx=4000 rep=2 cfg=0,-1,0 wall 47.89 ms
+ring ctx=4000 rep=2 cfg=8,-1,0 wall 21.43 ms
+ring ctx=4000 rep=2 cfg=12,-1,0 wall 20.18 ms
+ring ctx=4000 rep=2 cfg=16,-1,0 wall 19.50 ms
+ring ctx=4000 rep=2 cfg=4,9,0 wall 20.83 ms
+ring ctx=4000 rep=2 cfg=6,9,0 wall 19.90 ms
+ring ctx=4000 rep=2 cfg=8,9,0 wall 20.18 ms
+ring ctx=4000 rep=2 cfg=12,9,0 wall 20.71 ms
+ring ctx=4000 rep=3 cfg=0,-1,0 wall 47.90 ms
+ring ctx=4000 rep=3 cfg=8,-1,0 wall 21.43 ms
+ring ctx=4000 rep=3 cfg=12,-1,0 wall 20.18 ms
+ring ctx=4000 rep=3 cfg=16,-1,0 wall 19.51 ms
+ring ctx=4000 rep=3 cfg=4,9,0 wall 20.81 ms
+ring ctx=4000 rep=3 cfg=6,9,0 wall 19.92 ms
+ring ctx=4000 rep=3 cfg=8,9,0 wall 20.20 ms
+ring ctx=4000 rep=3 cfg=12,9,0 wall 20.73 ms
+RINGDONE

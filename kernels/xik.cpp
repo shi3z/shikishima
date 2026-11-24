@@ -2006,7 +2006,7 @@ void k_kv(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
   });
 }
 
-template <int VW>
+template <int VW, int UNR = -1, int ABL = 0>
 void k_attn_w(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
   const float *q = c->qb, *r = c->rb, *sink = c->sinkb, *gate = c->gateb;
   const float *kc = c->kcache[slot], *vc = c->vcache[slot];
@@ -2058,30 +2058,79 @@ void k_attn_w(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos
       den = reduce_over_group(g, den, plus<float>()) + sycl::exp(-mx);
       group_barrier(g);
       float o = 0.f;
-      if (VW > 0) {  // identical accumulation order (j ascending, one rounded multiply + add each); VW loads are issued before the VW adds
+      // ABL (timing-only ablations, wrong numbers): bit0 = lg[] value from a register expression instead of the SLM read, bit1 = V value
+      // from a register expression instead of the global load.  ABL=0 is the real kernel.
+#define XA_LG(jj) ((ABL & 1) ? (float)((jj) & 7) * 0.125f : lg[jj])
+#define XA_VV(kpp) ((ABL & 2) ? (float)((kpp) & 15) * 0.01f + (float)tid * 1e-3f : vc[(local ? ((kpp) % RING) : (kpp)) * KVD + kvh * HD + tid])
+#define XA_SERIAL_BODY { int kp = lo + j; o += XA_LG(j) * XA_VV(kp); }
+      // accumulation order is j ascending with one rounded multiply and one rounded add per key in every variant
+      if constexpr (VW > 0) {
         int j = 0;
-        for (; j + VW <= nk; j += VW) {
-          float vv8[VW > 0 ? VW : 1];
+        if constexpr (UNR == 9) {  // two-stage ring: block k+1 is loaded into the second register set while block k is accumulated
+          float va[VW], vb[VW];
+          if (j + VW <= nk) {
 #pragma unroll
-          for (int u = 0; u < VW; u++) {
-            int kp = lo + j + u;
-            size_t slotpos = local ? (kp % RING) : kp;
-            vv8[u] = vc[slotpos * KVD + kvh * HD + tid];
+            for (int u = 0; u < VW; u++) va[u] = XA_VV(lo + u);
           }
+          for (; j + 2 * VW <= nk; j += 2 * VW) {
 #pragma unroll
-          for (int u = 0; u < VW; u++) o += lg[j + u] * vv8[u];
+            for (int u = 0; u < VW; u++) vb[u] = XA_VV(lo + j + VW + u);
+#pragma unroll
+            for (int u = 0; u < VW; u++) o += XA_LG(j + u) * va[u];
+            if (j + 3 * VW <= nk) {
+#pragma unroll
+              for (int u = 0; u < VW; u++) va[u] = XA_VV(lo + j + 2 * VW + u);
+            }
+#pragma unroll
+            for (int u = 0; u < VW; u++) o += XA_LG(j + VW + u) * vb[u];
+          }
+          if (j + VW <= nk) {
+#pragma unroll
+            for (int u = 0; u < VW; u++) o += XA_LG(j + u) * va[u];
+            j += VW;
+          }
+        } else if constexpr (UNR == 0) {
+#pragma nounroll
+          for (; j + VW <= nk; j += VW) {
+            float vv8[VW];
+#pragma unroll
+            for (int u = 0; u < VW; u++) vv8[u] = XA_VV(lo + j + u);
+#pragma unroll
+            for (int u = 0; u < VW; u++) o += XA_LG(j + u) * vv8[u];
+          }
+        } else if constexpr (UNR == 4) {
+#pragma unroll 4
+          for (; j + VW <= nk; j += VW) {
+            float vv8[VW];
+#pragma unroll
+            for (int u = 0; u < VW; u++) vv8[u] = XA_VV(lo + j + u);
+#pragma unroll
+            for (int u = 0; u < VW; u++) o += XA_LG(j + u) * vv8[u];
+          }
+        } else {
+          for (; j + VW <= nk; j += VW) {
+            float vv8[VW];
+#pragma unroll
+            for (int u = 0; u < VW; u++) vv8[u] = XA_VV(lo + j + u);
+#pragma unroll
+            for (int u = 0; u < VW; u++) o += XA_LG(j + u) * vv8[u];
+          }
         }
-        for (; j < nk; j++) {
-          int kp = lo + j;
-          size_t slotpos = local ? (kp % RING) : kp;
-          o += lg[j] * vc[slotpos * KVD + kvh * HD + tid];
+        for (; j < nk; j++) XA_SERIAL_BODY
+      } else {
+        if constexpr (UNR == 0) {
+#pragma nounroll
+          for (int j = 0; j < nk; j++) XA_SERIAL_BODY
+        } else if constexpr (UNR == 4) {
+#pragma unroll 4
+          for (int j = 0; j < nk; j++) XA_SERIAL_BODY
+        } else {
+          for (int j = 0; j < nk; j++) XA_SERIAL_BODY
         }
-      } else
-      for (int j = 0; j < nk; j++) {
-        int kp = lo + j;
-        size_t slotpos = local ? (kp % RING) : kp;
-        o += lg[j] * vc[slotpos * KVD + kvh * HD + tid];
       }
+#undef XA_LG
+#undef XA_VV
+#undef XA_SERIAL_BODY
       o /= den;
       float gt = sigmoidf(gate[(size_t)t * QD + hh * HD + tid]);
       out[(size_t)t * QD + hh * HD + tid] = rbf(o * gt);
@@ -2090,18 +2139,21 @@ void k_attn_w(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos
 }
 
 void k_attn(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
-  static const int vw = getenv("XIK_ATTN") ? atoi(getenv("XIK_ATTN")) : 0;  // V prefetch width (0 = original loop)
-  switch (vw) {
-    case 1: return k_attn_w<1>(c, lw, slot, local, T, pos0);
-    case 2: return k_attn_w<2>(c, lw, slot, local, T, pos0);
-    case 4: return k_attn_w<4>(c, lw, slot, local, T, pos0);
-    case 8: return k_attn_w<8>(c, lw, slot, local, T, pos0);
-    case 12: return k_attn_w<12>(c, lw, slot, local, T, pos0);
-    case 16: return k_attn_w<16>(c, lw, slot, local, T, pos0);
-    case 24: return k_attn_w<24>(c, lw, slot, local, T, pos0);
-    case 32: return k_attn_w<32>(c, lw, slot, local, T, pos0);
-    default: return k_attn_w<0>(c, lw, slot, local, T, pos0);
-  }
+  // XIK_ATTN = V prefetch width VW (0 = original loop, default 8); XIK_ATTN_UNR = outer-loop unroll (-1 compiler default, 0 none, 4 forced x4);
+  // XIK_ATTN_ABL = timing-only ablation bits (1 no SLM read, 2 no V load) -- wrong numbers, benchmark only.
+  // Default (measured fastest at every context, output bit-identical): VW=8 loads issued ahead, outer loop unrolled x4.  XIK_ATTN=0 = original loop.
+  static const int vw = getenv("XIK_ATTN") ? atoi(getenv("XIK_ATTN")) : 8;
+  static const int unr = getenv("XIK_ATTN_UNR") ? atoi(getenv("XIK_ATTN_UNR")) : (getenv("XIK_ATTN") ? -1 : 4);
+  static const int abl = getenv("XIK_ATTN_ABL") ? atoi(getenv("XIK_ATTN_ABL")) : 0;
+#define KA(V, U, A) if (vw == V && unr == U && abl == A) return k_attn_w<V, U, A>(c, lw, slot, local, T, pos0);
+#define KAU(V) KA(V, -1, 0) KA(V, 0, 0) KA(V, 4, 0)
+  KAU(0) KAU(1) KAU(8)
+  KA(2, -1, 0) KA(4, -1, 0) KA(12, -1, 0) KA(16, -1, 0) KA(24, -1, 0) KA(32, -1, 0) KA(12, 0, 0) KA(16, 0, 0) KA(32, 0, 0)
+  KA(4, 9, 0) KA(6, 9, 0) KA(8, 9, 0) KA(12, 9, 0)
+  KA(0, -1, 1) KA(0, -1, 2) KA(0, -1, 3) KA(1, -1, 1) KA(1, -1, 2) KA(1, -1, 3) KA(8, 0, 1) KA(8, 0, 2) KA(8, 0, 3)
+#undef KAU
+#undef KA
+  throw std::runtime_error("unsupported XIK_ATTN / XIK_ATTN_UNR / XIK_ATTN_ABL combination");
 }
 
 // ------------------------------------------------------------------- MoE
