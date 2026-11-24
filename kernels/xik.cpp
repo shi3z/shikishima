@@ -2923,6 +2923,61 @@ void k_act(xik_ctx *c, int npairs, int nks) {
   });
 }
 
+// k_cvt_f16 + k_group in one launch (work-group 0 builds the expert groups, the others convert the activations)
+void k_cvt_group(xik_ctx *c, const float *x, sycl::half *y, size_t n, int np, int maxper) {
+  const int32_t *ridx = c->ridx;
+  int32_t *ecnt = c->ecnt, *elist = c->elist, *act = c->act_e, *nact = c->nact, *desc = c->desc;
+  int maxslots = std::min(NE, np);
+  const size_t ncvt = (n + NE - 1) / NE;
+  c->q.parallel_for(nd_range<1>((ncvt + 1) * NE, NE), [=](nd_item<1> it) {
+    int e = it.get_local_id(0);
+    auto g = it.get_group();
+    const size_t wg = it.get_group(0);
+    if (wg != 0) { size_t i = (wg - 1) * NE + e; if (i < n) y[i] = (sycl::half)x[i]; return; }
+    int cnt = 0;
+    for (int p = 0; p < np; p++)
+      if (ridx[p] == e) elist[(size_t)e * maxper + cnt++] = p;
+    ecnt[e] = cnt;
+    int flag = cnt > 0 ? 1 : 0;
+    int pos = exclusive_scan_over_group(g, flag, plus<int>());
+    if (flag) {
+      act[pos] = e;
+      int32_t *d = desc + pos * 16;
+      d[0] = e;
+      d[1] = cnt;
+      for (int i = 0; i < 8; i++) d[2 + i] = elist[(size_t)e * maxper + (i < cnt ? i : 0)];
+    }
+    int tot = reduce_over_group(g, flag, plus<int>());
+    if (e == 0) nact[0] = tot;
+    for (int j = tot + e; j < maxslots; j += NE) desc[j * 16 + 1] = 0;
+  });
+}
+static int fuse2_mask() { static const int v = getenv("XIK_FUSE2") ? atoi(getenv("XIK_FUSE2")) : 3; return v; }
+// T == 1: k_moe_combine + the MLP short conv (+ residual) in one launch; same arithmetic, the conv history is written by the thread that owns the channel
+void k_combine_conv(xik_ctx *c, int nks, const ConvArgs &a) {
+  const float *y = c->yp_part, *w = c->rwt;
+  float *out = c->moe_o;
+  const size_t stride = (size_t)TOPK * D;
+  c->q.parallel_for(range<1>((size_t)D), [=](id<1> id) {
+    const int d = (int)id[0];
+    float s = 0.f;
+    for (int k = 0; k < TOPK; k++) {
+      float yy = 0.f;
+      for (int q = 0; q < nks; q++) yy += y[q * stride + (size_t)k * D + d];
+      s += rbf(yy) * w[k];
+    }
+    const float xv = rbf(s);
+    out[d] = xv;
+    float acc = 0.f;
+    for (int lag = 0; lag < 4; lag++) {
+      const float cin = lag == 0 ? xv : a.state[(size_t)(3 - lag) * a.C + d];
+      acc += bf2f(a.wst[(size_t)d * 4 + (3 - lag)]) * cin;
+    }
+    const float v = rbf((acc + xv) / a.denom);
+    a.out[d] = a.add_to ? a.add_to[d] + v : v;
+    if (a.state_new) { a.state_new[d] = a.state[(size_t)1 * a.C + d]; a.state_new[a.C + d] = a.state[(size_t)2 * a.C + d]; a.state_new[2 * a.C + d] = xv; }
+  });
+}
 void k_moe_combine(xik_ctx *c, int T, int nks) {
   if (abl_mask() & 16) return;
   const float *y = c->yp_part, *w = c->rwt;
@@ -4780,8 +4835,8 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
       k_act(c, np, 1);
       expert_fp8<false>(c, lw, c->act, FI, c->yp_part, D, c->ridx, np, D, FI);
     } else {
-      if (!fr) { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
-      k_group(c, np, T); }
+      if (!fr) { if (fuse2_mask() & 1 && !(abl_mask())) k_cvt_group(c, c->in[0], c->x16_in, (size_t)T * D, np, T); else { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
+      k_group(c, np, T); } }
       int slots = std::min(NE, np);
       nks = fp8_ks();
       moe_fp8g(c, lw.w13, lw.w13_s, c->x16_in, D, true, T, slots, 2 * FI, D, c->gu_part, 2 * FI, (size_t)np * 2 * FI);
@@ -4792,8 +4847,8 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   } else {
     int mcfg = (c->moe_cfg >= 0) ? c->moe_cfg : 1;  // one K split for every T: results must not depend on the verify width
     nks = MOE_CFGS[mcfg].ks;
-    if (!fr) { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
-    k_group(c, np, T); }
+    if (!fr) { if (fuse2_mask() & 1 && !(abl_mask())) k_cvt_group(c, c->in[0], c->x16_in, (size_t)T * D, np, T); else { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
+    k_group(c, np, T); } }
     int slots = std::min(NE, np);
     if (lw.w3_13) moe_w3g(c, lw.w13, lw.w13_s, c->x16_in, D, true, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
     else moe_fp4g(c, mcfg, lw.w13, lw.w13_s, c->x16_in, D, true, lw.w13_amax, lw.w13_den, T, slots, 2 * FI, D, c->gu_part,
@@ -4804,11 +4859,10 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     else moe_fp4g(c, mcfg, lw.w2, lw.w2_s, c->x16_act, FI, false, lw.w2_amax, lw.w2_den, T, slots, D, FI, c->yp_part,
              (size_t)np * D, D);
   }
-  k_moe_combine(c, T, nks);
-  phase(c, P_MOE_W2);
   {
     ConvArgs a{c->moe_o, st_old + 6 * KVD + 3 * D, st_new ? st_new + 6 * KVD + 3 * D : nullptr, f.cur, f.cur, D, T, lw.mlp_conv, nullptr, nullptr, 0, 2.2360679775f};
-    k_conv(c, a);
+    if (T == 1 && (fuse2_mask() & 2) && !abl_mask()) { k_combine_conv(c, nks, a); phase(c, P_MOE_W2); }
+    else { k_moe_combine(c, T, nks); phase(c, P_MOE_W2); k_conv(c, a); }
   }
   if (!c->defer) c->cpar[slot] = 1 - par;
   c->kb = kb0; c->vb = vb0; c->ao2 = ao0; c->moe_o = mo0;
