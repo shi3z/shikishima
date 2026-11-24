@@ -2921,6 +2921,40 @@ void k_sigmoid_inplace(xik_ctx *c, float *x, size_t n) {
 void k_softcap_argmax(xik_ctx *c, int rows) {
   float *lg = c->logits;
   int32_t *am = c->am_d;
+  static const bool two = !getenv("XIK_ARGMAX2") || atoi(getenv("XIK_ARGMAX2")) != 0;
+  if (two && rows <= 64) {
+    // two launches: 64 work-groups per row each softcap a slice of the vocabulary (in place) and keep (max, lowest index); then one group per row picks the global
+    // maximum with the lowest index (same result as the single-group kernel, including ties)
+    constexpr int NW = 64, WGS = 256;
+    static float *pv = nullptr; static int32_t *pi = nullptr;
+    if (!pv) { pv = sycl::malloc_device<float>(64 * NW, c->q.q); pi = sycl::malloc_device<int32_t>(64 * NW, c->q.q); }
+    float *pv_ = pv; int32_t *pi_ = pi;
+    c->q.parallel_for(nd_range<1>((size_t)rows * NW * WGS, WGS), [=](nd_item<1> it) {
+      int grp = it.get_group(0), l = it.get_local_id(0);
+      int r = grp / NW, w = grp % NW;
+      auto g = it.get_group();
+      float best = -3.0e38f; int bi = VOCAB_U;
+      for (int i = w * WGS + l; i < VOCAB; i += NW * WGS) {
+        float v = softcap(lg[(size_t)r * VOCAB + i], FINAL_CAP);
+        lg[(size_t)r * VOCAB + i] = v;
+        if (i < VOCAB_U && v > best) { best = v; bi = i; }
+      }
+      float m = reduce_over_group(g, best, maximum<float>());
+      int cand = (best == m) ? bi : VOCAB_U;
+      int idx = reduce_over_group(g, cand, minimum<int>());
+      if (l == 0) { pv_[r * NW + w] = m; pi_[r * NW + w] = idx; }
+    });
+    c->q.parallel_for(nd_range<1>((size_t)rows * NW, NW), [=](nd_item<1> it) {
+      int r = it.get_group(0), l = it.get_local_id(0);
+      auto g = it.get_group();
+      float v = pv_[r * NW + l]; int i = pi_[r * NW + l];
+      float m = reduce_over_group(g, v, maximum<float>());
+      int cand = (v == m) ? i : VOCAB_U;
+      int idx = reduce_over_group(g, cand, minimum<int>());
+      if (l == 0) am[r] = idx;
+    });
+    return;
+  }
   c->q.parallel_for(nd_range<1>((size_t)rows * 1024, 1024), [=](nd_item<1> it) {
     int r = it.get_group(0), l = it.get_local_id(0);
     auto g = it.get_group();
