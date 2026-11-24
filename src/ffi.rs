@@ -26,6 +26,11 @@ unsafe extern "C" {
     pub fn xik_bench_moe(c: *mut XikCtx, layer: c_int, kind: c_int, cfg: c_int, t: c_int, iters: c_int, us: *mut f64, bytes: *mut f64) -> c_int;
     pub fn xik_bench_fp4var(c: *mut XikCtx, var: c_int, na: c_int, rot: c_int, iters: c_int, us: *mut f64, dur: *mut f64) -> c_int;
     pub fn xik_route_dump(c: *mut XikCtx, path: *const std::os::raw::c_char) -> c_int;
+    pub fn xik_test_ctl(c: *mut XikCtx) -> c_int;
+    pub fn xik_tanh_dump(c: *mut XikCtx, path: *const std::os::raw::c_char) -> c_int;
+    pub fn xik_bench_w4(c: *mut XikCtx, rows: c_int, k: c_int, ksd: c_int, iters: c_int, check: c_int, us: *mut f64, err: *mut f64) -> c_int;
+    pub fn xik_actstats_dump(c: *mut XikCtx, path: *const std::os::raw::c_char) -> c_int;
+    pub fn xik_probe_dpas(c: *mut XikCtx) -> c_int;
     pub fn xik_bench_launch(c: *mut XikCtx, n: c_int, kind: c_int) -> f64;
     pub fn xik_prof_rec(c: *mut XikCtx, on: c_int);
     pub fn xik_prof_tag(c: *mut XikCtx, tag: c_int);

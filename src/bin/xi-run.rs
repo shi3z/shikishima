@@ -191,6 +191,7 @@ fn main() {
         let wall = t.elapsed().as_secs_f64() * 1e3 / n as f64;
         let after = e.prof_us();
         if let Ok(p) = std::env::var("XIK_ROUTE_DUMP") { e.route_dump(&p).unwrap(); }
+        if let Ok(p) = std::env::var("XIK_TANH_DUMP") { e.tanh_dump(&p).unwrap(); }
         eprintln!("T=1 step: wall {:.2} ms | host submit finished at {:.2} ms | complete at {:.2} ms (in-forward timers)", wall, (after[14] - before[14]) / n as f64 / 1e3, (after[15] - before[15]) / n as f64 / 1e3);
         return;
     }
@@ -252,6 +253,18 @@ fn main() {
         }
         return;
     }
+    if a.iter().any(|x| x == "--test-ctl") { e.test_ctl().unwrap(); return; }
+    if a.iter().any(|x| x == "--bench-w4") {
+        for (name, rows, k, ksd) in [("q   3072x2304", 3072, 2304, 12), ("k   1024x2304", 1024, 2304, 12), ("wo  2304x3072", 2304, 3072, 16), ("gate3072x2304", 3072, 2304, 12), ("head201024x2304", 201024, 2304, 12)] {
+            for kd in [ksd] {
+                let (us, err) = e.bench_w4(rows, k, kd, 300, true).unwrap();
+                let bytes = rows as f64 * k as f64 / 2.0 + rows as f64 * (k / 64) as f64 * 2.0;
+                eprintln!("W4A16 {name} KSD={kd}: {us:8.1} us  {:6.2} MB  {:6.1} GB/s  max rel err vs host {err:.2e}", bytes / 1e6, bytes / us / 1e3);
+            }
+        }
+        return;
+    }
+    if a.iter().any(|x| x == "--probe-dpas") { e.probe_dpas(); return; }
     if a.iter().any(|x| x == "--bench-launch") {
         eprintln!("empty kernel      : {:.2} us/launch (back to back, in-order queue)", e.bench_launch(4000, 1));
         eprintln!("1-WG rmsnorm (T=1): {:.2} us/launch", e.bench_launch(4000, 0));
@@ -368,6 +381,8 @@ fn main() {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         vd.sort_by(|a, b| a.partial_cmp(b).unwrap());
         pf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if let Ok(p) = std::env::var("XIK_TANH_DUMP") { e.tanh_dump(&p).unwrap(); }
+        if let Ok(p) = std::env::var("XIK_ACT_STATS_DUMP") { e.actstats_dump(&p).unwrap(); }
         eprintln!("{} {n} tok x{reps}: median {:.2} min {:.2} max {:.2} tok/s (wall, prefill included) | decode-only median {:.2} | prefill {} tok {:.0} ms", if hybrid { "hybrid" } else if spec { "dspark" } else { "plain" }, v[v.len() / 2], v[0], v[v.len() - 1], vd[vd.len() / 2], ids.len(), pf[pf.len() / 2] * 1e3);
         return;
     }

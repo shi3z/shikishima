@@ -1,0 +1,13 @@
+== code TV=0: TF n=256 top1 1.000 | draft-top1 in target-top5 1.000 | target-top1 in draft-top5 1.000 | KL(t||d) 0.0000 nats/token TF margin(target top1-top2) quantiles 10/50/90 = 1.89/10.19/14.95; margin>=2.0: 230 tokens, agree 1.000 
+   free: FREE n=256 first_divergence=256 positionwise_match=1.000 
+== history TV=0: TF n=256 top1 1.000 | draft-top1 in target-top5 1.000 | target-top1 in draft-top5 1.000 | KL(t||d) 0.0001 nats/token TF margin(target top1-top2) quantiles 10/50/90 = 0.38/3.22/8.74; margin>=2.0: 157 tokens, agree 1.000 
+   free: FREE n=256 first_divergence=110 positionwise_match=0.434 
+== prose TV=0: TF n=256 top1 1.000 | draft-top1 in target-top5 1.000 | target-top1 in draft-top5 1.000 | KL(t||d) 0.0002 nats/token TF margin(target top1-top2) quantiles 10/50/90 = 0.33/2.54/10.23; margin>=2.0: 134 tokens, agree 1.000 
+   free: FREE n=256 first_divergence=256 positionwise_match=1.000 
+== repeat TV=0: TF n=256 top1 1.000 | draft-top1 in target-top5 1.000 | target-top1 in draft-top5 1.000 | KL(t||d) 0.0002 nats/token TF margin(target top1-top2) quantiles 10/50/90 = 0.63/6.22/8.07; margin>=2.0: 206 tokens, agree 1.000 
+   free: FREE n=256 first_divergence=256 positionwise_match=1.000 
+== edit_py TV=0: TF n=256 top1 1.000 | draft-top1 in target-top5 1.000 | target-top1 in draft-top5 1.000 | KL(t||d) 0.0001 nats/token TF margin(target top1-top2) quantiles 10/50/90 = 4.21/7.83/9.52; margin>=2.0: 250 tokens, agree 1.000 
+   free: FREE n=256 first_divergence=256 positionwise_match=1.000 
+== jsonl TV=0: TF n=256 top1 1.000 | draft-top1 in target-top5 1.000 | target-top1 in draft-top5 1.000 | KL(t||d) 0.0004 nats/token TF margin(target top1-top2) quantiles 10/50/90 = 1.84/7.71/9.22; margin>=2.0: 228 tokens, agree 1.000 
+   free: FREE n=256 first_divergence=256 positionwise_match=1.000 
+TFCDONE

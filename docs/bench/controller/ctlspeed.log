@@ -1,0 +1,11 @@
+ctlspeed rep=1 cfg=[XIK_CTL_FUSED=0] wall 16.07 ms
+ctlspeed rep=1 cfg=[XIK_CTL_FUSED=1 XIK_CTL_TANH=0] wall 15.20 ms
+ctlspeed rep=2 cfg=[XIK_CTL_FUSED=0] wall 16.06 ms
+ctlspeed rep=2 cfg=[XIK_CTL_FUSED=1 XIK_CTL_TANH=0] wall 15.19 ms
+ctlspeed rep=3 cfg=[XIK_CTL_FUSED=0] wall 16.06 ms
+ctlspeed rep=3 cfg=[XIK_CTL_FUSED=1 XIK_CTL_TANH=0] wall 15.20 ms
+ctlspeed rep=4 cfg=[XIK_CTL_FUSED=0] wall 16.07 ms
+ctlspeed rep=4 cfg=[XIK_CTL_FUSED=1 XIK_CTL_TANH=0] wall 15.20 ms
+ctlspeed rep=5 cfg=[XIK_CTL_FUSED=0] wall 16.06 ms
+ctlspeed rep=5 cfg=[XIK_CTL_FUSED=1 XIK_CTL_TANH=0] wall 15.20 ms
+CTLSPEEDDONE

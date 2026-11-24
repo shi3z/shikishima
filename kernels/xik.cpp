@@ -17,6 +17,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <random>
+#include <sycl/ext/intel/math.hpp>
 #include "xik.h"
 
 using namespace sycl;
@@ -260,6 +262,7 @@ void gemv_bf16_t(queue &q, const uint16_t *W, const float *X, int ldx, float *Y,
 // fusion of that group could save.  1 loop controllers, 2 attention-residual mixes, 4 norms, 8 short convs, 16 MoE glue (cvt/act/combine; k_group stays so
 // the expert descriptors are valid), 32 router gemv, 64 q/r clip + kv store, 128 synthetic routing (use it in EVERY ablation run so the expert access pattern is identical).
 static int abl_mask() { static const int v = getenv("XIK_ABL") ? atoi(getenv("XIK_ABL")) : 0; return v; }
+static int expert_lws() { static const int v = getenv("XIK_LWS") ? atoi(getenv("XIK_LWS")) : 16; return v; }  // work-group size of the expert kernels (16 = default); smaller groups spread 1152 threads more evenly over the Xe cores
 void gemv_bf16_old(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, int T,
                bool round_out) {
   if (abl_mask() & 32) return;
@@ -1164,7 +1167,7 @@ void moe_fp4g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
   uint64_t *const ts = LEAN ? nullptr : g_ts;
   static const unsigned perm_m = getenv("XIK_PERM") ? (unsigned)atoi(getenv("XIK_PERM")) : 1;  // diagnostic: gid -> task bijection
   const unsigned pm = LEAN ? 1u : perm_m;
-  c->q.parallel_for(nd_range<1>(nthreads, 16), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+  c->q.parallel_for(nd_range<1>(nthreads, expert_lws()), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
     using namespace es;
     size_t hw_gid = it.get_global_id(0);
     size_t gid = pm == 1 ? hw_gid : (hw_gid * pm) % (it.get_global_range(0));
@@ -1556,9 +1559,9 @@ void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
   };
   if constexpr (G256) {
     sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
-    c->q.parallel_for(nd_range<1>(nthreads, 16), props, kernel);
+    c->q.parallel_for(nd_range<1>(nthreads, expert_lws()), props, kernel);
   } else {
-    c->q.parallel_for(nd_range<1>(nthreads, 16), kernel);
+    c->q.parallel_for(nd_range<1>(nthreads, expert_lws()), kernel);
   }
 }
 void moe_fp8g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper,
@@ -1810,6 +1813,12 @@ void k_mix_t(xik_ctx *c, const MixArgs &a, int T) {
 
 void k_mix(xik_ctx *c, const MixArgs &a, int T) {
   if (abl_mask() & 2) return;
+  if (abl_mask() & 2048) {  // ablation: same launch, trivial work (copy of the newest block to every output) -> separates launch/boundary cost from the mix work
+    const float *src = a.st[a.ns - 1]; float *o0 = a.out[0], *o1 = a.out[1], *o2 = a.out[2], *o3 = a.out[3]; const int nq = a.nq;
+    c->q.parallel_for(nd_range<1>((size_t)T * D, 256), [=](nd_item<1> it) {
+      size_t i = it.get_global_id(0); float v = src[i]; o0[i] = v; if (nq > 1) o1[i] = v; if (nq > 2) o2[i] = v; if (nq > 3) o3[i] = v; });
+    return;
+  }
 #define MIXCASE(S, Q) if (a.ns == S && a.nq == Q) return k_mix_t<S, Q>(c, a, T);
   MIXCASE(2, 1) MIXCASE(3, 1) MIXCASE(4, 1) MIXCASE(5, 1)
   MIXCASE(2, 3) MIXCASE(3, 3) MIXCASE(4, 3) MIXCASE(5, 3)
@@ -1899,7 +1908,59 @@ void k_blend_t(xik_ctx *c, const BlendArgs &a, int T) {
     for (int i = 0; i < 9; i++) a.out[k][(size_t)t * D + l + i * 256] = rbf(v[i] * inv * bf2f(a.nw[k][l + i * 256]));
   });
 }
-void k_blend(xik_ctx *c, const BlendArgs &a, int T) { if (a.n == 1) k_blend_t<1>(c, a, T); else k_blend_t<3>(c, a, T); }
+// ---- tanh-input statistics (XIK_TANH_HIST=1): histograms of the controller gate inputs f and g (the arguments of tanh in k_blend) over every
+// logical visit of a run.  Observation only: the statistics kernel reads f and g after k_blend has been enqueued; results are unchanged.
+// Layout per tensor (0 = f "forget", 1 = g "gain"): lin[2048] |x| in steps of 1/256 below 8, mid[64] steps of 1/4 in [8,24), expo[256] float exponent field,
+// cnt[8] = {n, negative, zero, nonfinite, |x|>=19.06 (saturation), |x|<2^-12, min key, max key}; ord[48][4] = {n, sum|x| (x1e3 fixed), max|x| key, n(|x|>=19.06)}.
+struct ThHist { uint32_t lin[2048], mid[64], expo[256], cnt[8], ord[48][4]; };
+static ThHist *g_th = nullptr;   // device, [2]
+static int g_th_ctr = 0;
+static bool th_on() { static const bool v = getenv("XIK_TANH_HIST") && atoi(getenv("XIK_TANH_HIST")); return v; }
+static inline uint32_t th_key(float x) { uint32_t b = sycl::bit_cast<uint32_t>(x); return (b & 0x80000000u) ? ~b : (b | 0x80000000u); }  // monotone float -> uint
+static void th_record(xik_ctx *c, const BlendArgs &a, int T) {
+  if (!g_th) { g_th = sycl::malloc_device<ThHist>(2, c->q.q); c->q.memset(g_th, 0, 2 * sizeof(ThHist)).wait(); uint32_t init[2] = {0xFFFFFFFFu, 0u}; for (int t = 0; t < 2; t++) { c->q.memcpy(&g_th[t].cnt[6], &init[0], 4).wait(); c->q.memcpy(&g_th[t].cnt[7], &init[1], 4).wait(); } }
+  const int ord = g_th_ctr++ % 48;
+  ThHist *H = g_th;
+  for (int k = 0; k < a.n; k++)
+    for (int tsr = 0; tsr < 2; tsr++) {
+      const float *x = tsr ? a.g[k] : a.f[k];
+      c->q.parallel_for(range<1>((size_t)T * D), [=](id<1> id) {
+        float v = x[id[0]]; float av = sycl::fabs(v); uint32_t bits = sycl::bit_cast<uint32_t>(av);
+        ThHist &h = H[tsr];
+        using AR = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>;
+        AR(h.cnt[0]).fetch_add(1);
+        if (v < 0.f) AR(h.cnt[1]).fetch_add(1);
+        if (v == 0.f) AR(h.cnt[2]).fetch_add(1);
+        if (!(av < 3.0e38f)) AR(h.cnt[3]).fetch_add(1);
+        if (av >= 19.06f) AR(h.cnt[4]).fetch_add(1);
+        if (av < 2.44140625e-4f) AR(h.cnt[5]).fetch_add(1);
+        if (av < 8.0f) AR(h.lin[(int)(av * 256.f)]).fetch_add(1); else if (av < 24.f) AR(h.mid[(int)((av - 8.f) * 4.f)]).fetch_add(1);
+        AR(h.expo[(bits >> 23) & 255]).fetch_add(1);
+        uint32_t key = th_key(v);
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(h.cnt[6]).fetch_min(key);
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(h.cnt[7]).fetch_max(key);
+        AR(h.ord[ord][0]).fetch_add(1);
+        AR(h.ord[ord][1]).fetch_add((uint32_t)(sycl::fmin(av, 1000.f) * 1000.f));
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(h.ord[ord][2]).fetch_max(bits);
+        if (av >= 19.06f) AR(h.ord[ord][3]).fetch_add(1);
+      });
+    }
+}
+extern "C" int xik_tanh_dump(xik_ctx *c, const char *path) {
+  try {
+    c->q.wait();
+    if (!g_th) return 0;
+    std::vector<ThHist> h(2); c->q.memcpy(h.data(), g_th, 2 * sizeof(ThHist)).wait();
+    FILE *f = fopen(path, "wb"); if (!f) throw std::runtime_error("cannot write tanh histogram");
+    fwrite(h.data(), sizeof(ThHist), 2, f); fclose(f);
+    fprintf(stderr, "tanh histogram: %u values per tensor written to %s\n", h[0].cnt[0], path);
+    return 0;
+  } catch (std::exception &e) { g_err = e.what(); return 1; }
+}
+void k_blend(xik_ctx *c, const BlendArgs &a, int T) {
+  if (a.n == 1) k_blend_t<1>(c, a, T); else k_blend_t<3>(c, a, T);
+  if (th_on()) th_record(c, a, T);
+}
 
 // ------------------------------------------------------------- short conv
 // Depthwise causal conv over [3 state | T chunk], taps lag 0..3, fp32, bf16 output.
@@ -2470,6 +2531,67 @@ static void require_aligned(const void *p, size_t a, const char *what) {
   }
 }
 
+// ---- activation statistics (XIK_ACT_STATS=1): mean square of every dense-weight input channel over all visits/tokens of a run (for activation-aware quantisation)
+struct ActSt { float *s[24][4]; float cnt[24][4]; float *head = nullptr; float hcnt = 0; bool init = false; };
+static ActSt g_as;
+static bool as_on() { static const bool v = getenv("XIK_ACT_STATS") && atoi(getenv("XIK_ACT_STATS")); return v; }
+static void as_rec(xik_ctx *c, int layer, int kind, const float *x, int K, int T) {  // kind 0..2 = in[0..2], 3 = attn_o, 4 = head input
+  if (!g_as.init) { memset(&g_as, 0, sizeof g_as); g_as.init = true; }
+  float *&acc = kind == 4 ? g_as.head : g_as.s[layer][kind];
+  if (!acc) { acc = sycl::malloc_device<float>(K, c->q.q); c->q.memset(acc, 0, K * 4).wait(); }
+  if (kind == 4) g_as.hcnt += T; else g_as.cnt[layer][kind] += T;
+  float *a = acc;
+  c->q.parallel_for(range<1>(K), [=](id<1> i) { float t = 0.f; for (int r = 0; r < T; r++) { float v = x[(size_t)r * K + i[0]]; t += v * v; } a[i[0]] += t; });
+}
+extern "C" int xik_actstats_dump(xik_ctx *c, const char *path) {
+  try {
+    c->q.wait(); if (!g_as.init) return 0;
+    FILE *f = fopen(path, "wb"); if (!f) throw std::runtime_error("cannot write activation statistics");
+    const int Ks[4] = {D, D, D, QD};
+    for (int l = 0; l < 24; l++) for (int k = 0; k < 4; k++) {
+      std::vector<float> h(Ks[k], 0.f); if (g_as.s[l][k]) c->q.memcpy(h.data(), g_as.s[l][k], Ks[k] * 4).wait();
+      float n = g_as.cnt[l][k]; fwrite(&n, 4, 1, f); fwrite(h.data(), 4, Ks[k], f);
+    }
+    std::vector<float> h(D, 0.f); if (g_as.head) c->q.memcpy(h.data(), g_as.head, D * 4).wait();
+    fwrite(&g_as.hcnt, 4, 1, f); fwrite(h.data(), 4, D, f); fclose(f);
+    fprintf(stderr, "activation statistics -> %s\n", path); return 0;
+  } catch (std::exception &e) { g_err = e.what(); return 1; }
+}
+// Quality simulation of group-wise int4 weights (XIK_W4SIM=group size, XIK_W4MASK bits: 1 q/k/v/r/gate, 2 wo, 4 head, XIK_W4ASYM=1 asymmetric (zero point),
+// XIK_W4OBJ: 0 plain min/max, 1 clipping search by squared error, 2 clipping search by activation-weighted squared error (XIK_ACT_STATS_FILE)): the bf16
+// weights are replaced in place by (q - zp) * scale, scale = fp16, rounded back to bf16.  Run in the bf16 dense mode; this is the error an int4 kernel with the
+// same grouping sees (plus the bf16 rounding of the product).
+static void k_w4sim(xik_ctx *c, uint16_t *w, int rows, int K, int G, int asym, int obj, const float *h) {
+  const int ng = K / G;
+  c->q.parallel_for(range<1>((size_t)rows * ng), [=](id<1> id) {
+    size_t r = id[0] / ng; int g = (int)(id[0] % ng);
+    uint16_t *p = w + r * K + (size_t)g * G;
+    const float *hh = h ? h + (size_t)g * G : nullptr;
+    float amax = 0.f, lo = 1e30f, hi = -1e30f;
+    for (int i = 0; i < G; i++) { float x = bf2f(p[i]); amax = sycl::fmax(amax, sycl::fabs(x)); lo = sycl::fmin(lo, x); hi = sycl::fmax(hi, x); }
+    lo = sycl::fmin(lo, 0.f); hi = sycl::fmax(hi, 0.f);
+    float bs = 0.f, bz = 8.f, be = 1e30f;
+    const int ncand = obj ? 12 : 1;
+    for (int cdt = 0; cdt < ncand; cdt++) {
+      float sc, zp;
+      const float shrink = 1.f - 0.04f * cdt;  // 1.00 .. 0.56 of the full range
+      if (asym) { sc = (float)(sycl::half)((hi - lo) * shrink / 15.f); if (sc == 0.f) continue; zp = sycl::fmin(15.f, sycl::fmax(0.f, sycl::rint(-lo * shrink / sc))); }
+      else { sc = (float)(sycl::half)(amax * shrink / 7.5f); if (sc == 0.f) continue; zp = 8.f; }
+      float e = 0.f;
+      for (int i = 0; i < G; i++) {
+        float x = bf2f(p[i]); float q = sycl::fmin(15.f, sycl::fmax(0.f, sycl::rint(x / sc) + zp)); float d = x - (q - zp) * sc;
+        e += (obj == 2 && hh ? hh[i] : 1.f) * d * d;
+      }
+      if (e < be) { be = e; bs = sc; bz = zp; }
+    }
+    if (bs == 0.f) return;
+    for (int i = 0; i < G; i++) {
+      float x = bf2f(p[i]); float q = sycl::fmin(15.f, sycl::fmax(0.f, sycl::rint(x / bs) + bz));
+      float y = (q - bz) * bs;
+      uint32_t u = sycl::bit_cast<uint32_t>(y); u += 0x7FFFu + ((u >> 16) & 1u); p[i] = (uint16_t)(u >> 16);
+    }
+  });
+}
 int xik_upload(xik_ctx *c, const char *name, int dtype, const void *src, size_t bytes) {
   try {
     Buf b;
@@ -2500,6 +2622,35 @@ int xik_finalize(xik_ctx *c) {
       uint32_t *nw = (uint32_t *)alloc_expert(c, nb + 64);
       if (!nw) throw std::runtime_error("repack alloc failed: " + name);
       require_aligned(nw, 256, "dense repacked weights");
+      {
+        static const int w4g = getenv("XIK_W4SIM") ? atoi(getenv("XIK_W4SIM")) : 0, w4m = getenv("XIK_W4MASK") ? atoi(getenv("XIK_W4MASK")) : 7;
+        static const int w4a = getenv("XIK_W4ASYM") ? atoi(getenv("XIK_W4ASYM")) : 0, w4o = getenv("XIK_W4OBJ") ? atoi(getenv("XIK_W4OBJ")) : 1;
+        static std::vector<float> st_h[24][4]; static std::vector<float> st_head; static bool st_loaded = false;
+        if (w4g && w4o == 2 && !st_loaded && getenv("XIK_ACT_STATS_FILE")) {  // activation mean squares written by XIK_ACT_STATS runs
+          st_loaded = true; FILE *f = fopen(getenv("XIK_ACT_STATS_FILE"), "rb"); const int Ks[4] = {D, D, D, QD};
+          if (!f) throw std::runtime_error("cannot open XIK_ACT_STATS_FILE");
+          for (int l = 0; l < 24; l++) for (int k = 0; k < 4; k++) { float n; if (fread(&n, 4, 1, f) != 1) throw std::runtime_error("short stats file"); st_h[l][k].resize(Ks[k]); if (fread(st_h[l][k].data(), 4, Ks[k], f) != (size_t)Ks[k]) throw std::runtime_error("short stats file"); for (auto &v : st_h[l][k]) v /= std::max(n, 1.f); }
+          float n; st_head.resize(D); if (fread(&n, 4, 1, f) != 1 || fread(st_head.data(), 4, D, f) != (size_t)D) throw std::runtime_error("short stats file"); for (auto &v : st_head) v /= std::max(n, 1.f);
+          fclose(f);
+        }
+        auto has = [&](const char *sub) { return name.find(sub) != std::string::npos; };
+        int bit = (has("attn.wq_du") || has("attn.wk_dv") || has("attn.wv_dv") || has("attn.wr_du") || has("attn.gate_attn")) ? 1 : has("attn.wo_ud") ? 2 : name == "model.llm.unembed.weight" ? 4 : 0;
+        if (w4g && (w4m & bit) && K % w4g == 0) {
+          float *dh = nullptr;
+          if (w4o == 2 && st_loaded) {
+            const float *hp = nullptr; size_t pos = name.find("layers.");
+            int layer = pos == std::string::npos ? -1 : atoi(name.c_str() + pos + 7);
+            if (name == "model.llm.unembed.weight") hp = st_head.data();
+            else if (layer >= 0 && layer < 24) {
+              int kind = has("attn.wo_ud") ? 3 : (has("attn.wk_dv") && !is_local(layer)) ? 1 : (has("attn.wv_dv") && !is_local(layer)) ? 2 : 0;
+              hp = st_h[layer][kind].data();
+            }
+            if (hp) { dh = sycl::malloc_device<float>(K, c->q.q); c->q.memcpy(dh, hp, K * 4).wait(); }
+          }
+          k_w4sim(c, (uint16_t *)it->second.p, rows, K, w4g, w4a, w4o, dh); c->q.wait();
+          if (dh) sycl::free(dh, c->q);
+        }
+      }
       if (want8) {
         float *sc = (float *)malloc_device((size_t)rows_pad * 4 + 64, c->q);
         k_quant_fp8(c, (const uint16_t *)it->second.p, nw, sc, rows, rows_pad, K);
@@ -3088,6 +3239,325 @@ struct Fwd {
   float *pop() { float *p = freel.back(); freel.pop_back(); return p; }
 };
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Fused ESIMD controller tail (T == 1): gain/forget GEMV (same DPAS recipe and summation order as dgemm_t, K = RANK = 64) + tanh + blend + rms norm
+// in one launch with one software grid barrier.  Phase 1: every thread owns two 16-row blocks, computes gain g and forget f of its channels exactly as the
+// GEMV kernel does, forms v = (1 - tanh f) * dest + tanh g * msg and stores v.  Barrier.  Phase 2: every thread recomputes the sum of squares over all
+// 2304 channels in exactly the order of reduce_over_group (per work-item 9 values ascending, then halving trees over a sub-group of 32 and over the 8
+// sub-groups -- verified bit for bit by --test-ctl) and writes rbf(v * rsqrt(ss/D + eps) * w).  tanh is the only part that is not bit-identical:
+// XIK_CTL_TANH selects the variant (0 = exp/inv short sequence, 1 = piecewise polynomial; see ctl_tanh_*).
+// Deadlock safety: 9 work-groups of 8 threads per stream, at most 3 streams (216 threads, far below the 1280 resident hardware threads); the spin is bounded.
+namespace ctlx {
+using namespace sycl::ext::intel::esimd;
+template <int TV>
+ESIMD_INLINE simd<float, 16> th(simd<float, 16> x) {
+  simd<float, 16> ax = abs(x);
+  simd<float, 16> r;
+  if constexpr (TV == 0) {  // B: tanh|x| = 1 - 2/(exp(2|x|)+1), small |x| by the odd Taylor series
+    simd<float, 16> e = exp(ax * 2.0f);
+    r = 1.0f - 2.0f * inv(e + 1.0f);
+    simd<float, 16> x2 = ax * ax;
+    simd<float, 16> sm = ax * (1.0f + x2 * (-0.33333334f + x2 * (0.13333334f + x2 * -0.05396825f)));
+    r.merge(sm, ax < 0.12f);
+    r.merge(simd<float, 16>(1.0f), ax > 9.0f);
+  } else if constexpr (TV == 2) {  // timing-only (WRONG numbers): the cheapest possible stand-in, bounds what any faster tanh could save
+    r = ax * 0.5f;
+  } else {  // C: placeholder = same as B (replaced by the fitted piecewise polynomial)
+    simd<float, 16> e = exp(ax * 2.0f);
+    r = 1.0f - 2.0f * inv(e + 1.0f);
+    simd<float, 16> x2 = ax * ax;
+    simd<float, 16> sm = ax * (1.0f + x2 * (-0.33333334f + x2 * (0.13333334f + x2 * -0.05396825f)));
+    r.merge(sm, ax < 0.12f);
+    r.merge(simd<float, 16>(1.0f), ax > 9.0f);
+  }
+  r.merge(-r, x < 0.0f);
+  return r;
+}
+ESIMD_INLINE simd<int32_t, 8> pack_a(const float *hid, int t, bool fp8) {  // 16 fp32 activations as a DPAS A operand, as dgemm_t does: fp8 weights -> fp16 pairs, bf16 weights -> truncated bf16 pairs
+  simd<float, 16> xv; xv.copy_from(hid + t * 16);
+  if (fp8) {
+    simd<sycl::half, 16> xh = xv;
+    return xh.template bit_cast_view<int32_t>();
+  }
+  simd<uint32_t, 16> xb = xv.template bit_cast_view<uint32_t>();
+  simd<uint32_t, 8> ev = xb.template select<8, 2>(0), od = xb.template select<8, 2>(1);
+  simd<uint32_t, 8> pk = (ev >> 16) | (od & 0xFFFF0000u);
+  return pk.template bit_cast_view<int32_t>();
+}
+// 16 rows, K = 64: four tiles, each its own accumulator from 0 (dgemm_t keeps one tile per thread), summed t0+t1+t2+t3, then (fp8) the per-row scale * 256
+ESIMD_INLINE simd<float, 16> gemv64(const uint32_t *wp, const float *scale, int rb, simd<int32_t, 32> av, simd<int32_t, 32> avh) {
+  simd<float, 16> s = 0.f;
+  if (scale) {
+#pragma unroll
+    for (int t = 0; t < 4; t++) {
+      simd<uint32_t, 64> bq; bq.copy_from(wp + (size_t)t * 64);
+      simd<uint32_t, 128> B;
+#pragma unroll
+      for (int q = 0; q < 4; q++) {
+        simd<uint32_t, 16> xq = bq.template select<16, 1>(16 * q);
+        simd<uint32_t, 16> m0 = xq & 0x00FF00FFu, m1 = (xq >> 8) & 0x00FF00FFu;
+        B.template select<16, 1>(16 * (2 * q)) = ((m0 & 0x007F007Fu) << 7) | ((m0 & 0x00800080u) << 8);
+        B.template select<16, 1>(16 * (2 * q + 1)) = ((m1 & 0x007F007Fu) << 7) | ((m1 & 0x00800080u) << 8);
+      }
+      simd<int32_t, 128> bi = B.template bit_cast_view<int32_t>();
+      simd<int32_t, 8> a8 = avh.template select<8, 1>(8 * t);
+      simd<float, 16> z = 0.f;
+      simd<float, 16> d = xmx::dpas<8, 1, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(z, bi, a8);
+      if (t == 0) s = d; else s += d;
+    }
+    simd<float, 16> sv; sv.copy_from(scale + rb * 16);
+    sv *= 256.0f;
+    s *= sv;
+    return s;
+  }
+#pragma unroll
+  for (int t = 0; t < 4; t++) {
+    simd<uint32_t, 64> t0v, t1v;
+    t0v.copy_from(wp + (size_t)t * 128); t1v.copy_from(wp + (size_t)t * 128 + 64);
+    simd<uint32_t, 128> b; b.template select<64, 1>(0) = t0v; b.template select<64, 1>(64) = t1v;
+    simd<int32_t, 128> bi = b.template bit_cast_view<int32_t>();
+    simd<float, 16> z = 0.f;
+    simd<int32_t, 8> a8 = av.template select<8, 1>(8 * t);
+    simd<float, 16> d = xmx::dpas<8, 1, float, float, int32_t, int32_t, xmx::dpas_argument_type::bf16, xmx::dpas_argument_type::bf16>(z, bi, a8);
+    if (t == 0) s = d; else s += d;
+  }
+  return s;
+}
+ESIMD_INLINE simd<int32_t, 8> pack_v(simd<float, 16> xv, bool fp8) {  // same as pack_a for a register operand
+  if (fp8) { simd<sycl::half, 16> xh = xv; return xh.template bit_cast_view<int32_t>(); }
+  simd<uint32_t, 16> xb = xv.template bit_cast_view<uint32_t>();
+  simd<uint32_t, 8> ev = xb.template select<8, 2>(0), od = xb.template select<8, 2>(1);
+  simd<uint32_t, 8> pk = (ev >> 16) | (od & 0xFFFF0000u);
+  return pk.template bit_cast_view<int32_t>();
+}
+// sum of squares of 2304 values in the exact order of reduce_over_group over 256 work-items x 9 values (see --test-ctl), then rsqrt(ss/D + eps)
+template <int DV = 0>
+ESIMD_INLINE float norm_inv(const float *x, bool coherent) {
+  simd<float, 256> p;
+#pragma unroll
+  for (int i = 0; i < 9; i++) {
+    simd<float, 256> v;
+#pragma unroll
+    for (int q4 = 0; q4 < 4; q4++) {
+      if (coherent) v.template select<64, 1>(64 * q4) = block_load<float, 64>(x + i * 256 + 64 * q4, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+      else v.template select<64, 1>(64 * q4) = block_load<float, 64>(x + i * 256 + 64 * q4);
+    }
+    if (i == 0) p = v * v; else p += v * v;
+  }
+  simd<float, 8> sg;
+#pragma unroll
+  for (int g = 0; g < 8; g++) {
+    simd<float, 16> h = p.template select<16, 1>(32 * g) + p.template select<16, 1>(32 * g + 16);
+    simd<float, 8> h8 = h.template select<8, 1>(0) + h.template select<8, 1>(8);
+    simd<float, 4> h4 = h8.template select<4, 1>(0) + h8.template select<4, 1>(4);
+    simd<float, 2> h2 = h4.template select<2, 1>(0) + h4.template select<2, 1>(2);
+    sg[g] = h2[0] + h2[1];
+  }
+  simd<float, 4> w4 = sg.template select<4, 1>(0) + sg.template select<4, 1>(4);
+  simd<float, 2> w2 = w4.template select<2, 1>(0) + w4.template select<2, 1>(2);
+  const float ss = w2[0] + w2[1];
+  float q;
+  if constexpr (DV == 0) q = ss / (float)D;
+  else if constexpr (DV == 1) q = ss * (1.0f / (float)D);
+  else if constexpr (DV == 2) q = ss * inv(simd<float, 1>((float)D))[0];
+  else q = (ss * 0.00390625f) / 9.0f;  // exact scaling by 2^-8, then /9
+  return rsqrt(simd<float, 1>(q + EPS))[0];
+}
+ESIMD_INLINE simd<int32_t, 128> unpack_fp8(simd<uint32_t, 64> bq) {  // one 16x16 fp8 e4m3 tile -> fp16 bit patterns (value * 2^-8), as dgemm_t
+  simd<uint32_t, 128> B;
+#pragma unroll
+  for (int q = 0; q < 4; q++) {
+    simd<uint32_t, 16> xq = bq.template select<16, 1>(16 * q);
+    simd<uint32_t, 16> m0 = xq & 0x00FF00FFu, m1 = (xq >> 8) & 0x00FF00FFu;
+    B.template select<16, 1>(16 * (2 * q)) = ((m0 & 0x007F007Fu) << 7) | ((m0 & 0x00800080u) << 8);
+    B.template select<16, 1>(16 * (2 * q + 1)) = ((m1 & 0x007F007Fu) << 7) | ((m1 & 0x00800080u) << 8);
+  }
+  return B.template bit_cast_view<int32_t>();
+}
+ESIMD_INLINE simd<float, 16> rbf16(simd<float, 16> x) {
+  simd<uint32_t, 16> u = x.template bit_cast_view<uint32_t>();
+  u += 0x7FFFu + ((u >> 16) & 1u);
+  u &= 0xFFFF0000u;
+  return u.template bit_cast_view<float>();
+}
+}  // namespace ctlx
+
+#define GRID_BARRIER(TARGET)                                                                                                                        \
+  {                                                                                                                                                 \
+    fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();                                                                           \
+    barrier();                                                                                                                                      \
+    if (tid == 0) {                                                                                                                                 \
+      atomic_update<atomic_op::inc, uint32_t, 1>(a.bar, simd<uint32_t, 1>(0));                                                                      \
+      uint32_t spins = 0;                                                                                                                           \
+      while (!(a.dbg & 1) && spins < 200000u) {                                                                                                     \
+        uint32_t cur = atomic_update<atomic_op::add, uint32_t, 1>(a.bar, simd<uint32_t, 1>(0), simd<uint32_t, 1>(0))[0];                            \
+        if (cur >= (TARGET)) break;                                                                                                                 \
+        spins++;                                                                                                                                    \
+      }                                                                                                                                             \
+      if (spins >= 200000u) atomic_update<atomic_op::inc, uint32_t, 1>(a.err, simd<uint32_t, 1>(0));                                              \
+    }                                                                                                                                               \
+    barrier();                                                                                                                                      \
+    fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();                                                                           \
+  }
+#define CTL_STAMP(I) if (a.ts && tid == 0) { simd<uint64_t, 1> tv_ = rdtsc(); a.ts[((size_t)a.tsidx * 54 + wg) * 6 + (I)] = tv_[0]; }
+struct CtlFArgs {
+  const uint32_t *wg[3], *wf[3];
+  const float *sg[3], *sf[3];  // fp8 per-row scales (null = bf16 weights)
+  const float *hid[3], *dest[3], *msg[3];
+  const uint16_t *nw[3];
+  float *out[3], *vbuf[3];
+  uint32_t *bar;
+  uint32_t target;
+  uint32_t *err;
+  int dbg;  // 1: no grid barrier wait (debug)
+  // full fusion (pairnorm + down GEMV in the same launch)
+  const uint32_t *wd[3]; const float *sd[3]; float *hp[3]; float *hdbg[3]; uint32_t base;
+  uint64_t *ts; int tsidx;  // optional per-work-group phase timestamps (XIK_CTL_TS=1): 6 stamps per work-group
+};
+template <int TV, bool FULL = false>
+void k_ctl_fused(xik_ctx *c, const CtlFArgs &a, int n) {
+  const uint32_t nwg = (uint32_t)n * 9;
+  c->q.parallel_for(nd_range<1>((size_t)nwg * 8, 8), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace sycl::ext::intel::esimd;
+    slm_init<64>();
+    const int wg = (int)it.get_group(0), tid = (int)it.get_local_id(0);
+    if (a.dbg & 8) return;  // debug: empty kernel
+    CTL_STAMP(0)
+    const int k = wg / 9, ts = (wg % 9) * 8 + tid;  // thread index within the stream, 0..71
+    simd<int32_t, 32> av, avh;
+    if constexpr (FULL) {
+      // ---- phase 0: pairnorm (recomputed per unit, exact order) + ctl_down GEMV partials.  Unit u = rb * 16 + t16: row block rb of the 64 rank rows,
+      //      tiles 18*t16 .. 18*t16+17 of the 288 K tiles (the K split of dgemm_t with KSD = 16, per = 18).  Partials -> global, barrier, then every
+      //      thread sums the 16 partials of each row block in the order dgemm_t uses, applies scale and bf16 rounding -> hid (registers).
+      const bool fpd = a.sd[k] != nullptr;
+      const int tw = fpd ? 64 : 128;
+      if (ts < 64) {
+        const int rb0 = ts / 16, t16 = ts % 16;  // 16 K-partials of 18 tiles per row block, as dgemm_t (KSD = 16)
+        const float *xseg = (t16 < 8) ? a.dest[k] : a.msg[k];
+        const int off = (t16 & 7) * 288;
+        const float inv_ = ctlx::norm_inv(xseg, false);
+        const uint32_t *wp = a.wd[k] + ((size_t)rb0 * 288 + t16 * 18) * tw;
+        simd<float, 16> acc = 0.f;
+        if (fpd) {
+          simd<uint32_t, 384> cur, nxt;
+#pragma unroll
+          for (int i = 0; i < 6; i++) cur.template select<64, 1>(64 * i) = block_load<uint32_t, 64>(wp + (size_t)i * 64);
+#pragma unroll
+          for (int g3 = 0; g3 < 3; g3++) {
+            if (g3 < 2) {
+#pragma unroll
+              for (int i = 0; i < 6; i++) nxt.template select<64, 1>(64 * i) = block_load<uint32_t, 64>(wp + (size_t)((g3 + 1) * 6 + i) * 64);
+            }
+#pragma unroll
+            for (int i = 0; i < 6; i++) {
+              simd<float, 16> xv; xv.copy_from(xseg + off + 16 * (g3 * 6 + i));
+              xv = ctlx::rbf16(xv * inv_);
+              simd<int32_t, 8> a8 = ctlx::pack_v(xv, true);
+              simd<int32_t, 128> bi = ctlx::unpack_fp8(cur.template select<64, 1>(64 * i));
+              acc = xmx::dpas<8, 1, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(acc, bi, a8);
+            }
+            if (g3 < 2) cur = nxt;
+          }
+        } else {
+          for (int i = 0; i < 18; i++) {
+            simd<uint32_t, 64> t0v, t1v;
+            t0v.copy_from(wp + (size_t)i * 128); t1v.copy_from(wp + (size_t)i * 128 + 64);
+            simd<uint32_t, 128> b2; b2.template select<64, 1>(0) = t0v; b2.template select<64, 1>(64) = t1v;
+            simd<int32_t, 128> bi = b2.template bit_cast_view<int32_t>();
+            simd<float, 16> xv; xv.copy_from(xseg + off + 16 * i);
+            xv = ctlx::rbf16(xv * inv_);
+            simd<int32_t, 8> a8 = ctlx::pack_v(xv, false);
+            acc = xmx::dpas<8, 1, float, float, int32_t, int32_t, xmx::dpas_argument_type::bf16, xmx::dpas_argument_type::bf16>(acc, bi, a8);
+          }
+        }
+        acc.copy_to(a.hp[k] + ts * 16);
+      }
+      CTL_STAMP(1)
+      GRID_BARRIER(a.base + nwg)
+      CTL_STAMP(2)
+#pragma unroll
+      for (int rb = 0; rb < 4; rb++) {
+        simd<float, 16> sum = block_load<float, 16>(a.hp[k] + rb * 256, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+        for (int j = 1; j < 16; j++)
+          sum += block_load<float, 16>(a.hp[k] + rb * 256 + j * 16, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+        if (fpd) { simd<float, 16> sv; sv.copy_from(a.sd[k] + rb * 16); sv *= 256.0f; sum *= sv; }
+        sum = ctlx::rbf16(sum);
+        av.template select<8, 1>(8 * rb) = ctlx::pack_v(sum, false);
+        avh.template select<8, 1>(8 * rb) = ctlx::pack_v(sum, true);
+        if (a.hdbg[k] && ts == 0) sum.copy_to(a.hdbg[k] + rb * 16);
+      }
+    } else {
+#pragma unroll
+      for (int t = 0; t < 4; t++) { av.template select<8, 1>(8 * t) = ctlx::pack_a(a.hid[k], t, false); avh.template select<8, 1>(8 * t) = ctlx::pack_a(a.hid[k], t, true); }
+    }
+    const int tile = a.sg[k] ? 64 : 128;
+    if (a.dbg & 16) return;  // debug: after the A-operand packing only
+    simd<float, 16> vv[2];
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      const int rb = ts + 72 * u;
+      simd<float, 16> g = ctlx::gemv64(a.wg[k] + (size_t)rb * 4 * tile, a.sg[k], rb, av, avh);
+      simd<float, 16> f = ctlx::gemv64(a.wf[k] + (size_t)rb * 4 * tile, a.sf[k], rb, av, avh);
+      simd<float, 16> de, ms;
+      de.copy_from(a.dest[k] + rb * 16); ms.copy_from(a.msg[k] + rb * 16);
+      simd<float, 16> tf = ctlx::th<TV>(f), tg = ctlx::th<TV>(g);
+      simd<float, 16> m1 = (1.0f - tf) * de, m2 = tg * ms;
+      vv[u] = m1 + m2;
+      vv[u].copy_to(a.vbuf[k] + rb * 16);
+    }
+    if (a.dbg & 2) return;  // debug: phase 1 only
+    if (a.dbg & 2) return;  // debug: phase 1 only
+    CTL_STAMP(3)
+    GRID_BARRIER(a.base + (FULL ? 2u : 1u) * nwg)
+    CTL_STAMP(4)
+    // ---- phase 2: sum of squares in the exact order of reduce_over_group
+    simd<float, 256> p;
+    {
+      simd<float, 256> v0;
+#pragma unroll
+      for (int q4 = 0; q4 < 4; q4++)
+        v0.template select<64, 1>(64 * q4) = block_load<float, 64>(a.vbuf[k] + 64 * q4, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+      p = v0 * v0;
+    }
+    for (int i = 1; i < 9; i++) {
+      simd<float, 256> vi;
+#pragma unroll
+      for (int q4 = 0; q4 < 4; q4++)
+        vi.template select<64, 1>(64 * q4) = block_load<float, 64>(a.vbuf[k] + i * 256 + 64 * q4, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+      p += vi * vi;
+    }
+    simd<float, 8> sg;
+#pragma unroll
+    for (int g = 0; g < 8; g++) {
+      simd<float, 16> h = p.template select<16, 1>(32 * g) + p.template select<16, 1>(32 * g + 16);
+      simd<float, 8> h8 = h.template select<8, 1>(0) + h.template select<8, 1>(8);
+      simd<float, 4> h4 = h8.template select<4, 1>(0) + h8.template select<4, 1>(4);
+      simd<float, 2> h2 = h4.template select<2, 1>(0) + h4.template select<2, 1>(2);
+      sg[g] = h2[0] + h2[1];
+    }
+    simd<float, 4> w4 = sg.template select<4, 1>(0) + sg.template select<4, 1>(4);
+    simd<float, 2> w2 = w4.template select<2, 1>(0) + w4.template select<2, 1>(2);
+    const float ss = w2[0] + w2[1];
+    const float inv_ = rsqrt(simd<float, 1>(ss / (float)D + EPS))[0];
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      const int rb = ts + 72 * u;
+      simd<float, 16> vcur;
+      vcur = block_load<float, 16>(a.vbuf[k] + rb * 16, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+      simd<uint16_t, 16> wb; wb.copy_from(a.nw[k] + rb * 16);
+      simd<uint32_t, 16> wu = wb; wu <<= 16;
+      simd<float, 16> w = wu.template bit_cast_view<float>();
+      simd<float, 16> o = ctlx::rbf16(vcur * inv_ * w);
+      o.copy_to(a.out[k] + rb * 16);
+    }
+    CTL_STAMP(5)
+  });
+}
+
+// error statistics of the fused tail against the SYCL k_blend path (XIK_CTL_CHECK=1)
+struct CtlChk { double n = 0, mism = 0, maxabs = 0, maxulp = 0; long calls = 0; };
+static CtlChk g_chk;
+
 // controller blend for n parallel streams: dest[j] (+) msg[j] -> out[j]
 void run_ctl(xik_ctx *c, const LayerW &lw, const int *cid, int n, const float **dest, const float **msg,
              const uint16_t **nw, float **out, int T) {
@@ -3104,10 +3574,94 @@ void run_ctl(xik_ctx *c, const LayerW &lw, const int *cid, int n, const float **
     g2.add(lw.ctl_forget[cid[j]], c->hid3[j], RANK, c->cf3[j], D, D, RANK, false);
     ba.dest[j] = dest[j]; ba.msg[j] = msg[j]; ba.g[j] = c->cg3[j]; ba.f[j] = c->cf3[j]; ba.nw[j] = nw[j]; ba.out[j] = out[j];
   }
-  k_pairnorm(c, pa, T);
   g1.cls = 1;
   g2.cls = 1;
-  gemv_multi(c, g1, T);
+  static const int ctl_mode = getenv("XIK_CTL_FUSED") ? atoi(getenv("XIK_CTL_FUSED")) : 3;  // default 3 (T == 1 only; APPROXIMATE: exp/inv tanh, K-split order of the down GEMV differs by rounding); XIK_CTL_FUSED=0 restores the SYCL controller chain  // 0 off, 1 fused tail, 2 tail + compare, 3 fully fused (pairnorm + down + tail), 4 fully fused + compare
+  static const int ctl_tv = getenv("XIK_CTL_TANH") ? atoi(getenv("XIK_CTL_TANH")) : 0;
+  const bool fused = ctl_mode && T == 1 && n <= 3;
+  const bool full = fused && ctl_mode >= 3;
+  if (!full) {
+    k_pairnorm(c, pa, T);
+    gemv_multi(c, g1, T);
+  }
+  if (fused) {
+    static uint32_t *bar = nullptr, *err = nullptr; static float *vb = nullptr, *chk = nullptr, *hpb = nullptr, *hchk = nullptr; static uint32_t expected = 0;
+    if (!bar) {
+      bar = sycl::malloc_device<uint32_t>(64, c->q.q); err = bar + 32; c->q.memset(bar, 0, 256).wait();
+      vb = sycl::malloc_device<float>(3 * D, c->q.q); chk = sycl::malloc_device<float>(3 * D, c->q.q);
+      hpb = sycl::malloc_device<float>(3 * 128 * 16, c->q.q); hchk = sycl::malloc_device<float>(3 * 64, c->q.q);
+    }
+    const bool check = ctl_mode == 2 || ctl_mode == 4;
+    if (check) {  // reference result (and hid) from the unfused chain
+      if (full) { k_pairnorm(c, pa, T); gemv_multi(c, g1, T); }
+      gemv_multi(c, g2, T); k_blend(c, ba, T);
+    }
+    CtlFArgs fa{};
+    for (int j = 0; j < n; j++) {
+      fa.wg[j] = reinterpret_cast<const uint32_t *>(lw.ctl_gain[cid[j]]); fa.wf[j] = reinterpret_cast<const uint32_t *>(lw.ctl_forget[cid[j]]);
+      fa.wd[j] = reinterpret_cast<const uint32_t *>(lw.ctl_down[cid[j]]);
+      auto look = [&](const void *w) -> const float * { auto fi = g_fp8_scale.find(w); return fi == g_fp8_scale.end() ? nullptr : fi->second; };
+      fa.sg[j] = look(lw.ctl_gain[cid[j]]); fa.sf[j] = look(lw.ctl_forget[cid[j]]); fa.sd[j] = look(lw.ctl_down[cid[j]]);
+      fa.hid[j] = c->hid3[j]; fa.dest[j] = dest[j]; fa.msg[j] = msg[j]; fa.nw[j] = nw[j]; fa.out[j] = check ? chk + (size_t)j * D : out[j]; fa.vbuf[j] = vb + (size_t)j * D;
+      fa.hp[j] = hpb + (size_t)j * 128 * 16; fa.hdbg[j] = (full && check) ? hchk + j * 64 : nullptr;
+    }
+    static uint64_t *tsb = nullptr; static int tscall = 0; static const bool ts_on = getenv("XIK_CTL_TS") && atoi(getenv("XIK_CTL_TS"));
+    static std::vector<int> ts_n;
+    fa.ts = nullptr; fa.tsidx = 0;
+    if (ts_on && full) {
+      if (!tsb) { tsb = sycl::malloc_device<uint64_t>(256 * 54 * 6, c->q.q); c->q.memset(tsb, 0, 256 * 54 * 6 * 8).wait(); }
+      if (tscall < 256) { fa.ts = tsb; fa.tsidx = tscall; ts_n.push_back(n); tscall++; }
+      if (tscall == 256) {
+        tscall++;
+        c->q.wait();
+        std::vector<uint64_t> h(256 * 54 * 6); c->q.memcpy(h.data(), tsb, h.size() * 8).wait();
+        for (int kind = 1; kind <= 3; kind += 2) {
+          double sum[6] = {0, 0, 0, 0, 0, 0}, skew_start = 0, skew_end = 0, wait1 = 0, wait2 = 0; int cnt = 0;
+          for (int ci = 0; ci < 256; ci++) {
+            if (ts_n[ci] != kind) continue;
+            const int nw = kind * 9; uint64_t t0 = ~0ull, mx_s = 0, mn_e = ~0ull, mx_e = 0;
+            for (int w = 0; w < nw; w++) { const uint64_t *r = &h[((size_t)ci * 54 + w) * 6]; t0 = std::min(t0, r[0]); mx_s = std::max(mx_s, r[0]); mn_e = std::min(mn_e, r[5]); mx_e = std::max(mx_e, r[5]); }
+            skew_start += (double)(mx_s - t0); skew_end += (double)(mx_e - mn_e);
+            for (int w = 0; w < nw; w++) { const uint64_t *r = &h[((size_t)ci * 54 + w) * 6];
+              for (int q = 1; q < 6; q++) sum[q] += (double)(r[q] - r[q - 1]); wait1 += 0; }
+            cnt += nw;
+          }
+          if (cnt) { const double tick = 1.0 / 2400.0;  // us per rdtsc tick (about 2.4 GHz)
+            int ncalls = 0; for (int ci = 0; ci < 256; ci++) ncalls += ts_n[ci] == kind;
+            fprintf(stderr, "ctl timeline [%d stream(s), %d calls, per work-group mean, us]: phase0 (pairnorm+down partials) %.2f | wait barrier1 %.2f | hid sum + gain/forget/blend %.2f | wait barrier2 %.2f | norm + store %.2f | total %.2f ; launch skew (last start - first start) %.2f, finish skew %.2f\n",
+              kind, ncalls, sum[1] * tick / cnt, sum[2] * tick / cnt, sum[3] * tick / cnt, sum[4] * tick / cnt, sum[5] * tick / cnt, (sum[1] + sum[2] + sum[3] + sum[4] + sum[5]) * tick / cnt, skew_start * tick / ncalls, skew_end * tick / ncalls); }
+        }
+      }
+    }
+    fa.bar = bar; fa.err = err; fa.dbg = getenv("XIK_CTL_DBG") ? atoi(getenv("XIK_CTL_DBG")) : 0;
+    fa.base = expected; expected += (uint32_t)(full ? 2 : 1) * n * 9;  // the counter is shared by every call: targets are running totals of work-groups
+    if (full) { if (ctl_tv == 2) k_ctl_fused<2, true>(c, fa, n); else k_ctl_fused<0, true>(c, fa, n); }
+    else { if (ctl_tv == 2) k_ctl_fused<2>(c, fa, n); else k_ctl_fused<0>(c, fa, n); }
+    if (check) {
+      c->q.wait();
+      std::vector<float> a_(n * D), b_(n * D), ha(n * 64), hb(n * 64); uint32_t e_ = 0;
+      for (int j = 0; j < n; j++) {
+        c->q.memcpy(a_.data() + (size_t)j * D, out[j], D * 4); c->q.memcpy(b_.data() + (size_t)j * D, chk + (size_t)j * D, D * 4);
+        c->q.memcpy(ha.data() + j * 64, c->hid3[j], 256); if (full) c->q.memcpy(hb.data() + j * 64, hchk + j * 64, 256);
+      }
+      c->q.memcpy(&e_, err, 4); c->q.wait();
+      static double hn = 0, hm = 0;
+      if (full) for (int i = 0; i < n * 64; i++) {
+        hn++; const bool bad = sycl::bit_cast<uint32_t>(ha[i]) != sycl::bit_cast<uint32_t>(hb[i]); hm += bad;
+        static int shown = 0;
+        if (bad && shown < 12) { shown++; fprintf(stderr, "hid mismatch call %ld stream %d row %d: ref %.9g (0x%08x) fused %.9g (0x%08x)\n", g_chk.calls, i / 64, i % 64, ha[i], sycl::bit_cast<uint32_t>(ha[i]), hb[i], sycl::bit_cast<uint32_t>(hb[i])); }
+      }
+      for (int i = 0; i < n * D; i++) {
+        g_chk.n++;
+        uint32_t ua = sycl::bit_cast<uint32_t>(a_[i]), ub = sycl::bit_cast<uint32_t>(b_[i]);
+        if (ua != ub) { g_chk.mism++; double d = std::fabs((double)a_[i] - (double)b_[i]); g_chk.maxabs = std::max(g_chk.maxabs, d);
+          long du = std::labs((long)(ua >> 16) - (long)(ub >> 16)); g_chk.maxulp = std::max(g_chk.maxulp, (double)du); }
+      }
+      if (++g_chk.calls % 480 == 0)
+        fprintf(stderr, "ctl-check [mode %d, tanh variant %d]: %ld calls, %.0f outputs, mismatching %.4f%%, max |diff| %.3e, max diff %.0f bf16-ulp, hid mismatches %.0f / %.0f, barrier timeouts %u\n", ctl_mode, ctl_tv, g_chk.calls, g_chk.n, 100.0 * g_chk.mism / g_chk.n, g_chk.maxabs, g_chk.maxulp, hm, hn, e_);
+    }
+    return;
+  }
   gemv_multi(c, g2, T);
   k_blend(c, ba, T);
 }
@@ -3134,7 +3688,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     a.nq = nq;
     const float *qp = c->attnres_q[layer - 1];
     for (int j = 0; j < nq; j++) { a.qry[j] = qp + (size_t)j * D; a.out[j] = c->mix[j]; }
-    k_mix(c, a, T);
+    if (!(abl_mask() & 256)) k_mix(c, a, T);
     for (int j = 0; j < 3; j++) attn_src[j] = c->mix[local ? 0 : j];
   } else {
     for (int j = 0; j < 3; j++) attn_src[j] = f.cur;
@@ -3165,6 +3719,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     phase(c, P_NORM);
   }
 
+  if (as_on()) { as_rec(c, layer, 0, inp[0], D, T); if (!local) { as_rec(c, layer, 1, inp[1], D, T); as_rec(c, layer, 2, inp[2], D, T); } }
   // ---- projections: one launch
   {
     GArgs g;
@@ -3186,6 +3741,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   phase(c, P_KV);
   k_attn(c, lw, slot, local, T, pos0);
   phase(c, P_ATTN);
+  if (as_on()) as_rec(c, layer, 3, c->attn_o, QD, T);
   static const int ksd_wo = getenv("XIK_KSD_WO") ? atoi(getenv("XIK_KSD_WO")) : 32;
   gemv_bf16(c, lw.wo, c->attn_o, QD, c->ao2, D, D, QD, T, true, ksd_wo, 2);
   phase(c, P_WO);
@@ -3216,7 +3772,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     a.nq = 1;
     a.qry[0] = c->attnres_mlp[layer];
     a.out[0] = c->mix[0];
-    k_mix(c, a, T);
+    if (!(abl_mask() & 512)) k_mix(c, a, T);
   }
   phase(c, P_MIX);
   if (have_msg) {
@@ -3348,7 +3904,7 @@ static void enqueue_body(xik_ctx *c, int T, int rows, bool out_argmax, int pos0)
           a.qry[1] = c->xpass_kvq + (size_t)(2 * ci) * D;     a.out[1] = c->msg[1];  // k
           a.qry[2] = c->xpass_kvq + (size_t)(2 * ci + 1) * D; a.out[2] = c->msg[2];  // v
           a.qry[3] = c->xpass_q + (size_t)(2 * ci + 1) * D;   a.out[3] = c->msg[3];  // mlp
-          k_mix(c, a, T);
+          if (!(abl_mask() & 1024)) k_mix(c, a, T);
           phase(c, P_LOOP);
         }
         capv();
@@ -3364,7 +3920,7 @@ static void enqueue_body(xik_ctx *c, int T, int rows, bool out_argmax, int pos0)
       for (int b = 0; b < f.nb; b++) a.st[b] = f.blk[b];
       a.st[f.nb] = f.cur;
       a.ns = f.nb + 1; a.nq = 1; a.qry[0] = c->attnres_out; a.out[0] = c->mix[0];
-      k_mix(c, a, T);
+      if (!(abl_mask() & 4096)) k_mix(c, a, T);
       NormArgs na{};
       na.n = 1; na.x[0] = c->mix[0]; na.w[0] = c->final_norm; na.out[0] = c->in[0];
       k_wnorm(c, na, T);
@@ -3372,6 +3928,7 @@ static void enqueue_body(xik_ctx *c, int T, int rows, bool out_argmax, int pos0)
     }
     const float *hx = out_argmax ? c->in[0] : c->in[0] + (size_t)(T - 1) * D;
     static const int ksd_head = getenv("XIK_KSD_HEAD") ? atoi(getenv("XIK_KSD_HEAD")) : KSD_DEFAULT;
+    if (as_on()) as_rec(c, 0, 4, hx, D, rows);
     gemv_bf16(c, c->unembed, hx, D, c->logits, VOCAB, VOCAB, D, rows, false, ksd_head, 3);
     k_softcap_argmax(c, rows);
     phase(c, P_HEAD);
@@ -3920,6 +4477,293 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
 }
 
 // Fixed cost of one in-order kernel: n back-to-back tiny kernels (kind 0: 1-WG rmsnorm, 1: empty 1-item kernel).
+
+// ---- controller re-implementation groundwork: which ESIMD math / reduction orders reproduce the SYCL kernels bit for bit?
+extern "C" int xik_test_ctl(xik_ctx *c) {
+  try {
+    std::mt19937 rng(12345);
+    // (1) math functions: sycl::tanh / sycl::rsqrt (as used by k_blend / k_pairnorm) against ESIMD versions
+    const int N = 1 << 20;
+    std::vector<float> hx(N), hr(N);
+    std::uniform_real_distribution<float> ux(-6.f, 6.f), ur(1e-4f, 50.f);
+    for (int i = 0; i < N; i++) { hx[i] = ux(rng); hr[i] = ur(rng); }
+    float *dx = sycl::malloc_device<float>(N, c->q.q), *dr = sycl::malloc_device<float>(N, c->q.q);
+    float *o_th = sycl::malloc_device<float>(N, c->q.q), *o_rs = sycl::malloc_device<float>(N, c->q.q);
+    float *e_th = sycl::malloc_device<float>(N, c->q.q), *e_rs = sycl::malloc_device<float>(N, c->q.q), *e_th_s = sycl::malloc_device<float>(N, c->q.q);
+    c->q.memcpy(dx, hx.data(), N * 4); c->q.memcpy(dr, hr.data(), N * 4); c->q.wait();
+    float *i0 = sycl::malloc_device<float>(N, c->q.q), *i1 = sycl::malloc_device<float>(N, c->q.q), *i2 = sycl::malloc_device<float>(N, c->q.q), *i3 = sycl::malloc_device<float>(N, c->q.q);
+    c->q.parallel_for(range<1>(N), [=](id<1> i) { o_th[i] = sycl::tanh(dx[i]); o_rs[i] = sycl::rsqrt(dr[i]);
+      i0[i] = sycl::ext::intel::math::__imf_tanhf(dx[i]); i1[i] = sycl::ext::intel::math::__imf_tanhf_ha(dx[i]); i2[i] = sycl::ext::intel::math::__imf_tanhf_la(dx[i]); i3[i] = sycl::ext::intel::math::__imf_tanhf_ep(dx[i]); }).wait();
+    {
+      std::vector<float> ref(N), v0(N), v1(N), v2(N), v3(N);
+      c->q.memcpy(ref.data(), o_th, N * 4); c->q.memcpy(v0.data(), i0, N * 4); c->q.memcpy(v1.data(), i1, N * 4); c->q.memcpy(v2.data(), i2, N * 4); c->q.memcpy(v3.data(), i3, N * 4); c->q.wait();
+      size_t k0 = 0, k1 = 0, k2 = 0, k3 = 0;
+      for (int i = 0; i < N; i++) { k0 += ref[i] != v0[i]; k1 += ref[i] != v1[i]; k2 += ref[i] != v2[i]; k3 += ref[i] != v3[i]; }
+      fprintf(stderr, "math  sycl::tanh vs __imf_tanhf / _ha / _la / _ep mismatches: %zu / %zu / %zu / %zu of %d\n", k0, k1, k2, k3, N);
+    }
+    c->q.parallel_for(range<1>(N / 16), [=](id<1> i) SYCL_ESIMD_KERNEL {
+      using namespace es;
+      simd<float, 16> x, r;
+      x.copy_from(dx + i[0] * 16); r.copy_from(dr + i[0] * 16);
+      simd<float, 16> ex = es::exp(x * 2.0f);
+      simd<float, 16> t = (ex - 1.0f) / (ex + 1.0f);  // ESIMD vector tanh from exp (no esimd::tanh exists)
+      t.copy_to(e_th + i[0] * 16);
+      simd<float, 16> rr = es::rsqrt(r);
+      rr.copy_to(e_rs + i[0] * 16);
+      simd<float, 16> ts;  // variant 2: 1 - 2/(exp(2x)+1)
+      ts = 1.0f - 2.0f / (ex + 1.0f);
+      ts.copy_to(e_th_s + i[0] * 16);
+    }).wait();
+    std::vector<float> a(N), b(N), cc(N), d(N), e(N);
+    c->q.memcpy(a.data(), o_th, N * 4); c->q.memcpy(b.data(), e_th, N * 4); c->q.memcpy(cc.data(), e_th_s, N * 4);
+    c->q.memcpy(d.data(), o_rs, N * 4); c->q.memcpy(e.data(), e_rs, N * 4); c->q.wait();
+    size_t m1 = 0, m2 = 0, m3 = 0;
+    for (int i = 0; i < N; i++) { m1 += a[i] != b[i]; m2 += a[i] != cc[i]; m3 += d[i] != e[i]; }
+    fprintf(stderr, "math  tanh: SYCL tanh vs ESIMD (e-1)/(e+1) mismatches %zu / %d | SYCL tanh vs ESIMD 1-2/(e+1) %zu / %d | rsqrt: SYCL vs es::rsqrt %zu / %d\n", m1, N, m2, N, m3, N);
+    {  // ESIMD tanh candidates against the SYCL reference, split by |x| range
+      constexpr int NV = 6;
+      float *ov[NV]; for (int v = 0; v < NV; v++) ov[v] = sycl::malloc_device<float>(N, c->q.q);
+      c->q.parallel_for(range<1>(N / 16), [=](id<1> i) SYCL_ESIMD_KERNEL {
+        using namespace es;
+        simd<float, 16> x; x.copy_from(dx + i[0] * 16);
+        simd<float, 16> ax = es::abs(x), sg = x / ax;   // sign via division is fine for the test (x != 0)
+        simd<float, 16> em = es::exp(ax * -2.0f), ep = es::exp(ax * 2.0f);
+        simd<float, 16> t[NV];
+        t[0] = (1.0f - em) / (1.0f + em);
+        t[1] = 1.0f - 2.0f / (ep + 1.0f);
+        t[2] = 1.0f - 2.0f * es::inv(ep + 1.0f);
+        t[3] = (ep - 1.0f) / (ep + 1.0f);
+        t[4] = (1.0f - em) * es::inv(1.0f + em);
+        t[5] = 2.0f / (1.0f + em) - 1.0f;
+        for (int v = 0; v < NV; v++) { simd<float, 16> r = t[v] * sg; r.copy_to(ov[v] + i[0] * 16); }
+      }).wait();
+      std::vector<float> ref(N), cv(N); c->q.memcpy(ref.data(), o_th, N * 4).wait();
+      for (int v = 0; v < NV; v++) {
+        c->q.memcpy(cv.data(), ov[v], N * 4).wait();
+        size_t mm[3] = {0, 0, 0}, tot[3] = {0, 0, 0};
+        for (int i = 0; i < N; i++) { float ax = std::fabs(hx[i]); int r = ax < 0.5f ? 0 : ax < 2.0f ? 1 : 2; tot[r]++; mm[r] += ref[i] != cv[i]; }
+        fprintf(stderr, "tanh variant %d: mismatches |x|<0.5: %zu/%zu, 0.5..2: %zu/%zu, >2: %zu/%zu\n", v, mm[0], tot[0], mm[1], tot[1], mm[2], tot[2]);
+      }
+    }
+    {  // pairnorm: SYCL k_pairnorm against the ESIMD recomputation (norm_inv + rbf) on random "residual-like" vectors
+      const int NV = 512;
+      std::vector<float> hv((size_t)NV * 2 * D);
+      std::normal_distribution<float> nd(0.f, 1.f);
+      for (int v = 0; v < NV; v++) { float sc = std::exp(nd(rng) * 1.5f); for (int i = 0; i < 2 * D; i++) hv[(size_t)v * 2 * D + i] = nd(rng) * sc; }
+      float *dv = sycl::malloc_device<float>(hv.size(), c->q.q), *pr = sycl::malloc_device<float>(hv.size(), c->q.q), *pe = sycl::malloc_device<float>(hv.size(), c->q.q);
+      c->q.memcpy(dv, hv.data(), hv.size() * 4).wait();
+      size_t bad = 0, badv = 0, tot = 0;
+      for (int v = 0; v < NV; v++) {
+        PairArgs pa{}; pa.n = 1; pa.dest[0] = dv + (size_t)v * 2 * D; pa.msg[0] = dv + (size_t)v * 2 * D + D; pa.pair[0] = pr + (size_t)v * 2 * D;
+        k_pairnorm(c, pa, 1);
+      }
+      c->q.wait();
+      std::vector<float> a1(hv.size()), a2(hv.size());
+      c->q.memcpy(a1.data(), pr, hv.size() * 4).wait();
+      auto run_dv = [&](auto tag) {
+        constexpr int DVv = decltype(tag)::value;
+        c->q.parallel_for(nd_range<1>((size_t)NV * 2, 1), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+          using namespace es;
+          int g = (int)it.get_group(0); const float *x = dv + (size_t)g * D;
+          float inv = ctlx::norm_inv<DVv>(x, false);
+          for (int i = 0; i < D / 16; i++) { simd<float, 16> xv; xv.copy_from(x + i * 16); simd<float, 16> o = ctlx::rbf16(xv * inv); o.copy_to(pe + (size_t)g * D + i * 16); }
+        }).wait();
+        c->q.memcpy(a2.data(), pe, hv.size() * 4).wait();
+        bad = badv = tot = 0;
+        for (int v = 0; v < NV; v++) { size_t bv = 0; for (int i = 0; i < 2 * D; i++) bv += a1[(size_t)v * 2 * D + i] != a2[(size_t)v * 2 * D + i]; bad += bv; badv += bv > 0; tot += 2 * D; }
+        fprintf(stderr, "pairnorm: SYCL vs ESIMD recomputation, ss/D variant %d: %zu / %zu outputs differ, %zu / %d vectors have a difference\n", DVv, bad, tot, badv, NV);
+      };
+      run_dv(std::integral_constant<int, 0>{}); run_dv(std::integral_constant<int, 1>{}); run_dv(std::integral_constant<int, 2>{}); run_dv(std::integral_constant<int, 3>{});
+    }
+    // (2) reduce_over_group(plus) over 256 work-items: find the summation order
+    const int NT = 4096;
+    std::vector<float> hp((size_t)NT * 256); std::uniform_real_distribution<float> up(0.f, 4.f);
+    for (auto &v : hp) v = up(rng) * up(rng);
+    float *dp = sycl::malloc_device<float>(hp.size(), c->q.q), *dres = sycl::malloc_device<float>(NT, c->q.q);
+    c->q.memcpy(dp, hp.data(), hp.size() * 4).wait();
+    c->q.parallel_for(nd_range<1>((size_t)NT * 256, 256), [=](nd_item<1> it) {
+      float v = dp[it.get_global_id(0)];
+      float r = reduce_over_group(it.get_group(), v, plus<float>());
+      if (it.get_local_id(0) == 0) dres[it.get_group(0)] = r;
+    }).wait();
+    std::vector<float> gres(NT); c->q.memcpy(gres.data(), dres, NT * 4).wait();
+    // candidate orders (host, IEEE fp32)
+    auto cand = [&](int S, int intra, int inter, const float *p) {
+      std::vector<float> sg(256 / S);
+      for (int g = 0; g < 256 / S; g++) {
+        float v[64]; for (int l = 0; l < S; l++) v[l] = p[g * S + l];
+        if (intra == 0) { for (int off = S / 2; off >= 1; off >>= 1) for (int l = 0; l < off; l++) v[l] = v[l] + v[l + off]; sg[g] = v[0]; }          // halving tree
+        else if (intra == 1) { for (int off = 1; off < S; off <<= 1) for (int l = 0; l + off < S; l += 2 * off) v[l] = v[l] + v[l + off]; sg[g] = v[0]; }  // adjacent pairs first
+        else { float s = v[0]; for (int l = 1; l < S; l++) s = s + v[l]; sg[g] = s; }                                                                      // sequential
+      }
+      float r;
+      if (inter == 0) { r = sg[0]; for (size_t g = 1; g < sg.size(); g++) r = r + sg[g]; }                                                                 // sequential over sub-groups
+      else if (inter == 1) { std::vector<float> w = sg; for (size_t off = w.size() / 2; off >= 1; off >>= 1) for (size_t g = 0; g < off; g++) w[g] = w[g] + w[g + off]; r = w[0]; }
+      else { std::vector<float> w = sg; for (size_t off = 1; off < w.size(); off <<= 1) for (size_t g = 0; g + off < w.size(); g += 2 * off) w[g] = w[g] + w[g + off]; r = w[0]; }
+      return r;
+    };
+    const char *in_n[3] = {"halving", "adjacent", "sequential"}, *out_n[3] = {"sequential", "halving", "adjacent"};
+    int bestm = -1; std::string bestn;
+    for (int S : {16, 32})
+      for (int intra = 0; intra < 3; intra++)
+        for (int inter = 0; inter < 3; inter++) {
+          int match = 0;
+          for (int t = 0; t < NT; t++) match += cand(S, intra, inter, hp.data() + (size_t)t * 256) == gres[t];
+          if (match > bestm) { bestm = match; bestn = "subgroup " + std::to_string(S) + ", intra " + in_n[intra] + ", inter " + out_n[inter]; }
+          if (match == NT) fprintf(stderr, "reduce: EXACT match subgroup %d intra %s inter %s (%d / %d)\n", S, in_n[intra], out_n[inter], match, NT);
+        }
+    fprintf(stderr, "reduce: best candidate %s matches %d / %d groups\n", bestn.c_str(), bestm, NT);
+    return 0;
+  } catch (std::exception &ex) { g_err = ex.what(); return 1; }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// W4A16 dense GEMV feasibility kernel (benchmark): int4 weights (nibble - 8) x fp16 activations on the fp16 DPAS, per-(row, 64-K group) fp16 scale applied to the
+// group partial sum.  Layout per 16-row block and 32 K: 256 B = 64 dwords [q][n] (q = 0..3, n = row): dword (q,n) holds K = 8q..8q+7 of row n with nibble j of the
+// K-chunk at bit 4*(j/2) (j even) or 16 + 4*(j/2) (j odd), so that ((x >> 4p) & 0x000F000F) | 0x64006400 is the half2 (1024 + k_{2p}, 1024 + k_{2p+1}): one
+// shift, one and, one or per output dword, then one half subtraction (-1032) turns it into (nibble - 8) exactly.  Scales: [row block][64-K group][16 rows] fp16.
+template <int KSD>
+void w4_gemv(xik_ctx *c, const uint32_t *W, const uint16_t *S, const float *X, float *Y, int rows, int K) {
+  const int nrb = rows / 16, ngrp = K / 64, per = ngrp / KSD;  // groups per thread (K split over KSD threads)
+  c->q.parallel_for(nd_range<1>((size_t)nrb * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    slm_init<KSD * 16 * 4>();
+    const int rb = (int)it.get_group(0), tid = (int)it.get_local_id(0);
+    const int g0 = tid * per;
+    const uint32_t *wp = W + ((size_t)rb * (K / 32) + (size_t)g0 * 2) * 64;
+    const uint16_t *sp = S + ((size_t)rb * ngrp + g0) * 16;
+    simd<float, 16> acc = 0.f;
+    simd<uint32_t, 128> cur, nxt;
+    cur.template select<64, 1>(0) = block_load<uint32_t, 64>(wp);
+    cur.template select<64, 1>(64) = block_load<uint32_t, 64>(wp + 64);
+    simd<uint16_t, 16> scur = block_load<uint16_t, 16>(sp);
+    for (int g = 0; g < per; g++) {
+      simd<uint16_t, 16> snx;
+      if (g + 1 < per) {
+        nxt.template select<64, 1>(0) = block_load<uint32_t, 64>(wp + (size_t)(g + 1) * 128);
+        nxt.template select<64, 1>(64) = block_load<uint32_t, 64>(wp + (size_t)(g + 1) * 128 + 64);
+        snx = block_load<uint16_t, 16>(sp + (size_t)(g + 1) * 16);
+      }
+      simd<float, 16> ag = 0.f;
+#pragma unroll
+      for (int t = 0; t < 4; t++) {  // four 16-K tiles of this group
+        simd<uint32_t, 128> B;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          simd<uint32_t, 16> x = cur.template select<16, 1>(64 * (t / 2) + 16 * (2 * (t % 2) + h));
+#pragma unroll
+          for (int pp = 0; pp < 4; pp++) {
+            simd<uint32_t, 16> v = (pp == 0 ? x : (x >> (4 * pp))) & 0x000F000Fu;
+            B.template select<16, 1>(16 * (4 * h + pp)) = v | 0x64006400u;
+          }
+        }
+        simd<sycl::half, 256> bh = B.template bit_cast_view<sycl::half>();
+        bh -= (sycl::half)1032.0f;
+        simd<int32_t, 128> bi = bh.template bit_cast_view<int32_t>();
+        simd<float, 16> xv; xv.copy_from(X + (size_t)(g0 + g) * 64 + t * 16);
+        simd<sycl::half, 16> xh = xv;
+        simd<int32_t, 8> a8 = xh.template bit_cast_view<int32_t>();
+        simd<float, 16> z = 0.f;
+        ag = xmx::dpas<8, 1, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(t == 0 ? z : ag, bi, a8);
+      }
+      simd<sycl::half, 16> sh = scur.template bit_cast_view<sycl::half>();
+      simd<float, 16> sf = sh;
+      acc += ag * sf;
+      if (g + 1 < per) { cur = nxt; scur = snx; }
+    }
+    slm_block_store<float, 16>(tid * 64, acc);
+    barrier();
+    if (tid == 0) {
+      simd<float, 16> sum = slm_block_load<float, 16>(0);
+      for (int j = 1; j < KSD; j++) sum += slm_block_load<float, 16>(j * 64);
+      sum.copy_to(Y + rb * 16);
+    }
+  });
+}
+extern "C" int xik_bench_w4(xik_ctx *c, int rows, int K, int ksd, int iters, int check, double *out_us, double *out_err) {
+  try {
+    const int nrb = rows / 16, ngrp = K / 64;
+    std::mt19937 rng(7);
+    std::vector<uint8_t> nib((size_t)rows * K);
+    for (auto &v : nib) v = rng() & 15;
+    std::vector<uint32_t> hw((size_t)nrb * (K / 32) * 64);
+    // pack: block b (32 K) of row block rb: dword (q, n) holds K = 8q..8q+7 of row n, nibble j at bit 4*(j/2) (even j) or 16 + 4*(j/2) (odd j)
+    for (int rb = 0; rb < nrb; rb++)
+      for (int b = 0; b < K / 32; b++)
+        for (int q = 0; q < 4; q++)
+          for (int n = 0; n < 16; n++) {
+            uint32_t d = 0;
+            for (int j = 0; j < 8; j++) {
+              uint32_t v = nib[(size_t)(rb * 16 + n) * K + b * 32 + 8 * q + j];
+              d |= (j & 1) ? (v << (16 + 4 * (j / 2))) : (v << (4 * (j / 2)));
+            }
+            hw[((size_t)rb * (K / 32) + b) * 64 + q * 16 + n] = d;
+          }
+    std::vector<uint16_t> hs((size_t)nrb * ngrp * 16); std::vector<float> sf(hs.size());
+    for (size_t i = 0; i < hs.size(); i++) { sycl::half h = (sycl::half)(0.01f + 0.0001f * (float)(rng() % 100)); hs[i] = sycl::bit_cast<uint16_t>(h); sf[i] = (float)h; }
+    std::vector<float> hx(K); for (auto &v : hx) v = ((int)(rng() % 2001) - 1000) / 1000.f;
+    uint32_t *dw = sycl::aligned_alloc_device<uint32_t>(256, hw.size(), c->q.q); uint16_t *ds = sycl::aligned_alloc_device<uint16_t>(256, hs.size(), c->q.q);
+    float *dx = sycl::aligned_alloc_device<float>(256, K, c->q.q), *dy = sycl::aligned_alloc_device<float>(256, rows, c->q.q);
+    c->q.memcpy(dw, hw.data(), hw.size() * 4); c->q.memcpy(ds, hs.data(), hs.size() * 2); c->q.memcpy(dx, hx.data(), K * 4); c->q.wait();
+    auto run = [&]() { if (ksd == 12) w4_gemv<12>(c, dw, ds, dx, dy, rows, K); else if (ksd == 16) w4_gemv<16>(c, dw, ds, dx, dy, rows, K); else if (ksd == 9) w4_gemv<9>(c, dw, ds, dx, dy, rows, K); else if (ksd == 6) w4_gemv<6>(c, dw, ds, dx, dy, rows, K); else if (ksd == 4) w4_gemv<4>(c, dw, ds, dx, dy, rows, K); else w4_gemv<8>(c, dw, ds, dx, dy, rows, K); };
+    run(); c->q.wait();
+    *out_err = 0;
+    if (check) {
+      std::vector<float> hy(rows); c->q.memcpy(hy.data(), dy, rows * 4).wait();
+      double me = 0, mr = 0;
+      for (int r = 0; r < rows; r += 7) {
+        double ref = 0;
+        for (int g = 0; g < ngrp; g++) { double gs = 0; for (int k = 0; k < 64; k++) gs += ((double)nib[(size_t)r * K + g * 64 + k] - 8.0) * (double)(float)(sycl::half)hx[g * 64 + k]; ref += gs * sf[((size_t)(r / 16) * ngrp + g) * 16 + (r % 16)]; }
+        me = std::max(me, std::fabs(ref - hy[r])); mr = std::max(mr, std::fabs(ref));
+      }
+      *out_err = me / (mr + 1e-30);
+    }
+    // cold weights: rotate over several copies so the weights are not L2-resident
+    const int NC = (int)std::max<size_t>(6, (size_t)(80u << 20) / (hw.size() * 4) + 1); std::vector<uint32_t *> cw(NC); cw[0] = dw;
+    for (int i = 1; i < NC; i++) { cw[i] = sycl::aligned_alloc_device<uint32_t>(256, hw.size(), c->q.q); c->q.memcpy(cw[i], hw.data(), hw.size() * 4); }
+    c->q.wait();
+    auto run2 = [&](int i) { uint32_t *w = cw[i % NC]; if (ksd == 12) w4_gemv<12>(c, w, ds, dx, dy, rows, K); else if (ksd == 16) w4_gemv<16>(c, w, ds, dx, dy, rows, K); else if (ksd == 9) w4_gemv<9>(c, w, ds, dx, dy, rows, K); else if (ksd == 6) w4_gemv<6>(c, w, ds, dx, dy, rows, K); else if (ksd == 4) w4_gemv<4>(c, w, ds, dx, dy, rows, K); else w4_gemv<8>(c, w, ds, dx, dy, rows, K); };
+    for (int i = 0; i < 20; i++) run2(i);
+    c->q.wait();
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; i++) run2(i);
+    c->q.wait();
+    *out_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+    return 0;
+  } catch (std::exception &e) { g_err = e.what(); return 1; }
+}
+
+// ---- native integer DPAS semantics probe: which (src1, src2) precisions exist on this device and how many K elements one instruction consumes
+template <sycl::ext::intel::esimd::xmx::dpas_argument_type PB, sycl::ext::intel::esimd::xmx::dpas_argument_type PA, int KB, int KA>  // KB / KA: elements per dword of B / A
+static void probe_dpas(xik_ctx *c, const char *name, int kexp, std::mt19937 &rng) {
+  try {
+    // B: 8 dwords x 16 lanes, A: 8 dwords (R = 1).  Fill with small random bytes; the host reference assumes the K dimension runs over the elements of the 8 dwords of
+    // lane n (B) and of A in order, element e of dword d = K index d * KB + e (B) / d * KA + e (A) when KB == KA.
+    std::vector<uint32_t> hb(128), ha(8);
+    for (auto &v : hb) v = rng(); for (auto &v : ha) v = rng();
+    uint32_t *db = sycl::malloc_device<uint32_t>(128, c->q.q), *da = sycl::malloc_device<uint32_t>(8, c->q.q); int32_t *dr = sycl::malloc_device<int32_t>(16, c->q.q);
+    c->q.memcpy(db, hb.data(), 512); c->q.memcpy(da, ha.data(), 32); c->q.memset(dr, 0, 64).wait();
+    c->q.parallel_for(nd_range<1>(1, 1), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+      using namespace es;
+      simd<int32_t, 128> b; simd<int32_t, 8> a; simd<int32_t, 16> z = 0;
+      b.copy_from(reinterpret_cast<const int32_t *>(db)); a.copy_from(reinterpret_cast<const int32_t *>(da));
+      simd<int32_t, 16> r = sycl::ext::intel::esimd::xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, PB, PA>(z, b, a);
+      r.copy_to(dr);
+    }).wait();
+    std::vector<int32_t> r(16); c->q.memcpy(r.data(), dr, 64).wait();
+    fprintf(stderr, "dpas %-8s compiled and ran, result[0..3] = %d %d %d %d (expected K per instruction %d)\n", name, r[0], r[1], r[2], r[3], kexp);
+    (void)KB; (void)KA;
+  } catch (std::exception &e) { fprintf(stderr, "dpas %s: %s\n", name, e.what()); }
+}
+extern "C" int xik_probe_dpas(xik_ctx *c) {
+  std::mt19937 rng(3);
+  probe_dpas<sycl::ext::intel::esimd::xmx::dpas_argument_type::s8, sycl::ext::intel::esimd::xmx::dpas_argument_type::s8, 4, 4>(c, "s8 x s8", 32, rng);
+  probe_dpas<sycl::ext::intel::esimd::xmx::dpas_argument_type::s4, sycl::ext::intel::esimd::xmx::dpas_argument_type::s4, 8, 8>(c, "s4 x s4", 64, rng);
+  probe_dpas<sycl::ext::intel::esimd::xmx::dpas_argument_type::u4, sycl::ext::intel::esimd::xmx::dpas_argument_type::u4, 8, 8>(c, "u4 x u4", 64, rng);
+  probe_dpas<sycl::ext::intel::esimd::xmx::dpas_argument_type::u8, sycl::ext::intel::esimd::xmx::dpas_argument_type::s8, 4, 4>(c, "u8 x s8", 32, rng);
+  return 0;
+}
+
 extern "C" double xik_bench_launch(xik_ctx *c, int n, int kind) {
   const uint16_t *w = c->final_norm;
   NormArgs na{};
