@@ -379,6 +379,8 @@ struct W4Args {
   void add(const W4Alt &w, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool rnd) { s[n] = W4Seg{w.w, w.sz, X, Y, rows, K, ldx, ldy, (int)rnd, total_wg}; total_wg += (rows + 15) / 16; n++; }
 };
 static void w4z_run(xik_ctx *c, const W4Args &a, int T);
+static bool w4n_on();
+static bool w4n_use(int T);
 struct DSeg {
   const uint32_t *Wt;
   const float *X;
@@ -822,7 +824,7 @@ void gemv_multi(xik_ctx *c, const GArgs &a, int T) {
   d.cls = a.cls;
   W4Args wa;
   for (int i = 0; i < a.n; i++) {
-    auto alt = (T <= 16 && !g_w4alt.empty()) ? g_w4alt.find(a.s[i].W) : g_w4alt.end();
+    auto alt = (T <= (w4n_on() ? 64 : 16) && !g_w4alt.empty()) ? g_w4alt.find(a.s[i].W) : g_w4alt.end();
     if (alt != g_w4alt.end()) wa.add(alt->second, a.s[i].X, a.s[i].ldx, a.s[i].Y, a.s[i].ldy, a.s[i].rows, a.s[i].K, a.s[i].round);
     else d.add(a.s[i].W, a.s[i].X, a.s[i].ldx, a.s[i].Y, a.s[i].ldy, a.s[i].rows, a.s[i].K, a.s[i].round);
   }
@@ -831,7 +833,7 @@ void gemv_multi(xik_ctx *c, const GArgs &a, int T) {
 }
 void gemv_bf16(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, int T,
                bool round_out, int ksd = KSD_DEFAULT, int cls = 0) {
-  if (T <= 16 && !g_w4alt.empty()) {
+  if (T <= (w4n_on() ? 64 : 16) && !g_w4alt.empty()) {
     auto alt = g_w4alt.find(W);
     if (alt != g_w4alt.end()) { W4Args wa; wa.add(alt->second, X, ldx, Y, ldy, rows, K, round_out); return w4z_run(c, wa, T); }
   }
@@ -3383,7 +3385,7 @@ static void head_gemv(xik_ctx *c, const float *X, int ldx, float *Y, int T, bool
 static void k_w4zpack(xik_ctx *c, const uint16_t *w, int rows, int K, int asym, int obj, const float *h, uint32_t *out, uint32_t *sz) {
   const int ngrp = K / 64, nrbp = rows / 16;
   const bool tm = getenv("XIK_W4TM") != nullptr;
-  const bool nat = getenv("XIK_W4N") != nullptr;  // native DPAS layout: dword kd of a 32-K chunk holds K = 8 kd .. 8 kd + 7 as consecutive unsigned nibbles (u4 x s8 DPAS B operand)
+  const bool nat = false;  // the pair-order layout serves both kernels: the native path permutes the int8 activations instead (k_aq)
   c->q.parallel_for(range<1>((size_t)rows * ngrp), [=](id<1> id) {
     const size_t r = id[0] / ngrp; const int g = (int)(id[0] % ngrp);
     const uint16_t *p = w + r * K + (size_t)g * 64;
@@ -3505,7 +3507,10 @@ static void w4z_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
 }
 // ---- native int4 x int8 DPAS path (XIK_W4N=1): weights stay unsigned nibbles in the DPAS B layout (no expansion), activations are quantised to int8 per token and 64-K group
 // (scale amax / 127, sum of the quantised values for the zero point), acc = sum(q * a) in int32, out = scale_w * scale_a * (acc - zero * sum_a)
-static bool w4n_on() { static const bool v = getenv("XIK_W4N") != nullptr; return v; }
+// XIK_W4N: 1 = native u4 x s8 DPAS for T = 17..64 (prefill-sized passes; decode / verify T <= 16 keep the fp16-expansion kernel), 2 = native for every T
+static int w4n_mode() { static const int v = getenv("XIK_W4N") ? atoi(getenv("XIK_W4N")) : 1; return v; }
+static bool w4n_on() { return w4n_mode() != 0; }
+static bool w4n_use(int T) { return w4n_mode() == 2 || (w4n_mode() == 1 && T > 16); }
 static void k_aq(xik_ctx *c, const float *X, int ldx, int T, int K, int32_t *aq, float *as, int32_t *asum) {
   const int ngrp = K / 64;
   c->q.parallel_for(range<1>((size_t)T * ngrp), [=](id<1> id) {
@@ -3517,19 +3522,24 @@ static void k_aq(xik_ctx *c, const float *X, int ldx, int T, int K, int32_t *aq,
     int sum = 0;
     for (int d = 0; d < 16; d++) {
       uint32_t w = 0;
-      for (int j = 0; j < 4; j++) { int q = (int)sycl::fmax(-127.f, sycl::fmin(127.f, sycl::rint(v[4 * d + j] * inv))); sum += q; w |= (uint32_t)(uint8_t)(int8_t)q << (8 * j); }
+      // byte position 8 (e / 8) + slot(e % 8) holds element e, slot(j) = (j & 1) * 4 + j / 2: the nibble order of the pair-order weight layout
+      for (int pb = 0; pb < 4; pb++) {
+        const int pos = 4 * d + pb, grp = pos / 8, sl = pos % 8, j = (sl % 4) * 2 + sl / 4;  // inverse of slot(j)
+        int q = (int)sycl::fmax(-127.f, sycl::fmin(127.f, sycl::rint(v[8 * grp + j] * inv))); sum += q; w |= (uint32_t)(uint8_t)(int8_t)q << (8 * pb);
+      }
       aq[((size_t)t * ngrp + g) * 16 + d] = (int32_t)w;
     }
     as[t * ngrp + g] = amax / 127.f; asum[t * ngrp + g] = sum;
   });
 }
 namespace {
-template <int R>
+// RC tokens per DPAS (repeat count) x NP passes: one launch handles up to RC * NP tokens, the B tile (weights) of each 32-K chunk is loaded once and used by all NP passes
+template <int RC, int NP>
 static void w4n_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
   constexpr int KSD = 12;
   c->q.parallel_for(nd_range<1>((size_t)a.total_wg * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
     using namespace es;
-    slm_init<KSD * 16 * R * 4>();
+    slm_init<KSD * 16 * RC * NP * 4>();
     const int wgi = (int)it.get_group(0), tid = (int)it.get_local_id(0);
     int si = 0;
     while (si + 1 < a.n && wgi >= a.s[si + 1].wg0) si++;
@@ -3537,7 +3547,9 @@ static void w4n_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
     const int rb = wgi - sd.wg0, K = sd.K, ngrp = K / 64, per = ngrp / KSD, g0 = tid * per;
     const uint32_t *wp = sd.W + ((size_t)rb * (K / 32) + (size_t)g0 * 2) * 64;
     const uint32_t *sp = sd.SZ + ((size_t)rb * ngrp + g0) * 16;
-    simd<float, 16 * R> acc = 0.f;
+    simd<float, 16 * RC> acc[NP];
+#pragma unroll
+    for (int p = 0; p < NP; p++) acc[p] = 0.f;
     simd<int32_t, 128> cur, nxt;
     cur.template select<64, 1>(0) = block_load<int32_t, 64>(reinterpret_cast<const int32_t *>(wp));
     cur.template select<64, 1>(64) = block_load<int32_t, 64>(reinterpret_cast<const int32_t *>(wp) + 64);
@@ -3550,54 +3562,64 @@ static void w4n_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
         snx = block_load<uint32_t, 16>(sp + (size_t)(g + 1) * 16);
       }
       const int gg = g0 + g;
-      simd<int32_t, 8 * R> a0, a1;
-#pragma unroll
-      for (int r = 0; r < R; r++) {
-        const int tr = t0 + (r < nt ? r : 0);
-        a0.template select<8, 1>(8 * r) = block_load<int32_t, 8>(sd.aq + ((size_t)tr * ngrp + gg) * 16);
-        a1.template select<8, 1>(8 * r) = block_load<int32_t, 8>(sd.aq + ((size_t)tr * ngrp + gg) * 16 + 8);
-      }
-      simd<int32_t, 16 * R> ia = 0;
-      ia = xmx::dpas<8, R, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ia, cur.template select<64, 1>(0).read(), a0);
-      ia = xmx::dpas<8, R, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ia, cur.template select<64, 1>(64).read(), a1);
-      simd<float, 16 * R> fa = convert<float>(ia);
       simd<uint16_t, 32> sv16 = scur.template bit_cast_view<uint16_t>();
       simd<sycl::half, 16> shs = sv16.template select<16, 2>(0).template bit_cast_view<sycl::half>();
       simd<sycl::half, 16> shz = sv16.template select<16, 2>(1).template bit_cast_view<sycl::half>();
       simd<float, 16> ws = shs, zp = shz;
       zp -= 1024.f;
+      simd<int32_t, 64> b0 = cur.template select<64, 1>(0), b1 = cur.template select<64, 1>(64);
 #pragma unroll
-      for (int r = 0; r < R; r++) {
-        const int tr = t0 + (r < nt ? r : 0);
-        const float asr = sd.as[tr * ngrp + gg], sm = (float)sd.asum[tr * ngrp + gg];
-        acc.template select<16, 1>(16 * r) += (fa.template select<16, 1>(16 * r) - zp * sm) * ws * asr;
+      for (int p = 0; p < NP; p++) {
+        simd<int32_t, 8 * RC> a0, a1;
+#pragma unroll
+        for (int r = 0; r < RC; r++) {
+          const int tl = p * RC + r, tr = t0 + (tl < nt ? tl : 0);
+          a0.template select<8, 1>(8 * r) = block_load<int32_t, 8>(sd.aq + ((size_t)tr * ngrp + gg) * 16);
+          a1.template select<8, 1>(8 * r) = block_load<int32_t, 8>(sd.aq + ((size_t)tr * ngrp + gg) * 16 + 8);
+        }
+        simd<int32_t, 16 * RC> ia = 0;
+        ia = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ia, b0, a0);
+        ia = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ia, b1, a1);
+        simd<float, 16 * RC> fa = convert<float>(ia);
+#pragma unroll
+        for (int r = 0; r < RC; r++) {
+          const int tl = p * RC + r, tr = t0 + (tl < nt ? tl : 0);
+          const float asr = sd.as[tr * ngrp + gg], sm = (float)sd.asum[tr * ngrp + gg];
+          acc[p].template select<16, 1>(16 * r) += (fa.template select<16, 1>(16 * r) - zp * sm) * ws * asr;
+        }
       }
       if (g + 1 < per) { cur = nxt; scur = snx; }
     }
-    slm_block_store<float, 16 * R>(tid * 16 * R * 4, acc);
+#pragma unroll
+    for (int p = 0; p < NP; p++) slm_block_store<float, 16 * RC>((p * KSD + tid) * 16 * RC * 4, acc[p]);
     barrier();
     if (tid == 0) {
-      simd<float, 16 * R> sum = slm_block_load<float, 16 * R>(0);
-      for (int j = 1; j < KSD; j++) sum += slm_block_load<float, 16 * R>(j * 16 * R * 4);
-      if (sd.rnd) {
-        simd<uint32_t, 16 * R> u = sum.template bit_cast_view<uint32_t>();
-        u += 0x7FFFu + ((u >> 16) & 1u); u &= 0xFFFF0000u;
-        sum = u.template bit_cast_view<float>();
-      }
 #pragma unroll
-      for (int r = 0; r < R; r++)
-        if (r < nt) {
-          simd<float, 16> o = sum.template select<16, 1>(16 * r);
-          if ((rb + 1) * 16 <= sd.rows) o.copy_to(sd.Y + (size_t)(t0 + r) * sd.ldy + rb * 16);
-          else for (int i = 0; i < 16; i++) if (rb * 16 + i < sd.rows) sd.Y[(size_t)(t0 + r) * sd.ldy + rb * 16 + i] = o[i];
+      for (int p = 0; p < NP; p++) {
+        simd<float, 16 * RC> sum = slm_block_load<float, 16 * RC>(p * KSD * 16 * RC * 4);
+        for (int j = 1; j < KSD; j++) sum += slm_block_load<float, 16 * RC>((p * KSD + j) * 16 * RC * 4);
+        if (sd.rnd) {
+          simd<uint32_t, 16 * RC> u = sum.template bit_cast_view<uint32_t>();
+          u += 0x7FFFu + ((u >> 16) & 1u); u &= 0xFFFF0000u;
+          sum = u.template bit_cast_view<float>();
         }
+#pragma unroll
+        for (int r = 0; r < RC; r++) {
+          const int tl = p * RC + r;
+          if (tl < nt) {
+            simd<float, 16> o = sum.template select<16, 1>(16 * r);
+            if ((rb + 1) * 16 <= sd.rows) o.copy_to(sd.Y + (size_t)(t0 + tl) * sd.ldy + rb * 16);
+            else for (int i = 0; i < 16; i++) if (rb * 16 + i < sd.rows) sd.Y[(size_t)(t0 + tl) * sd.ldy + rb * 16 + i] = o[i];
+          }
+        }
+      }
     }
   });
 }
 }  // namespace
 static void w4z_run(xik_ctx *c, const W4Args &a_in, int T) {
   W4Args a = a_in;
-  if (w4n_on()) {
+  if (w4n_use(T)) {
     static int32_t *aqb[4]; static float *asb[4]; static int32_t *smb[4]; static bool inited = false;
     if (!inited) { for (int i = 0; i < 4; i++) { aqb[i] = sycl::malloc_device<int32_t>(64 * 3072 / 4, c->q.q); asb[i] = sycl::malloc_device<float>(64 * 48, c->q.q); smb[i] = sycl::malloc_device<int32_t>(64 * 48, c->q.q); } inited = true; }
     const float *seenX[4] = {nullptr, nullptr, nullptr, nullptr}; int nseen = 0;
@@ -3606,9 +3628,11 @@ static void w4z_run(xik_ctx *c, const W4Args &a_in, int T) {
       if (k < 0) { k = nseen++; seenX[k] = a.s[i].X; k_aq(c, a.s[i].X, a.s[i].ldx, T, a.s[i].K, aqb[k], asb[k], smb[k]); }
       a.s[i].aq = aqb[k]; a.s[i].as = asb[k]; a.s[i].asum = smb[k];
     }
-    for (int t0 = 0; t0 < T; t0 += 8) {
-      const int n = std::min(8, T - t0);
-      if (n == 1) w4n_r<1>(c, a, t0, n); else if (n == 2) w4n_r<2>(c, a, t0, n); else if (n <= 4) w4n_r<4>(c, a, t0, n); else w4n_r<8>(c, a, t0, n);
+    for (int t0 = 0; t0 < T; t0 += 64) {
+      const int n = std::min(64, T - t0);
+      if (n == 1) w4n_r<1, 1>(c, a, t0, n); else if (n == 2) w4n_r<2, 1>(c, a, t0, n); else if (n <= 4) w4n_r<4, 1>(c, a, t0, n); else if (n <= 8) w4n_r<8, 1>(c, a, t0, n);
+      else if (n <= 16) w4n_r<8, 2>(c, a, t0, n); else if (n <= 24) w4n_r<8, 3>(c, a, t0, n); else if (n <= 32) w4n_r<8, 4>(c, a, t0, n);
+      else if (n <= 40) w4n_r<8, 5>(c, a, t0, n); else if (n <= 48) w4n_r<8, 6>(c, a, t0, n); else if (n <= 56) w4n_r<8, 7>(c, a, t0, n); else w4n_r<8, 8>(c, a, t0, n);
     }
     return;
   }

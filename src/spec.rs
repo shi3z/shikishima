@@ -179,6 +179,14 @@ impl Adaptive {
 /// acceptance of both proposal sources; picks the path with the best expected committed tokens per second.
 pub struct Ctl {
     est: [f64; 7],    // DSpark: P(at least j of the first j drafts accepted)
+    hit: [f64; 7],    // decayed hit / trial counts behind `est` (Beta posterior with an optimistic prior)
+    tri: [f64; 7],
+    backoff: u32,     // consecutive DSpark losses episodes (exponential cooldown)
+    nplain: usize,    // plain steps observed (the first ones move t_plain faster: the very first step includes warm-up)
+    since_copy: usize, // rounds since a copy proposal was last used (exploration: its acceptance is only learned by trying)
+    cal_d: f64,       // realised / predicted speed of DSpark rounds (EMA): corrects the acceptance / cost model with what was measured
+    cal_c: f64,       // same for copy rounds
+    vr: [f64; 7],     // verification cost of a pass of width 1,2,4,8,16,32,64 in units of a plain step (measured on the first passes of each width, then an EMA)
     copy_rate: f64,   // copy proposals: per-position acceptance (geometric model)
     cs: f64,          // decayed counts of accepted / rejected copied tokens
     cf: f64,
@@ -194,19 +202,42 @@ pub struct Ctl {
 impl Ctl {
     pub fn new(t_plain: f64) -> Self {
         let f = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        Self { est: [0.6, 0.45, 0.3, 0.2, 0.15, 0.1, 0.08], copy_rate: 0.7, cs: 3.0, cf: 1.3, t_commit: 0.0012, t_plain: f("XIK_C1", t_plain), slope: f("XIK_SLOPE", 0.0031), t_draft: f("XIK_CDRAFT", 0.0107), since_probe: 0, cooldown: 0, losses: 0 }
+        Self { est: [0.75, 0.55, 0.4, 0.3, 0.2, 0.15, 0.1], hit: [3.0, 2.2, 1.6, 1.2, 0.8, 0.6, 0.4], tri: [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0], backoff: 0, nplain: 0, since_copy: 0, cal_d: 1.0, cal_c: 1.0, vr: [1.0, 1.49, 1.84, 2.44, 3.88, 5.9, 11.6], copy_rate: 0.7, cs: 3.0, cf: 1.3, t_commit: 0.0012, t_plain: f("XIK_C1", t_plain), slope: f("XIK_SLOPE", 0.0031), t_draft: f("XIK_CDRAFT", 0.0075), since_probe: 0, cooldown: 0, losses: 0 }
     }
     fn vcost(&self, rows: usize) -> f64 {
-        self.t_plain + self.slope * (rows as f64 - 1.0) + self.t_commit
+        if std::env::var("XIK_CTL_OLD").is_ok() { return self.t_plain + self.slope * (rows as f64 - 1.0) + self.t_commit; }
+        // piecewise-linear in log2(width) over the measured ratios (the cost per extra row falls with the width: weights are shared by more rows)
+        let x = (rows.max(1) as f64).log2().min(6.0);
+        let i = (x.floor() as usize).min(5);
+        let f = x - i as f64;
+        self.t_plain * (self.vr[i] * (1.0 - f) + self.vr[i + 1] * f) + self.t_commit
     }
     pub fn plan_dspark(&self, kmax: usize) -> (usize, f64) {
+        // expected tokens per round = 1 + sum_j P(accepted >= j); the estimate is the posterior mean of the measured acceptance plus a small exploration bonus
+        // that vanishes with the number of observations (XIK_CTL_OLD=1: the former fixed 0.85 discount)
+        let old = std::env::var("XIK_CTL_OLD").is_ok();
         let (mut best, mut gain) = ((0usize, 0.0), 1.0);
         for k in 1..=kmax.min(7) {
-            gain += self.est[k - 1] * 0.85; // conservative: the moving average lags behind sudden drops in acceptance
+            let e = self.est[k - 1];
+            gain += if old { e * 0.85 } else { (e + 0.5 * (e * (1.0 - e) / (self.tri[k - 1] + 1.0)).sqrt()).min(1.0) };
             let r = gain / (self.vcost(1 + k) + self.t_draft);
             if r > best.1 { best = (k, r); }
         }
         best
+    }
+    pub fn pred_dspark(&self, k: usize) -> f64 {
+        let gain = 1.0 + (0..k).map(|j| self.est[j]).sum::<f64>();
+        gain / (self.vcost(1 + k) + self.t_draft)
+    }
+    pub fn pred_copy(&self, k: usize) -> f64 {
+        let (mut gain, mut p) = (1.0, 1.0);
+        for _ in 0..k { p *= self.copy_rate; gain += p; }
+        gain / self.vcost(1 + k)
+    }
+    pub fn calibrate(&mut self, dspark: bool, pred: f64, real: f64) {
+        if pred <= 0.0 || std::env::var("XIK_CTL_OLD").is_ok() { return; }
+        let c = if dspark { &mut self.cal_d } else { &mut self.cal_c };
+        *c = (*c + 0.2 * (real / pred - *c)).clamp(0.4, 3.0);
     }
     pub fn plan_copy(&self, len: usize) -> (usize, f64) {
         let (mut best, mut gain, mut p) = ((0usize, 0.0), 1.0, 1.0);
@@ -221,7 +252,10 @@ impl Ctl {
     pub fn upd_dspark(&mut self, k: usize, acc: usize) {
         for j in 1..=k {
             let hit = if acc >= j { 1.0 } else { 0.0 };
-            self.est[j - 1] += 0.12 * (hit - self.est[j - 1]);
+            // decayed Beta counts: the estimate follows task changes within ~25 observations, and is not dragged by a pessimistic prior
+            self.hit[j - 1] = self.hit[j - 1] * 0.96 + hit;
+            self.tri[j - 1] = self.tri[j - 1] * 0.96 + 1.0;
+            self.est[j - 1] = ((self.hit[j - 1] + 0.5) / (self.tri[j - 1] + 1.0)).clamp(0.02, 0.98);
         }
     }
     pub fn upd_copy(&mut self, k: usize, acc: usize) {
@@ -230,11 +264,17 @@ impl Ctl {
         self.cf = self.cf * 0.8 + if acc < k { 1.0 } else { 0.0 };
         self.copy_rate = (self.cs / (self.cs + self.cf)).clamp(0.05, 0.985);
     }
-    pub fn obs_plain(&mut self, t: f64) { self.t_plain += 0.1 * (t - self.t_plain); }
+    pub fn obs_plain(&mut self, t: f64) { self.nplain += 1; let a = if self.nplain <= 6 { 0.4 } else { 0.1 }; self.t_plain += a * (t - self.t_plain); }
     pub fn obs_verify(&mut self, rows: usize, t: f64) {
         if rows >= 2 {
             let s = ((t - self.t_plain) / (rows as f64 - 1.0)).max(0.0005);
             self.slope += 0.1 * (s - self.slope);
+            let r = (t / self.t_plain).max(1.0);
+            let x = (rows as f64).log2().min(6.0);
+            let i = (x.floor() as usize).min(5);
+            let f = x - i as f64;
+            self.vr[i] += 0.25 * (1.0 - f) * (r - self.vr[i]);
+            self.vr[i + 1] += 0.25 * f * (r - self.vr[i + 1]);
         }
     }
     pub fn obs_commit(&mut self, t: f64) { self.t_commit += 0.1 * (t - self.t_commit); }
@@ -338,7 +378,14 @@ pub fn generate_hybrid(e: &mut Engine, prompt: &[i32], n: usize, block: usize, m
             } else { (0, 0.0) };
             if ctl.cooldown > 0 { ctl.cooldown -= 1; }
             let (dk, dr) = if use_dspark && ctl.cooldown == 0 { ctl.plan_dspark((block - 1).min(7)) } else { (0, 0.0) };
+            let (dr, cr) = (dr * ctl.cal_d, cr * ctl.cal_c);
             let pr = margin / ctl.t_plain;
+            // exploration of the copy proposals: their acceptance is learned only by using them
+            let mut ck = ck; let mut cr = cr;
+            if cp.len() >= 8 && !(ck > 0 && cr > dr && cr > pr) {
+                ctl.since_copy += 1;
+                if ctl.since_copy >= 5 { ctl.since_copy = 0; ck = cp.len().min(12); cr = f64::MAX; }
+            }
             if ck > 0 && cr > dr && cr > pr {
                 kind = 2;
                 k = ck;
@@ -373,6 +420,7 @@ pub fn generate_hybrid(e: &mut Engine, prompt: &[i32], n: usize, block: usize, m
                 ctl.obs_commit(t2.elapsed().as_secs_f64());
                 let dt = dv + t2.elapsed().as_secs_f64();
                 ctl.obs_verify(ids.len(), dv);
+                ctl.calibrate(false, ctl.pred_copy(k), (1 + acc) as f64 / dt);
                 ctl.upd_copy(k, acc);
                 hs.copy_diag.add(cp.len(), k, acc, dv, dt - dv);
                 hs.copy.rounds += 1; hs.copy.tokens += 1 + acc; hs.copy.secs += dt;
@@ -407,13 +455,14 @@ pub fn generate_hybrid(e: &mut Engine, prompt: &[i32], n: usize, block: usize, m
             ctl.obs_commit(t2.elapsed().as_secs_f64());
             let dt = dv + t2.elapsed().as_secs_f64();
             ctl.obs_verify(ids.len(), dv);
+            ctl.calibrate(true, ctl.pred_dspark(k), (1 + acc) as f64 / (td + dt));
             ctl.upd_dspark(k, acc);
             hs.dspark_diag.add(7, k, acc, dv, dt - dv);
             if (1 + acc) as f64 / (td + dt) < 1.0 / ctl.t_plain {
                 ctl.losses += 1;
-                if ctl.losses >= 2 { ctl.cooldown = 24; ctl.losses = 0; }
+                if ctl.losses >= 2 { ctl.cooldown = 6usize << ctl.backoff.min(2); ctl.backoff += 1; ctl.losses = 0; }
             } else {
-                ctl.losses = 0;
+                ctl.losses = 0; ctl.backoff = 0;
             }
             hs.dspark.rounds += 1; hs.dspark.tokens += 1 + acc; hs.dspark.secs += td + dt;
             st.cycles += 1; st.hist[acc.min(8)] += 1; st.drafted += k; st.accepted += acc;
