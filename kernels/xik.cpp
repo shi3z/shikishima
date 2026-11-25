@@ -1753,9 +1753,78 @@ void moe_p3_t(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const int32_t 
     }
   });
 }
+// T = 1 planar expert kernel (one token per expert slot): tile loop fully unrolled (NT = K / 128 is a constant), weight tiles PD ahead and activation records PD ahead in static
+// register rings; wait placement is left to the compiler in front of the first use.  XIK_P3PD = prefetch distance in tiles (0 = old kernel).
+template <int NT, int PD, int GRF>
+void moe_p3_t1(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const int32_t *AQ, bool w13, int maxslots, int rows, float *Y, int ldy) {
+  const int nrb = rows / 16, ngk = NT * 2;
+  const int32_t *desc = c->desc;
+  const size_t nthreads = (size_t)maxslots * nrb;
+  sycl::ext::oneapi::experimental::properties pr{sycl::ext::intel::experimental::grf_size<GRF>};
+  c->q.parallel_for(nd_range<1>(nthreads, expert_lws()), pr, [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    const size_t gid = it.get_global_id(0);
+    const int rb = (int)(gid % nrb), j = (int)(gid / nrb);
+    simd<int32_t, 16> d = block_load<int32_t, 16>(desc + j * 16);
+    if (d[1] <= 0) return;
+    const int e = d[0], id0 = d[2], trow = w13 ? id0 / TOPK : id0;
+    const size_t wst = (size_t)nrb * 192, sst = (size_t)nrb * 16;
+    const uint32_t *wp = Wp + (((size_t)e * NT) * nrb + rb) * 192;
+    const uint32_t *sp = Sp + (((size_t)e * NT) * nrb + rb) * 16;
+    const int32_t *ap = AQ + (size_t)trow * ngk * 32;
+    simd<uint32_t, 192> wb[NT]; simd<uint32_t, 16> sb[NT]; simd<int32_t, 32> ab[NT * 2];
+#define XP3_LD(t) { w3_ld_tile(wp, sp, wst, sst, (t), wb[t], sb[t]); ab[2 * (t)] = block_load<int32_t, 32>(ap + (size_t)(2 * (t)) * 32); ab[2 * (t) + 1] = block_load<int32_t, 32>(ap + (size_t)(2 * (t) + 1) * 32); }
+#pragma unroll
+    for (int t = 0; t < PD && t < NT; t++) XP3_LD(t);
+    simd<float, 16> acc = 0.f;
+#pragma unroll
+    for (int t = 0; t < NT; t++) {
+      if (t + PD < NT) XP3_LD(t + PD);
+#pragma unroll
+      for (int gi = 0; gi < 2; gi++) {
+        simd<int32_t, 32> p0 = wb[t].template select<32, 1>(96 * gi).template bit_cast_view<int32_t>().read();
+        simd<int32_t, 16> z0 = wb[t].template select<16, 1>(96 * gi + 32).template bit_cast_view<int32_t>().read();
+        simd<int32_t, 32> p1 = wb[t].template select<32, 1>(96 * gi + 48).template bit_cast_view<int32_t>().read();
+        simd<int32_t, 16> z1 = wb[t].template select<16, 1>(96 * gi + 80).template bit_cast_view<int32_t>().read();
+        simd<int32_t, 32> q0, q1;
+        q0.template select<16, 1>(0) = z0 & 0x55555555; q0.template select<16, 1>(16) = (z0 >> 1) & 0x55555555;
+        q1.template select<16, 1>(0) = z1 & 0x55555555; q1.template select<16, 1>(16) = (z1 >> 1) & 0x55555555;
+        simd<sycl::half, 16> sh = sb[t].template select<8, 1>(8 * gi).template bit_cast_view<sycl::half>();
+        simd<float, 16> ws = sh;
+        simd<int32_t, 32> a32 = ab[2 * t + gi];
+        simd<int32_t, 8> a0 = a32.template select<8, 1>(0), a1 = a32.template select<8, 1>(16);
+        const float as0 = sycl::bit_cast<float>((int32_t)a32[8]), sm0 = (float)(int32_t)a32[9], as1 = sycl::bit_cast<float>((int32_t)a32[24]), sm1 = (float)(int32_t)a32[25];
+        simd<int32_t, 16> i12a = 0, i3a = 0, i12b = 0, i3b = 0;
+        i12a = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12a, p0, a0);
+        i3a = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3a, q0, a0);
+        i12b = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12b, p1, a1);
+        i3b = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3b, q1, a1);
+        simd<float, 16> fa = convert<float>(i12a + (i3a << 2)), fb = convert<float>(i12b + (i3b << 2));
+        acc += ((fa - 4.f * sm0) * as0 + (fb - 4.f * sm1) * as1) * ws;
+      }
+    }
+#undef XP3_LD
+    acc.copy_to(Y + (size_t)id0 * ldy + rb * 16);
+  });
+}
+template <int NT>
+static void moe_p3_t1_pd(xik_ctx *c, int pd, const uint32_t *W, const uint32_t *S, const int32_t *AQ, bool w13, int maxslots, int rows, float *Y, int ldy) {
+  static const int grf = getenv("XIK_P3GRF") ? atoi(getenv("XIK_P3GRF")) : 128;
+  if (grf == 256) {
+    switch (pd) { case 2: moe_p3_t1<NT, 2, 256>(c, W, S, AQ, w13, maxslots, rows, Y, ldy); break; case 3: moe_p3_t1<NT, 3, 256>(c, W, S, AQ, w13, maxslots, rows, Y, ldy); break;
+      case 4: moe_p3_t1<NT, 4, 256>(c, W, S, AQ, w13, maxslots, rows, Y, ldy); break; case 6: moe_p3_t1<NT, 6, 256>(c, W, S, AQ, w13, maxslots, rows, Y, ldy); break;
+      default: moe_p3_t1<NT, 8, 256>(c, W, S, AQ, w13, maxslots, rows, Y, ldy); break; }
+  } else {
+    switch (pd) { case 1: moe_p3_t1<NT, 1, 128>(c, W, S, AQ, w13, maxslots, rows, Y, ldy); break; case 2: moe_p3_t1<NT, 2, 128>(c, W, S, AQ, w13, maxslots, rows, Y, ldy); break;
+      case 3: moe_p3_t1<NT, 3, 128>(c, W, S, AQ, w13, maxslots, rows, Y, ldy); break; case 4: moe_p3_t1<NT, 4, 128>(c, W, S, AQ, w13, maxslots, rows, Y, ldy); break;
+      default: moe_p3_t1<NT, 6, 128>(c, W, S, AQ, w13, maxslots, rows, Y, ldy); break; }
+  }
+}
 void moe_p3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const int32_t *AQ, const float *AS, const int32_t *SM, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
   const uint32_t *W = (const uint32_t *)Wp, *S = (const uint32_t *)Sp;
-  if (maxper <= 1) moe_p3_t<1, 1>(c, W, S, AQ, AS, SM, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+  static const int p3pd = getenv("XIK_P3PD") ? atoi(getenv("XIK_P3PD")) : 0;
+  if (maxper <= 1 && p3pd > 0 && (K == 2304 || K == 1152)) { if (K == 2304) moe_p3_t1_pd<18>(c, p3pd, W, S, AQ, w13, maxslots, rows, Y, ldy); else moe_p3_t1_pd<9>(c, p3pd, W, S, AQ, w13, maxslots, rows, Y, ldy); }
+  else if (maxper <= 1) moe_p3_t<1, 1>(c, W, S, AQ, AS, SM, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
   else {
     static const int cls_env = getenv("XIK_P3CLS") ? atoi(getenv("XIK_P3CLS")) : -1;  // -1: by pass width; 0: 8 x 2, 1: 4 x 2, 2: 4 x 4, 3: 4 x 1, 4: 2 x 4
     const int cls = cls_env >= 0 ? cls_env : (maxper <= 8 ? 4 : 2);
