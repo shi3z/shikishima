@@ -388,7 +388,7 @@ struct DSeg {
   const uint32_t *Wt;
   const float *X;
   float *Y;
-  int rows, nrb, K, ldx, ldy, round, wg0;
+  int rows, K, ldx, ldy, round, wg0;  // (no stored row-block count: kernel arguments of 512 B and more launch measurably slower)
   const float *scale;  // non-null: FP8 e4m3 tiles with this per-row scale
 };
 struct DArgs {
@@ -399,7 +399,7 @@ struct DArgs {
   void add(const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool round) {
     int nrb = (rows + 15) / 16;
     auto it = g_fp8_scale.find(W);
-    s[n] = DSeg{reinterpret_cast<const uint32_t *>(W), X, Y, rows, nrb, K, ldx, ldy, (int)round, total_wg, it == g_fp8_scale.end() ? nullptr : it->second};
+    s[n] = DSeg{reinterpret_cast<const uint32_t *>(W), X, Y, rows, K, ldx, ldy, (int)round, total_wg, it == g_fp8_scale.end() ? nullptr : it->second};
     total_wg += nrb;
     n++;
   }
@@ -464,7 +464,7 @@ void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
         if (AV == 4) {
           // surface: all weights as rows of 64 B; row y = 4 consecutive dwords-of-16 -> tile t covers rows 4t..4t+3
           v = sycl::ext::intel::experimental::esimd::lsc_load_2d<uint32_t, 16, 16, 1, false, false>(
-              base, 63u, (unsigned)(sd.nrb * nkt * 4 - 1), 63u, 0, (int)((t_first + (kt - k0)) * 4));
+              base, 63u, (unsigned)(((sd.rows + 15) / 16) * nkt * 4 - 1), 63u, 0, (int)((t_first + (kt - k0)) * 4));
         } else {
           v.copy_from(base + (t_first + (kt - k0)) * 64);
         }
