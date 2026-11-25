@@ -2803,12 +2803,14 @@ inline void route_top8(SG sg, int lane, const float *logit, const float *bias, i
 }
 // T == 1: router GEMV (K split in 4 chunks per row, partials added in chunk order: APPROXIMATE rounding order) and top-8 in one launch: the last work-group to finish
 // (atomic ticket) selects the experts.  XIK_RFUSE=0 restores the separate GEMV / top-8 launches.
-static void router_fused(xik_ctx *c, const LayerW &lw) {
+static void router_fused(xik_ctx *c, const LayerW &lw, bool grp) {
   const uint16_t *W = lw.router; const float *X = c->in[0]; const float *bias = lw.router_bias;
   float *logit = c->tmp1; int32_t *ridx = c->ridx; float *rwt = c->rwt;
   static uint32_t *ctr = nullptr;
   if (!ctr) { ctr = sycl::malloc_device<uint32_t>(16, c->q.q); c->q.memset(ctr, 0, 64).wait(); }
   uint32_t *ctr_ = ctr;
+  const float *xin = c->in[0]; sycl::half *x16 = c->x16_in;
+  int32_t *ecnt = c->ecnt, *elist = c->elist, *actl = c->act_e, *nact = c->nact, *desc = c->desc;
   constexpr int NWG = NE / 2, KB = D / 8, QB = KB / 4;
   c->q.submit([&](handler &h) {
     local_accessor<float, 1> red(range<1>(8), h);
@@ -2817,6 +2819,7 @@ static void router_fused(xik_ctx *c, const LayerW &lw) {
       auto sg = it.get_sub_group();
       const int lane = sg.get_local_linear_id(), wg = it.get_group(0), sgid = it.get_local_id(0) / 16;
       const int row = wg * 2 + sgid / 4, q = sgid % 4;
+      if (grp && it.get_local_id(0) < D / NWG) { const int i = wg * (D / NWG) + (int)it.get_local_id(0); x16[i] = (sycl::half)xin[i]; }  // cvt_f16 of the MLP input (36 elements per work-group)
       float acc = 0.f;
       for (int kb = q * QB + lane; kb < (q + 1) * QB; kb += 16) {
         vec<float, 4> a = *reinterpret_cast<const vec<float, 4> *>(X + kb * 8);
@@ -2842,6 +2845,27 @@ static void router_fused(xik_ctx *c, const LayerW &lw) {
       if (last[0] && sgid == 0) {
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
         route_top8(sg, lane, logit, bias, ridx, rwt);
+      }
+      if (grp && last[0]) {
+        // expert grouping (k_group for T = 1: 8 pairs) by the same last work-group, after its top-8 result is visible
+        group_barrier(it.get_group());
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
+        const int e = (int)it.get_local_id(0);  // 128 threads = NE experts
+        int cnt = 0;
+        for (int p = 0; p < TOPK; p++)
+          if (ridx[p] == e) elist[(size_t)e * 1 + cnt++] = p;
+        ecnt[e] = cnt;
+        const int flag = cnt > 0 ? 1 : 0;
+        const int pos = exclusive_scan_over_group(it.get_group(), flag, plus<int>());
+        if (flag) {
+          actl[pos] = e;
+          int32_t *d = desc + pos * 16;
+          d[0] = e; d[1] = cnt;
+          for (int i = 0; i < 8; i++) d[2 + i] = elist[(size_t)e * 1 + (i < cnt ? i : 0)];
+        }
+        const int tot = reduce_over_group(it.get_group(), flag, plus<int>());
+        if (e == 0) nact[0] = tot;
+        for (int j = tot + e; j < TOPK; j += NE) desc[j * 16 + 1] = 0;
       }
     });
   });
@@ -5125,7 +5149,9 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   static const bool rfuse = !getenv("XIK_RFUSE") || atoi(getenv("XIK_RFUSE")) != 0;
   const bool fr = fuse_route() && T == 1 && !use_int8() && !getenv("XIK_OLD_FP8");
   static const bool rr_active = getenv("XIK_ROUTE_REPLAY") || (getenv("XIK_ROUTE_REC") && atoi(getenv("XIK_ROUTE_REC")));
-  if (rfuse && T == 1 && !fr && !rr_active && !abl_mask()) router_fused(c, lw);
+  static const bool rgrp = !getenv("XIK_RGRP") || atoi(getenv("XIK_RGRP")) != 0;  // router launch also converts the MLP input and builds the expert groups
+  const bool fused_grp = rfuse && rgrp && T == 1 && !fr && !rr_active && !abl_mask();
+  if (rfuse && T == 1 && !fr && !rr_active && !abl_mask()) router_fused(c, lw, fused_grp);
   else {
     gemv_bf16_old(c, lw.router, c->in[0], D, c->tmp1, NE, NE, D, T, false);
     if (fr) k_route_fused1(c, lw); else k_router(c, lw, T);
@@ -5166,7 +5192,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
       k_act(c, np, 1);
       expert_fp8<false>(c, lw, c->act, FI, c->yp_part, D, c->ridx, np, D, FI);
     } else {
-      if (!fr) { if (fuse2_mask() & 1 && !(abl_mask())) k_cvt_group(c, c->in[0], c->x16_in, (size_t)T * D, np, T); else { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
+      if (!fr && !fused_grp) { if (fuse2_mask() & 1 && !(abl_mask())) k_cvt_group(c, c->in[0], c->x16_in, (size_t)T * D, np, T); else { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
       k_group(c, np, T); } }
       int slots = std::min(NE, np);
       nks = fp8_ks();
@@ -5178,7 +5204,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   } else {
     int mcfg = (c->moe_cfg >= 0) ? c->moe_cfg : 1;  // one K split for every T: results must not depend on the verify width
     nks = MOE_CFGS[mcfg].ks;
-    if (!fr) { if (fuse2_mask() & 1 && !(abl_mask())) k_cvt_group(c, c->in[0], c->x16_in, (size_t)T * D, np, T); else { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
+    if (!fr && !fused_grp) { if (fuse2_mask() & 1 && !(abl_mask())) k_cvt_group(c, c->in[0], c->x16_in, (size_t)T * D, np, T); else { k_cvt_f16(c, c->in[0], c->x16_in, (size_t)T * D);
     k_group(c, np, T); } }
     int slots = std::min(NE, np);
     if (lw.w3_13) moe_w3g(c, lw.w13, lw.w13_s, c->x16_in, D, true, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
