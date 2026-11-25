@@ -47,3 +47,5 @@ Hybrid numbers are dominated by the accepted draft length, which depends on the 
 Matrix of the latest round (6 tasks x 5 repeats, decode-only tok/s medians; plain code/history/prose/repeat/edit_py/jsonl): K1 87.0 87.1 86.9 86.9 86.6 86.3, K3 97.0 97.1 97.0 97.0 96.6 96.5, K3x 99.8 100.0 99.8 99.8 99.2 99.2; Hybrid K3x 108.9 104.0 97.3 120.5 302.9 203.7.
 Further kernel changes of this round (all bit-identical unless noted): router GEMV + top-8 in one launch (K split in 4, rounding order changes), int4 sink / dynamic projections.
 Study of the XMX (DPAS) pipeline, roofline bounds and native int4 x int8 DPAS: `docs/xmx-backend-study.md`; hardware counters: `docs/hw-counters.md`.
+
+Latest (planar INT3 experts on native u2 x s8 DPAS, controller rework, grouped MoE, 32-K activation scales; one B60): K3x plain 99.8 tok/s (6 tasks x 5 repeats, geo-mean), Hybrid 150.3 tok/s (geo-mean; code 144.9, history 101.9, prose 95.9, repeat 118.2, edit_py 347.8, jsonl 198.0); prefill passes of 64 / 256 tokens 99 ms (644 tok/s) / 354 ms (722 tok/s); GSM8K 0.883, MMLU 0.833, code 1.000 on the evaluation sets. See docs/xmx-backend-study.md (sections 9-13).

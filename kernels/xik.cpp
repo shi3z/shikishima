@@ -1659,14 +1659,15 @@ void k_act_q(xik_ctx *c, int npairs, int32_t *rec) {
       v[e4] = rbf(softcap(g, GATE_CAP) * sigmoidf(g) * softcap(u, UP_CAP));
       amax = sycl::fmax(amax, sycl::fabs(v[e4]));
     }
-    amax = reduce_over_group(sg, amax, maximum<float>());
+    // 32-element chunks = 8 lanes: segmented maximum / sum with xor shuffles
+    for (int m = 1; m < 8; m <<= 1) amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, m));
     const float inv = amax > 0.f ? 127.f / amax : 0.f;
     int sum = 0; uint32_t w = 0;
     for (int e4 = 0; e4 < 4; e4++) { int q = (int)sycl::fmax(-127.f, sycl::fmin(127.f, sycl::rint(v[e4] * inv))); sum += q; w |= (uint32_t)(uint8_t)(int8_t)q << (8 * e4); }
-    sum = reduce_over_group(sg, sum, plus<int>());
-    int32_t *r = rec + ((size_t)pr * NGF + gr) * 32;
-    r[lane] = (int32_t)w;
-    if (lane == 0) { r[16] = sycl::bit_cast<int32_t>(amax / 127.f); r[17] = sum; }
+    for (int m = 1; m < 8; m <<= 1) sum += sycl::permute_group_by_xor(sg, sum, m);
+    int32_t *r = rec + (((size_t)pr * NGF + gr) * 2 + lane / 8) * 16;
+    r[lane % 8] = (int32_t)w;
+    if (lane % 8 == 0) { r[8] = sycl::bit_cast<int32_t>(amax / 127.f); r[9] = sum; }
   });
 }
 template <int RC, int NP>
@@ -1721,24 +1722,23 @@ void moe_p3_t(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const int32_t 
 #pragma unroll
               for (int p = 0; p < NP; p++) {
                 if (p * RC < n) {
-                  simd<int32_t, 8 * RC> a0, a1; float asr_[RC], sm_[RC];
+                  simd<int32_t, 8 * RC> a0, a1; float as0[RC], as1[RC], sm0[RC], sm1[RC];
 #pragma unroll
                   for (int r = 0; r < RC; r++) {
-                    simd<int32_t, 32> a32 = block_load<int32_t, 32>(AQ + ((size_t)trow[p * RC + r] * ngk + gg) * 32);
-                    a0.template select<8, 1>(8 * r) = a32.template select<8, 1>(0); a1.template select<8, 1>(8 * r) = a32.template select<8, 1>(8);
-                    asr_[r] = sycl::bit_cast<float>((int32_t)a32[16]); sm_[r] = (float)(int32_t)a32[17];
+                    simd<int32_t, 32> a32 = block_load<int32_t, 32>(AQ + ((size_t)trow[p * RC + r] * ngk * 2 + (size_t)gg * 2) * 16);  // records of the two 32-K chunks of this group
+                    a0.template select<8, 1>(8 * r) = a32.template select<8, 1>(0); a1.template select<8, 1>(8 * r) = a32.template select<8, 1>(16);
+                    as0[r] = sycl::bit_cast<float>((int32_t)a32[8]); sm0[r] = (float)(int32_t)a32[9];
+                    as1[r] = sycl::bit_cast<float>((int32_t)a32[24]); sm1[r] = (float)(int32_t)a32[25];
                   }
-                  simd<int32_t, 16 * RC> i12 = 0, i3 = 0;
-                  i12 = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12, p0, a0);
-                  i3 = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3, q0, a0);
-                  i12 = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12, p1, a1);
-                  i3 = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3, q1, a1);
-                  simd<int32_t, 16 * RC> tot = i12 + (i3 << 2);
-                  simd<float, 16 * RC> fa = convert<float>(tot);
+                  simd<int32_t, 16 * RC> i12a = 0, i3a = 0, i12b = 0, i3b = 0;
+                  i12a = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12a, p0, a0);
+                  i3a = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3a, q0, a0);
+                  i12b = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12b, p1, a1);
+                  i3b = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3b, q1, a1);
+                  simd<float, 16 * RC> fa = convert<float>(i12a + (i3a << 2)), fb = convert<float>(i12b + (i3b << 2));
 #pragma unroll
-                  for (int r = 0; r < RC; r++) {
-                    acc[p].template select<16, 1>(16 * r) += (fa.template select<16, 1>(16 * r) - 4.f * sm_[r]) * (ws * asr_[r]);
-                  }
+                  for (int r = 0; r < RC; r++)
+                    acc[p].template select<16, 1>(16 * r) += ((fa.template select<16, 1>(16 * r) - 4.f * sm0[r]) * as0[r] + (fb.template select<16, 1>(16 * r) - 4.f * sm1[r]) * as1[r]) * ws;
                 }
               }
             }
@@ -1799,7 +1799,7 @@ void moe_w3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half 
 // raw nibbles [e][row][K/2], raw e4m3 scales [e][row][K/16], outer scale amax[e] / den[0] (natural weight = e2m1 * e4m3 * amax / den).
 static void k_w3pack(xik_ctx *c, const uint8_t *raw, const uint8_t *sraw, const float *amax, const float *den, int rows, int K, uint32_t *W, uint16_t *S, int NC) {
   const bool tm = !getenv("XIK_W3TM") || atoi(getenv("XIK_W3TM")) != 0;
-  const bool pl = getenv("XIK_W3P") && atoi(getenv("XIK_W3P"));  // planar layout (u2 plane pair + bit plane per 32-K chunk), same codes and scales
+  const bool pl = !getenv("XIK_W3P") || atoi(getenv("XIK_W3P")) != 0;  // planar layout (u2 plane pair + bit plane per 32-K chunk), same codes and scales
   const int nrb = rows / 16, ntile = K / 128;
   c->q.parallel_for(range<1>((size_t)NE * nrb * ntile * 16), [=](id<1> id) {
     size_t i = id[0];
@@ -3100,17 +3100,17 @@ static void router_fused(xik_ctx *c, const LayerW &lw, bool grp, int32_t *qrec =
       const int lane = sg.get_local_linear_id(), wg = it.get_group(0), sgid = it.get_local_id(0) / 16;
       const int row = wg * 2 + sgid / 4, q = sgid % 4;
       if (grp && !qrec && it.get_local_id(0) < D / NWG) { const int i = wg * (D / NWG) + (int)it.get_local_id(0); x16[i] = (sycl::half)xin[i]; }  // cvt_f16 of the MLP input (36 elements per work-group)
-      if (qrec && wg < D / 64 && sgid == 0) {  // int8 record of 64-element group `wg` of the MLP input (planar INT3 experts): one sub-group, 4 elements per lane
+      if (qrec && wg < D / 64 && sgid == 0) {  // int8 chunk records (32 K each) of 64-element group `wg` of the MLP input (planar INT3 experts): one sub-group, 4 elements per lane
         float v[4], amax = 0.f;
         for (int e4 = 0; e4 < 4; e4++) { v[e4] = xin[wg * 64 + lane * 4 + e4]; amax = sycl::fmax(amax, sycl::fabs(v[e4])); }
-        amax = reduce_over_group(sg, amax, maximum<float>());
+        for (int m = 1; m < 8; m <<= 1) amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, m));
         const float inv = amax > 0.f ? 127.f / amax : 0.f;
         int sum = 0; uint32_t w = 0;
         for (int e4 = 0; e4 < 4; e4++) { int q = (int)sycl::fmax(-127.f, sycl::fmin(127.f, sycl::rint(v[e4] * inv))); sum += q; w |= (uint32_t)(uint8_t)(int8_t)q << (8 * e4); }
-        sum = reduce_over_group(sg, sum, plus<int>());
-        int32_t *r = qrec + (size_t)wg * 32;
-        r[lane] = (int32_t)w;
-        if (lane == 0) { r[16] = sycl::bit_cast<int32_t>(amax / 127.f); r[17] = sum; }
+        for (int m = 1; m < 8; m <<= 1) sum += sycl::permute_group_by_xor(sg, sum, m);
+        int32_t *r = qrec + ((size_t)wg * 2 + lane / 8) * 16;
+        r[lane % 8] = (int32_t)w;
+        if (lane % 8 == 0) { r[8] = sycl::bit_cast<int32_t>(amax / 127.f); r[9] = sum; }
       }
       float acc = 0.f;
       for (int kb = q * QB + lane; kb < (q + 1) * QB; kb += 16) {
@@ -3849,6 +3849,25 @@ static bool w4n_on() { return w4n_mode() != 0; }
 static bool w4n_use(int T) { return w4n_mode() == 2 || (w4n_mode() == 1 && T > 16); }
 static void k_aq(xik_ctx *c, const float *X, int ldx, int T, int K, int32_t *aq, float *as, int32_t *asum, bool perm = true, bool rec = false) {
   const int ngrp = K / 64;
+  if (rec) {
+    // 32-K chunk records for the planar INT3 experts: [8 dwords int8, scale = amax / 127, sum, 6 pad] (finer activation scale than the 64-K groups: GSM8K)
+    const int nch = K / 32;
+    c->q.parallel_for(range<1>((size_t)T * nch), [=](id<1> id) {
+      const int t = (int)(id[0] / nch), ch = (int)(id[0] % nch);
+      const float *x = X + (size_t)t * ldx + ch * 32;
+      float v[32], amax = 0.f;
+      for (int i = 0; i < 32; i++) { v[i] = x[i]; amax = sycl::fmax(amax, sycl::fabs(v[i])); }
+      const float inv = amax > 0.f ? 127.f / amax : 0.f;
+      int sum = 0; int32_t *r = aq + ((size_t)t * nch + ch) * 16;
+      for (int d = 0; d < 8; d++) {
+        uint32_t w = 0;
+        for (int pb = 0; pb < 4; pb++) { int q = (int)sycl::fmax(-127.f, sycl::fmin(127.f, sycl::rint(v[4 * d + pb] * inv))); sum += q; w |= (uint32_t)(uint8_t)(int8_t)q << (8 * pb); }
+        r[d] = (int32_t)w;
+      }
+      r[8] = sycl::bit_cast<int32_t>(amax / 127.f); r[9] = sum;
+    });
+    return;
+  }
   c->q.parallel_for(range<1>((size_t)T * ngrp), [=](id<1> id) {
     const int t = (int)(id[0] / ngrp), g = (int)(id[0] % ngrp);
     const float *x = X + (size_t)t * ldx + g * 64;
@@ -3863,10 +3882,9 @@ static void k_aq(xik_ctx *c, const float *X, int ldx, int T, int K, int32_t *aq,
         const int pos = 4 * d + pb, grp = pos / 8, sl = pos % 8, j = perm ? (sl % 4) * 2 + sl / 4 : sl;  // inverse of slot(j) (perm), or linear K order
         int q = (int)sycl::fmax(-127.f, sycl::fmin(127.f, sycl::rint(v[8 * grp + j] * inv))); sum += q; w |= (uint32_t)(uint8_t)(int8_t)q << (8 * pb);
       }
-      aq[((size_t)t * ngrp + g) * (rec ? 32 : 16) + d] = (int32_t)w;
+      aq[((size_t)t * ngrp + g) * 16 + d] = (int32_t)w;
     }
-    if (rec) { aq[((size_t)t * ngrp + g) * 32 + 16] = sycl::bit_cast<int32_t>(amax / 127.f); aq[((size_t)t * ngrp + g) * 32 + 17] = sum; }  // record: 16 dwords of int8, scale, sum, padding (one 128 B load)
-    else { as[t * ngrp + g] = amax / 127.f; asum[t * ngrp + g] = sum; }
+    as[t * ngrp + g] = amax / 127.f; asum[t * ngrp + g] = sum;
   });
 }
 namespace {
@@ -4327,7 +4345,7 @@ int xik_finalize(xik_ctx *c) {
         }
       }
       w.w3_13 = g_w3sel[l][0]; w.w3_2 = g_w3sel[l][1];
-      w.w3p = w.w3_13 && w.w3_2 && getenv("XIK_W3P") && atoi(getenv("XIK_W3P"));
+      w.w3p = w.w3_13 && w.w3_2 && (!getenv("XIK_W3P") || atoi(getenv("XIK_W3P")) != 0);
       w.w13 = tp8(c, p + "mlp.experts.w13_weight");
       w.w13_s = tp8(c, p + "mlp.experts.w13_weight_scale");
       w.w2 = tp8(c, p + "mlp.experts.w2_weight");
