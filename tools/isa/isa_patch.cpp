@@ -1,5 +1,5 @@
 // isa_patch: assemble Xe2 ISA text with libiga and splice it into a zebin's .text.<kernel> section.
-//   isa_patch in.zebin kernel_name kernel.asm out.zebin        (also: isa_patch -d in.zebin kernel_name > out.asm)
+//   isa_patch [-a] in.zebin kernel_name kernel.asm out.zebin        (-a: assemble with IGA auto dependency (SWSB) generation; also: isa_patch -d in.zebin kernel_name > out.asm)
 #include <iga/iga.h>
 #include <elf.h>
 #include <cstdio>
@@ -9,7 +9,7 @@
 #include <vector>
 static std::vector<char> rd(const char* p) { FILE* f = fopen(p, "rb"); if (!f) { perror(p); exit(1); } fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); std::vector<char> v(n); if (fread(v.data(), 1, n, f) != (size_t)n) exit(1); fclose(f); return v; }
 int main(int argc, char** argv) {
-  bool dis = argc > 1 && !strcmp(argv[1], "-d"); int a = dis ? 2 : 1;
+  bool dis = argc > 1 && !strcmp(argv[1], "-d"); bool autodep = argc > 1 && !strcmp(argv[1], "-a"); int a = (dis || autodep) ? 2 : 1;
   if (argc < a + 2) { fprintf(stderr, "usage\n"); return 1; }
   auto z = rd(argv[a]); std::string sec = std::string(".text.") + argv[a + 1];
   auto* eh = (Elf64_Ehdr*)z.data(); auto* sh = (Elf64_Shdr*)(z.data() + eh->e_shoff);
@@ -26,6 +26,7 @@ int main(int argc, char** argv) {
   }
   auto txt = rd(argv[a + 2]); txt.push_back(0);
   iga_assemble_options_t ao = IGA_ASSEMBLE_OPTIONS_INIT(); void* bin; uint32_t bn;
+  ao.encoder_opts = IGA_ENCODER_OPT_AUTO_COMPACT; if (autodep) { ao.encoder_opts |= IGA_ENCODER_OPT_AUTO_DEPENDENCIES; ao.sbid_count = 32; }
   auto st = iga_context_assemble(ctx, &ao, txt.data(), &bin, &bn);
   if (st != IGA_SUCCESS) {
     fprintf(stderr, "assemble: %s\n", iga_status_to_string(st));
