@@ -372,7 +372,7 @@ static std::map<const void *, const float *> g_fp8_scale;  // weight tile pointe
 // Used for T <= 16 (decode, verify); prefill keeps the FP8 copy.
 struct W4Alt { const uint32_t *w; const uint32_t *sz; size_t wb = 0, sb = 0; };
 static std::map<const void *, W4Alt> g_w4alt;
-struct W4Seg { const uint32_t *W, *SZ; const float *X; float *Y; int rows, K, ldx, ldy, rnd, wg0; };
+struct W4Seg { const uint32_t *W, *SZ; const float *X; float *Y; int rows, K, ldx, ldy, rnd, wg0; const int32_t *aq = nullptr; const float *as = nullptr; const int32_t *asum = nullptr; };
 struct W4Args {
   W4Seg s[8]; int n = 0, total_wg = 0;
   void add(const W4Alt &w, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool rnd) { s[n] = W4Seg{w.w, w.sz, X, Y, rows, K, ldx, ldy, (int)rnd, total_wg}; total_wg += (rows + 15) / 16; n++; }
@@ -1385,14 +1385,14 @@ ESIMD_INLINE simd<uint32_t, 16> pair_reg(int rho, const simd<uint32_t, 16> &a, c
   return (((a >> 15) & 0x00010001u) | ((b >> 14) & 0x00020002u) | ((c >> 13) & 0x00040004u)) | M;
 }
 }  // namespace w3m
-template <int R, int PW, int NB = 2>
+template <int R, int PW, int NB = 2, bool XP = (R <= 2)>
 ESIMD_INLINE es::simd<float, 16 * R> moe_w3_body(const uint32_t *wp, const uint32_t *sp, const sycl::half *X16, int ldx, bool w13, const int32_t *ids, int cnt, int per, int kofs, size_t wst, size_t sst) {
   using namespace es;
   simd<float, 16 * R> acc = 0.f;
   const uint32_t *xr[R];
 #pragma unroll
   for (int r = 0; r < R; r++) { int pp = ids[r < cnt ? r : 0]; xr[r] = reinterpret_cast<const uint32_t *>(X16 + (size_t)(w13 ? pp / TOPK : pp) * ldx + (size_t)kofs * 128); }
-  constexpr bool XPRE = R <= 2;  // R >= 4: activations are loaded per 32-K group (register pressure: the T > 1 kernel holds all R bodies)
+  constexpr bool XPRE = XP;  // default R <= 2; R >= 4: activations are loaded per 32-K group (register pressure: the T > 1 kernel holds all R bodies)
   simd<uint32_t, 192> wb[NB]; simd<uint32_t, 16> sb[NB]; simd<uint32_t, (XPRE ? 64 * R : 16)> xb[NB];
   auto load = [&](int u, int t) {
     simd<uint32_t, 64> t0 = ldp<PW, 64>(wp + (size_t)t * wst), t1 = ldp<PW, 64>(wp + (size_t)t * wst + 64), t2 = ldp<PW, 64>(wp + (size_t)t * wst + 128);
@@ -1465,7 +1465,7 @@ ESIMD_INLINE void moe_w3_store(es::simd<float, 16 * R> acc, int tid, const int32
     if (r < cnt) { simd<float, 16> o = acc.template select<16, 1>(16 * r); o.copy_to(Y + (size_t)ids[r] * ldy + rb * 16); }
 }
 // one work-group of KSD threads per (slot, 16-row block); each thread streams K/128/KSD tiles; K = 1 partial for the downstream kernels
-template <bool R1, int KSD, int NB = 2, int RC = -1>
+template <bool R1, int KSD, int NB = 2, int RC = -1, bool XP8 = false>
 void moe_w3g_t(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
   const int nrb = rows / 16, ntile = K / 128, per = ntile / KSD;
   const bool tm = !getenv("XIK_W3TM") || atoi(getenv("XIK_W3TM")) != 0;  // tile-major weight layout: [expert][tile][row block]
@@ -1502,10 +1502,10 @@ void moe_w3g_t(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl::h
           if (n <= 2) { moe_w3_store<2, KSD>(moe_w3_body<2, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb); continue; }
         }
         if constexpr (RC < 0 || RC == 1) {
-          if (n > 2 && n <= 4) { moe_w3_store<4, KSD>(moe_w3_body<4, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb); continue; }
+          if (n > 2 && n <= 4) { moe_w3_store<4, KSD>(moe_w3_body<4, 5, 2, (RC == 1)>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb); continue; }
         }
         if constexpr (RC < 0 || RC == 2) {
-          if (n > 4) moe_w3_store<8, KSD>(moe_w3_body<8, 5>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
+          if (n > 4) moe_w3_store<8, KSD>(moe_w3_body<8, 5, 2, (RC == 2 && XP8)>(wp, sp, X16, ldx, w13, ids, n, per, kofs, wst, sst), tid, ids, n, Y, ystride, ldy, rb);
         }
       }
     }
@@ -1517,7 +1517,7 @@ void moe_w3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half 
   const int ntile = K / 128; const int ksd = (ntile % ksd_env == 0) ? ksd_env : 1;
   static const int nb_env = getenv("XIK_W3NB") ? atoi(getenv("XIK_W3NB")) : 2;
   static const bool w3split = getenv("XIK_W3SPLIT") && atoi(getenv("XIK_W3SPLIT"));
-#define W3G(KS) if (ksd == KS) { if (maxper <= 1) { if (nb_env == 3) return moe_w3g_t<true, KS, 3>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 6) return moe_w3g_t<true, KS, 6>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 8) return moe_w3g_t<true, KS, 8>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 4) return moe_w3g_t<true, KS, 4>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); return moe_w3g_t<true, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); } if (w3split) { moe_w3g_t<false, KS, 2, 0>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (maxper > 2) moe_w3g_t<false, KS, 2, 1>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (maxper > 4) moe_w3g_t<false, KS, 2, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); return; } return moe_w3g_t<false, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); }
+#define W3G(KS) if (ksd == KS) { if (maxper <= 1) { if (nb_env == 3) return moe_w3g_t<true, KS, 3>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 6) return moe_w3g_t<true, KS, 6>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 8) return moe_w3g_t<true, KS, 8>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 4) return moe_w3g_t<true, KS, 4>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); return moe_w3g_t<true, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); } if (w3split) { moe_w3g_t<false, KS, 2, 0>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (maxper > 2) moe_w3g_t<false, KS, 2, 1>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (maxper > 4) moe_w3g_t<false, KS, 2, 2, false>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); return; } return moe_w3g_t<false, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); }
   W3G(3) W3G(9) W3G(1)
 #undef W3G
 }
@@ -3382,6 +3382,7 @@ static void head_gemv(xik_ctx *c, const float *X, int ldx, float *Y, int T, bool
 static void k_w4zpack(xik_ctx *c, const uint16_t *w, int rows, int K, int asym, int obj, const float *h, uint32_t *out, uint32_t *sz) {
   const int ngrp = K / 64, nrbp = rows / 16;
   const bool tm = getenv("XIK_W4TM") != nullptr;
+  const bool nat = getenv("XIK_W4N") != nullptr;  // native DPAS layout: dword kd of a 32-K chunk holds K = 8 kd .. 8 kd + 7 as consecutive unsigned nibbles (u4 x s8 DPAS B operand)
   c->q.parallel_for(range<1>((size_t)rows * ngrp), [=](id<1> id) {
     const size_t r = id[0] / ngrp; const int g = (int)(id[0] % ngrp);
     const uint16_t *p = w + r * K + (size_t)g * 64;
@@ -3407,7 +3408,7 @@ static void k_w4zpack(xik_ctx *c, const uint16_t *w, int rows, int K, int asym, 
         for (int j = 0; j < 8; j++) {
           float x = bf2f(p[bl * 32 + q4 * 8 + j]);
           uint32_t qv = bs == 0.f ? (uint32_t)bz : (uint32_t)sycl::fmin(15.f, sycl::fmax(0.f, sycl::rint(x / bs) + bz));
-          d |= (j & 1) ? (qv << (16 + 4 * (j / 2))) : (qv << (4 * (j / 2)));
+          d |= nat ? (qv << (4 * j)) : ((j & 1) ? (qv << (16 + 4 * (j / 2))) : (qv << (4 * (j / 2))));
         }
         out[(tm ? (((size_t)g * nrbp + rb) * 2 + bl) : ((size_t)rb * (K / 32) + g * 2 + bl)) * 64 + q4 * 16 + n] = d;
       }
@@ -3501,7 +3502,115 @@ static void w4z_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
     }
   });
 }
-static void w4z_run(xik_ctx *c, const W4Args &a, int T) {
+// ---- native int4 x int8 DPAS path (XIK_W4N=1): weights stay unsigned nibbles in the DPAS B layout (no expansion), activations are quantised to int8 per token and 64-K group
+// (scale amax / 127, sum of the quantised values for the zero point), acc = sum(q * a) in int32, out = scale_w * scale_a * (acc - zero * sum_a)
+static bool w4n_on() { static const bool v = getenv("XIK_W4N") != nullptr; return v; }
+static void k_aq(xik_ctx *c, const float *X, int ldx, int T, int K, int32_t *aq, float *as, int32_t *asum) {
+  const int ngrp = K / 64;
+  c->q.parallel_for(range<1>((size_t)T * ngrp), [=](id<1> id) {
+    const int t = (int)(id[0] / ngrp), g = (int)(id[0] % ngrp);
+    const float *x = X + (size_t)t * ldx + g * 64;
+    float v[64], amax = 0.f;
+    for (int i = 0; i < 64; i++) { v[i] = x[i]; amax = sycl::fmax(amax, sycl::fabs(v[i])); }
+    const float inv = amax > 0.f ? 127.f / amax : 0.f;
+    int sum = 0;
+    for (int d = 0; d < 16; d++) {
+      uint32_t w = 0;
+      for (int j = 0; j < 4; j++) { int q = (int)sycl::fmax(-127.f, sycl::fmin(127.f, sycl::rint(v[4 * d + j] * inv))); sum += q; w |= (uint32_t)(uint8_t)(int8_t)q << (8 * j); }
+      aq[((size_t)t * ngrp + g) * 16 + d] = (int32_t)w;
+    }
+    as[t * ngrp + g] = amax / 127.f; asum[t * ngrp + g] = sum;
+  });
+}
+namespace {
+template <int R>
+static void w4n_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
+  constexpr int KSD = 12;
+  c->q.parallel_for(nd_range<1>((size_t)a.total_wg * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    slm_init<KSD * 16 * R * 4>();
+    const int wgi = (int)it.get_group(0), tid = (int)it.get_local_id(0);
+    int si = 0;
+    while (si + 1 < a.n && wgi >= a.s[si + 1].wg0) si++;
+    const W4Seg &sd = a.s[si];
+    const int rb = wgi - sd.wg0, K = sd.K, ngrp = K / 64, per = ngrp / KSD, g0 = tid * per;
+    const uint32_t *wp = sd.W + ((size_t)rb * (K / 32) + (size_t)g0 * 2) * 64;
+    const uint32_t *sp = sd.SZ + ((size_t)rb * ngrp + g0) * 16;
+    simd<float, 16 * R> acc = 0.f;
+    simd<int32_t, 128> cur, nxt;
+    cur.template select<64, 1>(0) = block_load<int32_t, 64>(reinterpret_cast<const int32_t *>(wp));
+    cur.template select<64, 1>(64) = block_load<int32_t, 64>(reinterpret_cast<const int32_t *>(wp) + 64);
+    simd<uint32_t, 16> scur = block_load<uint32_t, 16>(sp);
+    for (int g = 0; g < per; g++) {
+      simd<uint32_t, 16> snx;
+      if (g + 1 < per) {
+        nxt.template select<64, 1>(0) = block_load<int32_t, 64>(reinterpret_cast<const int32_t *>(wp) + (size_t)(g + 1) * 128);
+        nxt.template select<64, 1>(64) = block_load<int32_t, 64>(reinterpret_cast<const int32_t *>(wp) + (size_t)(g + 1) * 128 + 64);
+        snx = block_load<uint32_t, 16>(sp + (size_t)(g + 1) * 16);
+      }
+      const int gg = g0 + g;
+      simd<int32_t, 8 * R> a0, a1;
+#pragma unroll
+      for (int r = 0; r < R; r++) {
+        const int tr = t0 + (r < nt ? r : 0);
+        a0.template select<8, 1>(8 * r) = block_load<int32_t, 8>(sd.aq + ((size_t)tr * ngrp + gg) * 16);
+        a1.template select<8, 1>(8 * r) = block_load<int32_t, 8>(sd.aq + ((size_t)tr * ngrp + gg) * 16 + 8);
+      }
+      simd<int32_t, 16 * R> ia = 0;
+      ia = xmx::dpas<8, R, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ia, cur.template select<64, 1>(0).read(), a0);
+      ia = xmx::dpas<8, R, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ia, cur.template select<64, 1>(64).read(), a1);
+      simd<float, 16 * R> fa = convert<float>(ia);
+      simd<uint16_t, 32> sv16 = scur.template bit_cast_view<uint16_t>();
+      simd<sycl::half, 16> shs = sv16.template select<16, 2>(0).template bit_cast_view<sycl::half>();
+      simd<sycl::half, 16> shz = sv16.template select<16, 2>(1).template bit_cast_view<sycl::half>();
+      simd<float, 16> ws = shs, zp = shz;
+      zp -= 1024.f;
+#pragma unroll
+      for (int r = 0; r < R; r++) {
+        const int tr = t0 + (r < nt ? r : 0);
+        const float asr = sd.as[tr * ngrp + gg], sm = (float)sd.asum[tr * ngrp + gg];
+        acc.template select<16, 1>(16 * r) += (fa.template select<16, 1>(16 * r) - zp * sm) * ws * asr;
+      }
+      if (g + 1 < per) { cur = nxt; scur = snx; }
+    }
+    slm_block_store<float, 16 * R>(tid * 16 * R * 4, acc);
+    barrier();
+    if (tid == 0) {
+      simd<float, 16 * R> sum = slm_block_load<float, 16 * R>(0);
+      for (int j = 1; j < KSD; j++) sum += slm_block_load<float, 16 * R>(j * 16 * R * 4);
+      if (sd.rnd) {
+        simd<uint32_t, 16 * R> u = sum.template bit_cast_view<uint32_t>();
+        u += 0x7FFFu + ((u >> 16) & 1u); u &= 0xFFFF0000u;
+        sum = u.template bit_cast_view<float>();
+      }
+#pragma unroll
+      for (int r = 0; r < R; r++)
+        if (r < nt) {
+          simd<float, 16> o = sum.template select<16, 1>(16 * r);
+          if ((rb + 1) * 16 <= sd.rows) o.copy_to(sd.Y + (size_t)(t0 + r) * sd.ldy + rb * 16);
+          else for (int i = 0; i < 16; i++) if (rb * 16 + i < sd.rows) sd.Y[(size_t)(t0 + r) * sd.ldy + rb * 16 + i] = o[i];
+        }
+    }
+  });
+}
+}  // namespace
+static void w4z_run(xik_ctx *c, const W4Args &a_in, int T) {
+  W4Args a = a_in;
+  if (w4n_on()) {
+    static int32_t *aqb[4]; static float *asb[4]; static int32_t *smb[4]; static bool inited = false;
+    if (!inited) { for (int i = 0; i < 4; i++) { aqb[i] = sycl::malloc_device<int32_t>(64 * 3072 / 4, c->q.q); asb[i] = sycl::malloc_device<float>(64 * 48, c->q.q); smb[i] = sycl::malloc_device<int32_t>(64 * 48, c->q.q); } inited = true; }
+    const float *seenX[4] = {nullptr, nullptr, nullptr, nullptr}; int nseen = 0;
+    for (int i = 0; i < a.n; i++) {
+      int k = -1; for (int j = 0; j < nseen; j++) if (seenX[j] == a.s[i].X && a.s[i].K == 0 + a.s[i].K) { k = j; break; }
+      if (k < 0) { k = nseen++; seenX[k] = a.s[i].X; k_aq(c, a.s[i].X, a.s[i].ldx, T, a.s[i].K, aqb[k], asb[k], smb[k]); }
+      a.s[i].aq = aqb[k]; a.s[i].as = asb[k]; a.s[i].asum = smb[k];
+    }
+    for (int t0 = 0; t0 < T; t0 += 8) {
+      const int n = std::min(8, T - t0);
+      if (n == 1) w4n_r<1>(c, a, t0, n); else if (n == 2) w4n_r<2>(c, a, t0, n); else if (n <= 4) w4n_r<4>(c, a, t0, n); else w4n_r<8>(c, a, t0, n);
+    }
+    return;
+  }
   for (int t0 = 0; t0 < T; t0 += 8) {
     const int n = std::min(8, T - t0);
     if (n == 1) w4z_r<1>(c, a, t0, n);
@@ -4902,6 +5011,22 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     if (fr) k_route_fused1(c, lw); else k_router(c, lw, T);
   }
   phase(c, P_MOE_ROUTE);
+  {
+    static const bool rstat = getenv("XIK_ROUTE_STATS") != nullptr;  // diagnostic: distinct experts / tokens per expert of every MoE call with T > 1 (host sync per call)
+    if (rstat && T > 1) {
+      static long calls = 0, sumdist = 0, sumpairs = 0, hist[17] = {0}; static int tcur = 0;
+      c->q.wait();
+      std::vector<int32_t> r((size_t)T * TOPK); c->q.memcpy(r.data(), c->ridx, r.size() * 4).wait();
+      int cnt[NE] = {0}; for (int v : r) cnt[v]++;
+      int dist = 0; for (int e = 0; e < NE; e++) if (cnt[e]) { dist++; hist[std::min(cnt[e], 16)]++; }
+      calls++; sumdist += dist; sumpairs += (long)T * TOPK; tcur = T;
+      if (calls % 400 == 0) {
+        fprintf(stderr, "route-stats T=%d: %ld calls, distinct experts/call %.1f, tokens per used expert %.2f, expert-count histogram (1..16+):", tcur, calls, (double)sumdist / calls, (double)sumpairs / std::max(1L, sumdist));
+        for (int k = 1; k <= 16; k++) fprintf(stderr, " %ld", hist[k]);
+        fprintf(stderr, "\n");
+      }
+    }
+  }
   int np = T * TOPK;
   int nks = 1;
   if (is_mxfp8(layer)) {

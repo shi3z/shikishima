@@ -68,3 +68,21 @@ Conclusion of the experiment: with the weights streamed in a DPAS-friendly layou
 * T = 1: bound 1.9 %, measured 0.5 %: the step is limited by DRAM bytes (floor 4.8 ms of the 10.1 ms step) and by ~900 dependent small kernels; XMX throughput is irrelevant.
 * T = 8 / 16: dense matrices (attention, head) share weights across the pass and run through DPAS at RC = 8 (two DPAS per B load for T = 16); the MoE expert kernels are limited by the number of distinct experts per pass.
 * Free token axis: RC <= 4 costs the same XMX time as RC = 1; attention / controller streams that are processed with R = 1 today could be batched up to 4 rows at no XMX cost if the model had independent rows (the 3 GQA query heads per KV head are such rows; the 3 controller streams of the loop controller share the structure).
+
+## 5. Native int4 x int8 DPAS integrated in the real model (attention, `XIK_W4N=1`, experimental, off by default)
+
+`k_aq` quantises each projection input to int8 per token and 64-K group (scale amax / 127, plus the sum of the quantised values for the zero point); `w4n_r<R>` streams the asymmetric int4 weights as unsigned nibbles in the DPAS B layout (offline packed with `k_w4zpack`, `XIK_W4N` at load) and runs `dpas<u4, s8>` (`u4 x s8` layout verified against an integer reference: 0 / 64 mismatches); out = scale_w x scale_a x (acc - zero x sum_a). The same path is used for every T, so plain and verify passes stay numerically consistent.
+
+| | K3x (fp16 expansion) | K3x + `XIK_W4N=1` |
+|---|---|---|
+| KL vs BF16-dense reference, 6 tasks mean (nats/token) | 0.0272 | 0.0268 |
+| mean top-1 agreement | 0.958 | 0.957 |
+| pass time T = 1 / 2 / 4 / 8 / 16 / 32 (ms) | 10.1 / 15.0 / 18.6 / 24.6 / 40.3 / 68.7 | 10.4 / 15.2 / 18.9 / 24.8 / 40.2 / 68.7 (T = 32 uses the FP8 path in both) |
+| plain decode, 96 tokens | 96.7 tok/s | 93.8 tok/s |
+
+Activation int8 quantisation does not change the quality (KL 0.0268 vs 0.0272) and the native instruction removes the weight-expansion ALU, but there is no end-to-end gain: T = 1 loses the extra quantisation launches (+0.3 ms), T = 8 / 16 are unchanged, as the streaming-GEMM experiment predicted (the attention GEMV is at 80 % of the DRAM roofline already). Larger T would profit (section 3, T = 64: native 127 us vs expansion 409 us), but those passes use the FP8 weights today.
+
+## 6. Production MoE versus the streaming harness (distinct experts per pass)
+
+`XIK_ROUTE_STATS=1` (host sync per call, diagnostic) on the `--bench-prefill` token ids (not natural text): T = 8: 26.0 distinct experts per MoE call, 2.47 tokens per used expert; T = 16: 34.7 distinct experts, 3.69 tokens per used expert (histogram of tokens per expert in the log of the run: 1: 4906, 2: 1968, 3: 1134, 4: 773, ... 8: 363 of 400 calls at T = 8). The production W3 MoE moves 26 x 3.24 MB = 84 MB per visit at T = 8 and 112 MB at T = 16 and takes about 260 us / 430 us per visit (w13 + w2): 326 GB/s (71 % of the DRAM peak) and 260 GB/s (57 %), against 360 GB/s (79 %) at T = 1. (An earlier statement of "37 %" in this file was derived from VTune's average read bandwidth, which under-counts; the bytes / time figure above is the one to use.)
+The T > 1 W3 kernel split into one launch per tokens-per-expert class (`XIK_W3SPLIT=1`, with the activation prefetch enabled for R = 4) is slower (T = 8: 24.5 -> 30.0 ms, T = 16: 40.1 -> 51.2 ms), so neither the register spill nor the per-group activation loads of the R = 4 / 8 bodies are the limiting factor; the remaining distance to the roofline at T = 16 is ALU (ALU1 active 36 % on K3x, XVE stalled 34 %, SBID 30 %) and the number of distinct experts.
