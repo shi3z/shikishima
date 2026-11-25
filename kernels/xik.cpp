@@ -293,7 +293,7 @@ void gemv_bf16_old(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float
                bool round_out) {
   if (abl_mask() & 32) return;
   static const bool rgv = !getenv("XIK_RGV") || atoi(getenv("XIK_RGV")) != 0;
-  if (rgv && T <= 64) return gemv_bf16_rs(c, W, X, ldx, Y, ldy, rows, K, T, round_out);
+  if (rgv) return gemv_bf16_rs(c, W, X, ldx, Y, ldy, rows, K, T, round_out);
   for (int t0 = 0; t0 < T; t0 += 8) {
     int n = std::min(8, T - t0);
     const float *x = X + (size_t)t0 * ldx;
