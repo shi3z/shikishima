@@ -17,7 +17,8 @@ fn main() {
     };
     let t0 = Instant::now();
     let max_ctx: usize = std::env::var("XI_MAX_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(4096); // up to 8192 (log-scaling limit)
-    let mut e = Engine::new(&dir, max_ctx, 64).expect("engine");
+    let max_tokens: usize = std::env::var("XI_MAX_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(64); // widest forward pass (prefill chunk), up to 1024
+    let mut e = Engine::new(&dir, max_ctx, max_tokens).expect("engine");
     eprintln!("load {:.1}s", t0.elapsed().as_secs_f64());
     e.reset();
     if let Some(i) = a.iter().position(|x| x == "--batch") {

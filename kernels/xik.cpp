@@ -373,7 +373,10 @@ static std::map<const void *, const float *> g_fp8_scale;  // weight tile pointe
 // Used for T <= 16 (decode, verify); prefill keeps the FP8 copy.
 struct W4Alt { const uint32_t *w; const uint32_t *sz; size_t wb = 0, sb = 0; };
 static std::map<const void *, W4Alt> g_w4alt;
-struct W4Seg { const uint32_t *W, *SZ; const float *X; float *Y; int rows, K, ldx, ldy, rnd, wg0; const int32_t *aq = nullptr; const float *as = nullptr; const int32_t *asum = nullptr; };
+struct W4Seg { const uint32_t *W, *SZ; const float *X; float *Y; int rows, K, ldx, ldy, rnd, wg0; };
+// int8 activations of the native path (separate from W4Seg: the fp16-expansion decode kernels do not carry these 24 bytes per segment in their arguments)
+struct W4Aux { const int32_t *aq = nullptr; const float *as = nullptr; const int32_t *asum = nullptr; };
+struct W4AuxArr { W4Aux v[8]; };
 struct W4Args {
   W4Seg s[8]; int n = 0, total_wg = 0;
   void add(const W4Alt &w, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool rnd) { s[n] = W4Seg{w.w, w.sz, X, Y, rows, K, ldx, ldy, (int)rnd, total_wg}; total_wg += (rows + 15) / 16; n++; }
@@ -824,7 +827,7 @@ void gemv_multi(xik_ctx *c, const GArgs &a, int T) {
   d.cls = a.cls;
   W4Args wa;
   for (int i = 0; i < a.n; i++) {
-    auto alt = (T <= (w4n_on() ? 64 : 16) && !g_w4alt.empty()) ? g_w4alt.find(a.s[i].W) : g_w4alt.end();
+    auto alt = (T <= (w4n_on() ? 1024 : 16) && !g_w4alt.empty()) ? g_w4alt.find(a.s[i].W) : g_w4alt.end();
     if (alt != g_w4alt.end()) wa.add(alt->second, a.s[i].X, a.s[i].ldx, a.s[i].Y, a.s[i].ldy, a.s[i].rows, a.s[i].K, a.s[i].round);
     else d.add(a.s[i].W, a.s[i].X, a.s[i].ldx, a.s[i].Y, a.s[i].ldy, a.s[i].rows, a.s[i].K, a.s[i].round);
   }
@@ -833,9 +836,12 @@ void gemv_multi(xik_ctx *c, const GArgs &a, int T) {
 }
 void gemv_bf16(xik_ctx *c, const uint16_t *W, const float *X, int ldx, float *Y, int ldy, int rows, int K, int T,
                bool round_out, int ksd = KSD_DEFAULT, int cls = 0) {
-  if (T <= (w4n_on() ? 64 : 16) && !g_w4alt.empty()) {
+  if (T <= (w4n_on() ? 1024 : 16) && !g_w4alt.empty()) {
     auto alt = g_w4alt.find(W);
-    if (alt != g_w4alt.end()) { W4Args wa; wa.add(alt->second, X, ldx, Y, ldy, rows, K, round_out); return w4z_run(c, wa, T); }
+    if (alt != g_w4alt.end()) {
+      W4Args wa; wa.add(alt->second, X, ldx, Y, ldy, rows, K, round_out);
+      return w4z_run(c, wa, T);
+    }
   }
   DArgs d;
   d.ksd = ksd;
@@ -1468,7 +1474,7 @@ ESIMD_INLINE void moe_w3_store(es::simd<float, 16 * R> acc, int tid, const int32
     if (r < cnt) { simd<float, 16> o = acc.template select<16, 1>(16 * r); o.copy_to(Y + (size_t)ids[r] * ldy + rb * 16); }
 }
 // one work-group of KSD threads per (slot, 16-row block); each thread streams K/128/KSD tiles; K = 1 partial for the downstream kernels
-template <bool R1, int KSD, int NB = 2, int RC = -1, bool XP8 = false>
+template <bool R1, int KSD, int NB = 2, int RC = -1, bool XP8 = false, bool SB = false>
 void moe_w3g_t(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
   const int nrb = rows / 16, ntile = K / 128, per = ntile / KSD;
   const bool tm = !getenv("XIK_W3TM") || atoi(getenv("XIK_W3TM")) != 0;  // tile-major weight layout: [expert][tile][row block]
@@ -1483,6 +1489,7 @@ void moe_w3g_t(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl::h
     simd<int32_t, 16> d = block_load<int32_t, 16>(desc + j * 16);
     const int cnt = d[1];
     if (cnt <= 0) return;
+    if (SB && cnt > 8) return;  // experts with more than 8 tokens are handled by the grouped kernel
     const int e = d[0];
     const size_t wst = tm ? (size_t)nrb * 192 : 192, sst = tm ? (size_t)nrb * 16 : 16;
     const uint32_t *wp = tm ? Wp + (((size_t)e * ntile + (size_t)tid * per) * nrb + rb) * 192 : Wp + (((size_t)e * nrb + rb) * ntile + (size_t)tid * per) * 192;
@@ -1514,12 +1521,118 @@ void moe_w3g_t(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl::h
     }
   });
 }
+ESIMD_INLINE void w3_ld_tile(const uint32_t *wp, const uint32_t *sp, size_t wst, size_t sst, int t, es::simd<uint32_t, 192> &wbuf, es::simd<uint32_t, 16> &sbuf) {
+  using namespace es;
+  simd<uint32_t, 64> t0 = ldp<5, 64>(wp + (size_t)t * wst), t1 = ldp<5, 64>(wp + (size_t)t * wst + 64), t2 = ldp<5, 64>(wp + (size_t)t * wst + 128);
+  wbuf.template select<64, 1>(0) = t0; wbuf.template select<64, 1>(64) = t1; wbuf.template select<64, 1>(128) = t2;
+  sbuf = ldp<0, 16>(sp + (size_t)t * sst);
+}
+// Grouped GEMM for experts with more than 8 tokens: the INT3 expansion of every weight tile is done once and applied to up to 8 * NP tokens (NP independent DPAS accumulators of 8 tokens each),
+// instead of once per chunk of 8 tokens.  Only the tile-major layout (XIK_W3TM, default) is supported.
+template <int NP>
+void moe_w3g_grp(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
+  const int nrb = rows / 16, ntile = K / 128;
+  const int32_t *desc = c->desc, *elist = c->elist;
+  const size_t nthreads = (size_t)maxslots * nrb;
+  c->q.parallel_for(nd_range<1>(nthreads, expert_lws()), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    const size_t gid = it.get_global_id(0);
+    const int rb = (int)(gid % nrb), j = (int)(gid / nrb);
+    simd<int32_t, 16> d = block_load<int32_t, 16>(desc + j * 16);
+    const int cnt = d[1];
+    if (cnt <= 8) return;
+    const int e = d[0];
+    const size_t wst = (size_t)nrb * 192, sst = (size_t)nrb * 16;
+    const uint32_t *wp = Wp + (((size_t)e * ntile) * nrb + rb) * 192;
+    const uint32_t *sp = Sp + (((size_t)e * ntile) * nrb + rb) * 16;
+    for (int g0 = 0; g0 < cnt; g0 += 8 * NP) {
+      const int n = cnt - g0 < 8 * NP ? cnt - g0 : 8 * NP;
+      int32_t ids[8 * NP];
+      const uint32_t *xr[8 * NP];
+#pragma unroll
+      for (int r = 0; r < 8 * NP; r++) {
+        const int rr = r < n ? r : 0;
+        ids[r] = (g0 + rr < 8) ? d[2 + g0 + rr] : elist[(size_t)e * maxper + g0 + rr];
+        xr[r] = reinterpret_cast<const uint32_t *>(X16 + (size_t)(w13 ? ids[r] / TOPK : ids[r]) * ldx);
+      }
+      simd<float, 128> acc[NP];
+#pragma unroll
+      for (int p = 0; p < NP; p++) acc[p] = 0.f;
+      simd<uint32_t, 192> wb[2]; simd<uint32_t, 16> sb[2];
+      w3_ld_tile(wp, sp, wst, sst, 0, wb[0], sb[0]);
+      for (int t0 = 0; t0 < ntile; t0 += 2) {
+#pragma unroll
+        for (int u = 0; u < 2; u++) {
+          const int t = t0 + u;
+          if (t + 1 < ntile) w3_ld_tile(wp, sp, wst, sst, t + 1, wb[(u + 1) % 2], sb[(u + 1) % 2]);
+          if (t < ntile) {
+            simd<float, 128> ag[NP];
+#pragma unroll
+            for (int g = 0; g < 4; g++) {
+              simd<uint32_t, 16> a = wb[u].template select<16, 1>(48 * g), b = wb[u].template select<16, 1>(48 * g + 16), cc = wb[u].template select<16, 1>(48 * g + 32);
+              simd<uint32_t, 256> B;
+#pragma unroll
+              for (int rho = 0; rho < 16; rho++) B.template select<16, 1>(16 * rho) = w3m::pair_reg(rho, a, b, cc);
+              simd<sycl::half, 512> bh = B.template bit_cast_view<sycl::half>();
+              bh -= (sycl::half)1028.0f;
+              simd<int32_t, 256> bi = bh.template bit_cast_view<int32_t>();
+              simd<int32_t, 128> xa[NP];  // activations of this 32-K group: 8 rows x 16 dwords per pass (one 64 B load per row)
+#pragma unroll
+              for (int p = 0; p < NP; p++)
+                if (p * 8 < n)
+#pragma unroll
+                  for (int r = 0; r < 8; r++) xa[p].template select<16, 1>(16 * r) = block_load<int32_t, 16>(reinterpret_cast<const int32_t *>(xr[p * 8 + r]) + (size_t)t * 64 + 16 * g);
+#pragma unroll
+              for (int s2 = 0; s2 < 2; s2++) {
+                simd<int32_t, 128> bs = bi.template select<128, 1>(128 * s2);
+#pragma unroll
+                for (int p = 0; p < NP; p++) {
+                  if (p * 8 < n) {
+                    simd<int32_t, 64> av;
+#pragma unroll
+                    for (int r = 0; r < 8; r++) av.template select<8, 1>(8 * r) = xa[p].template select<8, 1>(16 * r + 8 * s2);
+                    simd<float, 128> z = 0.f;
+                    ag[p] = xmx::dpas<8, 8, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(((g & 1) == 0 && s2 == 0) ? z : ag[p], bs, av);
+                  }
+                }
+              }
+              if (g & 1) {
+                simd<sycl::half, 16> sh = sb[u].template select<8, 1>(8 * (g >> 1)).template bit_cast_view<sycl::half>();
+                simd<float, 16> sf = sh;
+#pragma unroll
+                for (int p = 0; p < NP; p++)
+                  if (p * 8 < n)
+#pragma unroll
+                    for (int r = 0; r < 8; r++) acc[p].template select<16, 1>(16 * r) += ag[p].template select<16, 1>(16 * r) * sf;
+              }
+            }
+          }
+        }
+      }
+#pragma unroll
+      for (int p = 0; p < NP; p++)
+#pragma unroll
+        for (int r = 0; r < 8; r++)
+          if (p * 8 + r < n) { simd<float, 16> o = acc[p].template select<16, 1>(16 * r); o.copy_to(Y + (size_t)ids[p * 8 + r] * ldy + rb * 16); }
+    }
+  });
+}
 void moe_w3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
   static const int ksd_env = getenv("XIK_W3KSD") ? atoi(getenv("XIK_W3KSD")) : 1;  // threads per (slot, row block): 1, 3 or 9 (must divide K/128: 18 or 9)
   const uint32_t *W = (const uint32_t *)Wp, *S = (const uint32_t *)Sp;
   const int ntile = K / 128; const int ksd = (ntile % ksd_env == 0) ? ksd_env : 1;
   static const int nb_env = getenv("XIK_W3NB") ? atoi(getenv("XIK_W3NB")) : 2;
   static const bool w3split = getenv("XIK_W3SPLIT") && atoi(getenv("XIK_W3SPLIT"));
+  static const int grp_np = getenv("XIK_W3GRP") ? atoi(getenv("XIK_W3GRP")) : 2;  // 0 = off, 2 / 3 / 4 = passes of 8 tokens sharing the expanded weights
+  static const int grp_min = getenv("XIK_W3GMIN") ? atoi(getenv("XIK_W3GMIN")) : 40;  // widest pass below which the standard kernel is used (the extra launch costs more than it saves)
+  static const bool tm_on = !getenv("XIK_W3TM") || atoi(getenv("XIK_W3TM")) != 0;
+  if (grp_np > 0 && tm_on && maxper >= grp_min && ksd == 1 && nb_env == 2) {
+    moe_w3g_t<false, 1, 2, -1, false, true>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    if (grp_np == 4) moe_w3g_grp<4>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    else if (grp_np == 3) moe_w3g_grp<3>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    else moe_w3g_grp<2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    return;
+  }
 #define W3G(KS) if (ksd == KS) { if (maxper <= 1) { if (nb_env == 3) return moe_w3g_t<true, KS, 3>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 6) return moe_w3g_t<true, KS, 6>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 8) return moe_w3g_t<true, KS, 8>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (nb_env == 4) return moe_w3g_t<true, KS, 4>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); return moe_w3g_t<true, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); } if (w3split) { moe_w3g_t<false, KS, 2, 0>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (maxper > 2) moe_w3g_t<false, KS, 2, 1>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); if (maxper > 4) moe_w3g_t<false, KS, 2, 2, false>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); return; } return moe_w3g_t<false, KS, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy); }
   W3G(3) W3G(9) W3G(1)
 #undef W3G
@@ -3579,7 +3692,7 @@ static void k_aq(xik_ctx *c, const float *X, int ldx, int T, int K, int32_t *aq,
 namespace {
 // RC tokens per DPAS (repeat count) x NP passes: one launch handles up to RC * NP tokens, the B tile (weights) of each 32-K chunk is loaded once and used by all NP passes
 template <int RC, int NP>
-static void w4n_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
+static void w4n_r(xik_ctx *c, const W4Args &a, const W4AuxArr &aux, int t0, int nt) {
   constexpr int KSD = 12;
   c->q.parallel_for(nd_range<1>((size_t)a.total_wg * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
     using namespace es;
@@ -3588,6 +3701,7 @@ static void w4n_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
     int si = 0;
     while (si + 1 < a.n && wgi >= a.s[si + 1].wg0) si++;
     const W4Seg &sd = a.s[si];
+    const W4Aux &ax = aux.v[si];
     const int rb = wgi - sd.wg0, K = sd.K, ngrp = K / 64, per = ngrp / KSD, g0 = tid * per;
     const uint32_t *wp = sd.W + ((size_t)rb * (K / 32) + (size_t)g0 * 2) * 64;
     const uint32_t *sp = sd.SZ + ((size_t)rb * ngrp + g0) * 16;
@@ -3618,8 +3732,8 @@ static void w4n_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
 #pragma unroll
         for (int r = 0; r < RC; r++) {
           const int tl = p * RC + r, tr = t0 + (tl < nt ? tl : 0);
-          a0.template select<8, 1>(8 * r) = block_load<int32_t, 8>(sd.aq + ((size_t)tr * ngrp + gg) * 16);
-          a1.template select<8, 1>(8 * r) = block_load<int32_t, 8>(sd.aq + ((size_t)tr * ngrp + gg) * 16 + 8);
+          a0.template select<8, 1>(8 * r) = block_load<int32_t, 8>(ax.aq + ((size_t)tr * ngrp + gg) * 16);
+          a1.template select<8, 1>(8 * r) = block_load<int32_t, 8>(ax.aq + ((size_t)tr * ngrp + gg) * 16 + 8);
         }
         simd<int32_t, 16 * RC> ia = 0;
         ia = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ia, b0, a0);
@@ -3628,7 +3742,7 @@ static void w4n_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
 #pragma unroll
         for (int r = 0; r < RC; r++) {
           const int tl = p * RC + r, tr = t0 + (tl < nt ? tl : 0);
-          const float asr = sd.as[tr * ngrp + gg], sm = (float)sd.asum[tr * ngrp + gg];
+          const float asr = ax.as[tr * ngrp + gg], sm = (float)ax.asum[tr * ngrp + gg];
           acc[p].template select<16, 1>(16 * r) += (fa.template select<16, 1>(16 * r) - zp * sm) * ws * asr;
         }
       }
@@ -3665,18 +3779,18 @@ static void w4z_run(xik_ctx *c, const W4Args &a_in, int T) {
   W4Args a = a_in;
   if (w4n_use(T)) {
     static int32_t *aqb[4]; static float *asb[4]; static int32_t *smb[4]; static bool inited = false;
-    if (!inited) { for (int i = 0; i < 4; i++) { aqb[i] = sycl::malloc_device<int32_t>(64 * 3072 / 4, c->q.q); asb[i] = sycl::malloc_device<float>(64 * 48, c->q.q); smb[i] = sycl::malloc_device<int32_t>(64 * 48, c->q.q); } inited = true; }
-    const float *seenX[4] = {nullptr, nullptr, nullptr, nullptr}; int nseen = 0;
+    if (!inited) { const size_t mt = (size_t)std::max(64, c->max_tokens); for (int i = 0; i < 4; i++) { aqb[i] = sycl::malloc_device<int32_t>(mt * 3072 / 4, c->q.q); asb[i] = sycl::malloc_device<float>(mt * 48, c->q.q); smb[i] = sycl::malloc_device<int32_t>(mt * 48, c->q.q); } inited = true; }
+    const float *seenX[4] = {nullptr, nullptr, nullptr, nullptr}; int nseen = 0; W4AuxArr aux;
     for (int i = 0; i < a.n; i++) {
       int k = -1; for (int j = 0; j < nseen; j++) if (seenX[j] == a.s[i].X && a.s[i].K == 0 + a.s[i].K) { k = j; break; }
       if (k < 0) { k = nseen++; seenX[k] = a.s[i].X; k_aq(c, a.s[i].X, a.s[i].ldx, T, a.s[i].K, aqb[k], asb[k], smb[k]); }
-      a.s[i].aq = aqb[k]; a.s[i].as = asb[k]; a.s[i].asum = smb[k];
+      aux.v[i].aq = aqb[k]; aux.v[i].as = asb[k]; aux.v[i].asum = smb[k];
     }
     for (int t0 = 0; t0 < T; t0 += 64) {
       const int n = std::min(64, T - t0);
-      if (n == 1) w4n_r<1, 1>(c, a, t0, n); else if (n == 2) w4n_r<2, 1>(c, a, t0, n); else if (n <= 4) w4n_r<4, 1>(c, a, t0, n); else if (n <= 8) w4n_r<8, 1>(c, a, t0, n);
-      else if (n <= 16) w4n_r<8, 2>(c, a, t0, n); else if (n <= 24) w4n_r<8, 3>(c, a, t0, n); else if (n <= 32) w4n_r<8, 4>(c, a, t0, n);
-      else if (n <= 40) w4n_r<8, 5>(c, a, t0, n); else if (n <= 48) w4n_r<8, 6>(c, a, t0, n); else if (n <= 56) w4n_r<8, 7>(c, a, t0, n); else w4n_r<8, 8>(c, a, t0, n);
+      if (n == 1) w4n_r<1, 1>(c, a, aux, t0, n); else if (n == 2) w4n_r<2, 1>(c, a, aux, t0, n); else if (n <= 4) w4n_r<4, 1>(c, a, aux, t0, n); else if (n <= 8) w4n_r<8, 1>(c, a, aux, t0, n);
+      else if (n <= 16) w4n_r<8, 2>(c, a, aux, t0, n); else if (n <= 24) w4n_r<8, 3>(c, a, aux, t0, n); else if (n <= 32) w4n_r<8, 4>(c, a, aux, t0, n);
+      else if (n <= 40) w4n_r<8, 5>(c, a, aux, t0, n); else if (n <= 48) w4n_r<8, 6>(c, a, aux, t0, n); else if (n <= 56) w4n_r<8, 7>(c, a, aux, t0, n); else w4n_r<8, 8>(c, a, aux, t0, n);
     }
     return;
   }
