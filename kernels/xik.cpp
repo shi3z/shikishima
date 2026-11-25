@@ -2433,8 +2433,28 @@ void k_kv(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
   const bool kbf = c->kbf16;
   const int32_t *dpp = c->dparams;
   int ngrp = T * NKV, nst = sn ? 3 * KVD / HD : 0;
-  c->q.parallel_for(nd_range<1>((size_t)(ngrp + nst) * HD, HD), [=](nd_item<1> it) {
+  // XIK_FUSE3 (default on): the per-head q / r clipping (k_qr_clip) runs as extra work-groups of this launch (one group of 128 threads per (token, head))
+  static const bool f3 = !getenv("XIK_FUSE3") || atoi(getenv("XIK_FUSE3")) != 0;
+  const bool qr = f3 && !(abl_mask() & 64);
+  float *qq = c->qb, *rr = c->rb; const uint16_t *qcl = lw.q_clip, *rcl = lw.rel_clip;
+  const int nqr = qr ? T * NH : 0;
+  c->q.parallel_for(nd_range<1>((size_t)(ngrp + nst + nqr) * HD, HD), [=](nd_item<1> it) {
     int idx = it.get_group(0), d = it.get_local_id(0);
+    if (idx >= ngrp + nst) {
+      const int j = idx - ngrp - nst, t = j / NH, h = j % NH;
+      auto g = it.get_group();
+      float *qp = qq + (size_t)t * QD + h * HD;
+      const float v = qp[d] * bf2f(qcl[h * HD + d]);
+      const float ss = reduce_over_group(g, v * v, plus<float>());
+      const float f = sycl::fmin(QK_CLIP / (sycl::sqrt(ss) + 1e-6f), 1.0f);
+      qp[d] = rbf(v * f);
+      float *rp = rr + (size_t)t * RD + h * DREL;
+      const float rv = d < DREL ? rp[d] * bf2f(rcl[h * DREL + d]) : 0.f;
+      const float s2 = reduce_over_group(g, rv * rv, plus<float>());
+      const float f2 = sycl::fmin(REL_CLIP / (sycl::sqrt(s2) + 1e-6f), 1.0f);
+      if (d < DREL) rp[d] = rbf(rv * f2);
+      return;
+    }
     if (idx >= ngrp) {
       int j = (idx - ngrp) * HD + d;
       conv_state_write(ak, j);
@@ -5039,7 +5059,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     gemv_multi(c, g, T);
   }
   phase(c, P_GEMV_ATTN);
-  k_qr_clip(c, lw, T);
+  { static const bool f3 = !getenv("XIK_FUSE3") || atoi(getenv("XIK_FUSE3")) != 0; if (!f3 || (abl_mask() & 64)) k_qr_clip(c, lw, T); }
   k_kv(c, lw, slot, local, T, pos0);
   phase(c, P_KV);
   k_attn(c, lw, slot, local, T, pos0);
