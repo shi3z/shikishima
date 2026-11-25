@@ -1529,7 +1529,7 @@ ESIMD_INLINE void w3_ld_tile(const uint32_t *wp, const uint32_t *sp, size_t wst,
 }
 // Grouped GEMM for experts with more than 8 tokens: the INT3 expansion of every weight tile is done once and applied to up to 8 * NP tokens (NP independent DPAS accumulators of 8 tokens each),
 // instead of once per chunk of 8 tokens.  Only the tile-major layout (XIK_W3TM, default) is supported.
-template <int NP>
+template <int NP, int ABL = 0, bool SF = false>
 void moe_w3g_grp(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
   const int nrb = rows / 16, ntile = K / 128;
   const int32_t *desc = c->desc, *elist = c->elist;
@@ -1571,32 +1571,44 @@ void moe_w3g_grp(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const sycl:
             for (int g = 0; g < 4; g++) {
               simd<uint32_t, 16> a = wb[u].template select<16, 1>(48 * g), b = wb[u].template select<16, 1>(48 * g + 16), cc = wb[u].template select<16, 1>(48 * g + 32);
               simd<uint32_t, 256> B;
+              if constexpr (ABL & 1) {  // ablation (timing only, wrong numbers): no INT3 expansion, the loaded dwords feed the DPAS directly
 #pragma unroll
-              for (int rho = 0; rho < 16; rho++) B.template select<16, 1>(16 * rho) = w3m::pair_reg(rho, a, b, cc);
+                for (int rho = 0; rho < 16; rho++) B.template select<16, 1>(16 * rho) = (rho & 1) ? a : ((rho & 2) ? b : cc);
+              } else {
+#pragma unroll
+                for (int rho = 0; rho < 16; rho++) B.template select<16, 1>(16 * rho) = w3m::pair_reg(rho, a, b, cc);
+              }
               simd<sycl::half, 512> bh = B.template bit_cast_view<sycl::half>();
-              bh -= (sycl::half)1028.0f;
+              if constexpr (!(ABL & 1)) bh -= (sycl::half)1028.0f;
+              if constexpr (SF) {  // APPROXIMATE (fp16 rounding of code x scale, 5e-4 relative): the 64-K group scale is folded into B, DPAS accumulates straight into acc
+                simd<sycl::half, 16> sh0 = sb[u].template select<8, 1>(8 * (g >> 1)).template bit_cast_view<sycl::half>();
+                simd<sycl::half, 32> srep;
+                srep.template select<16, 2>(0) = sh0; srep.template select<16, 2>(1) = sh0;
+#pragma unroll
+                for (int rho = 0; rho < 16; rho++) bh.template select<32, 1>(32 * rho) *= srep;
+              }
               simd<int32_t, 256> bi = bh.template bit_cast_view<int32_t>();
-              simd<int32_t, 128> xa[NP];  // activations of this 32-K group: 8 rows x 16 dwords per pass (one 64 B load per row)
 #pragma unroll
-              for (int p = 0; p < NP; p++)
-                if (p * 8 < n)
+              for (int p = 0; p < NP; p++) {
+                if (p * 8 < n) {
+                  // activations of this 32-K group for the 8 tokens of pass p (one 64 B load per row); only one pass worth of registers is live at a time
+                  simd<int32_t, 128> xa;
 #pragma unroll
-                  for (int r = 0; r < 8; r++) xa[p].template select<16, 1>(16 * r) = block_load<int32_t, 16>(reinterpret_cast<const int32_t *>(xr[p * 8 + r]) + (size_t)t * 64 + 16 * g);
+                  for (int r = 0; r < 8; r++) xa.template select<16, 1>(16 * r) = block_load<int32_t, 16>(reinterpret_cast<const int32_t *>(xr[p * 8 + r]) + (size_t)t * 64 + 16 * g);
+                  simd<float, 128> z = 0.f;
 #pragma unroll
-              for (int s2 = 0; s2 < 2; s2++) {
-                simd<int32_t, 128> bs = bi.template select<128, 1>(128 * s2);
-#pragma unroll
-                for (int p = 0; p < NP; p++) {
-                  if (p * 8 < n) {
+                  for (int s2 = 0; s2 < 2; s2++) {
+                    simd<int32_t, 128> bs = bi.template select<128, 1>(128 * s2);
                     simd<int32_t, 64> av;
 #pragma unroll
-                    for (int r = 0; r < 8; r++) av.template select<8, 1>(8 * r) = xa[p].template select<8, 1>(16 * r + 8 * s2);
-                    simd<float, 128> z = 0.f;
-                    ag[p] = xmx::dpas<8, 8, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(((g & 1) == 0 && s2 == 0) ? z : ag[p], bs, av);
+                    for (int r = 0; r < 8; r++) av.template select<8, 1>(8 * r) = xa.template select<8, 1>(16 * r + 8 * s2);
+                    if constexpr (ABL & 2) { simd<float, 128> tt = bs.template bit_cast_view<float>(); tt.template select<64, 1>(0) += av.template bit_cast_view<float>(); ag[p] = (((g & 1) == 0 && s2 == 0) ? z : ag[p]) + tt; }  // ablation: no DPAS
+                    else if constexpr (SF) acc[p] = xmx::dpas<8, 8, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(acc[p], bs, av);
+                    else ag[p] = xmx::dpas<8, 8, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(((g & 1) == 0 && s2 == 0) ? z : ag[p], bs, av);
                   }
                 }
               }
-              if (g & 1) {
+              if (!SF && (g & 1)) {
                 simd<sycl::half, 16> sh = sb[u].template select<8, 1>(8 * (g >> 1)).template bit_cast_view<sycl::half>();
                 simd<float, 16> sf = sh;
 #pragma unroll
@@ -1625,10 +1637,18 @@ void moe_w3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half 
   static const bool w3split = getenv("XIK_W3SPLIT") && atoi(getenv("XIK_W3SPLIT"));
   static const int grp_np = getenv("XIK_W3GRP") ? atoi(getenv("XIK_W3GRP")) : 2;  // 0 = off, 2 / 3 / 4 = passes of 8 tokens sharing the expanded weights
   static const int grp_min = getenv("XIK_W3GMIN") ? atoi(getenv("XIK_W3GMIN")) : 40;  // widest pass below which the standard kernel is used (the extra launch costs more than it saves)
+  static const bool grp_sf = getenv("XIK_W3GSF") && atoi(getenv("XIK_W3GSF"));  // fold the group scale into the fp16 operand (approximate)
   static const bool tm_on = !getenv("XIK_W3TM") || atoi(getenv("XIK_W3TM")) != 0;
   if (grp_np > 0 && tm_on && maxper >= grp_min && ksd == 1 && nb_env == 2) {
     moe_w3g_t<false, 1, 2, -1, false, true>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
-    if (grp_np == 4) moe_w3g_grp<4>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    static const int gabl = getenv("XIK_W3GABL") ? atoi(getenv("XIK_W3GABL")) : 0;  // timing-only ablation of the grouped kernel: 1 no expansion, 2 no DPAS
+    if (gabl == 1) moe_w3g_grp<2, 1>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    else if (gabl == 2) moe_w3g_grp<2, 2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    else if (gabl == 3) moe_w3g_grp<2, 3>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    else if (grp_sf && grp_np == 4) moe_w3g_grp<4, 0, true>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    else if (grp_sf && grp_np == 3) moe_w3g_grp<3, 0, true>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    else if (grp_sf && grp_np == 2) moe_w3g_grp<2, 0, true>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
+    else if (grp_np == 4) moe_w3g_grp<4>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
     else if (grp_np == 3) moe_w3g_grp<3>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
     else moe_w3g_grp<2>(c, W, S, X16, ldx, w13, maxper, maxslots, rows, K, Y, ystride, ldy);
     return;
@@ -5499,6 +5519,7 @@ static int do_forward(xik_ctx *c, const int32_t *ids, int T, float *logits_last,
 }
 
 extern "C" int xik_forward(xik_ctx *c, const int32_t *ids, int T, float *logits_last, int32_t *out_argmax) {
+  { static bool once = false; if (!once) { once = true;if (getenv("XIK_ARGSZ")) fprintf(stderr, "kernel argument structs (bytes): W4Args %zu DArgs %zu GArgs %zu CtlFArgs %zu MixArgs %zu NormArgs %zu ConvArgs %zu PairArgs %zu BlendArgs %zu\n", sizeof(W4Args), sizeof(DArgs), sizeof(GArgs), sizeof(CtlFArgs), sizeof(MixArgs), sizeof(NormArgs), sizeof(ConvArgs), sizeof(PairArgs), sizeof(BlendArgs)); } }
   return do_forward(c, ids, T, logits_last, out_argmax, false);
 }
 

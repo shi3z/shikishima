@@ -114,3 +114,21 @@ Hybrid decode-only tok/s (K3x, one card each, 5 repeats, mean of two runs for th
 * T = 1 side: `qr_clip` fused into the kv launch (+0.8 tok/s), router launch also converts the MLP input and builds the expert groups (+0.4 tok/s), and **kernel-argument size**: the native path's int8 activation pointers (24 B x 8 segments) were part of the arguments of the decode attention kernels; moving them into a separate struct took the plain decode from 98.4 to 99.3-100.3 tok/s on the same prompt (the same change in the opposite direction, adding 40 B of conv pointers to the argument struct, cost 1 % and was reverted together with the wo + conv epilogue it served, which also did not pay off: 97.4 vs 98.4 tok/s).
 
 Targets not reached in this session: XMX Active >= 30 % (best 12.8 % in a real-model kernel; the roofline bound for weight-streaming kernels is derived in section 2), 200 tok/s code generation / 150 tok/s prose (plain 99-100, Hybrid 137 on code and 91 on prose), ISA-level hand scheduling (the kernels above are ESIMD intrinsics; ISA was inspected through the counters and the JIT dump, not hand-written).
+
+## 11. Why the grouped MoE kernel reaches 198 GB/s: ablation (T = 256 pass, K3x, one B60)
+
+`XIK_W3GABL` (timing only, wrong numbers): 1 = no INT3 expansion (the loaded dwords feed the DPAS directly), 2 = no DPAS.
+
+| variant | pass time | grouped kernel per call | bytes / time (all 128 experts, 208 MB per call on average) |
+|---|---|---|---|
+| full | 378.5 ms (354.0 ms after the register restructuring below) | 1048 us | 198 GB/s |
+| no expansion | 295.3 ms | 506 us | **411 GB/s = 90 % of the 456 GB/s peak** (the ceiling of exactly this access pattern) |
+| no DPAS | 371.0 ms | - | - |
+
+The DRAM access pattern (tile-major, contiguous per expert, 5k-18k threads) can run at 411 GB/s; the kernel reaches half of it because **the INT3 expansion ALU work is the limit** (about 192 ALU instructions per 16 x 128 weight tile, ALU1 32 % busy, ALU : DPAS = 7 : 1), not DRAM and not the DPAS (removing the DPAS saves 2 %). VTune's "DRAM read" column of the no-expansion run (163 GB/s) disagrees with bytes / time and should not be used for this kernel.
+Changes made from this: the activations of one 32-K group are loaded one pass (8 tokens) at a time instead of all NP passes at once (live registers -8 x (NP - 1) GRF): T = 256 pass 378.7 -> 354.0 ms (723 tok/s), T = 64 108.7 -> 105.1 ms. NP = 3 / 4 stay slower in the exact kernel (spills); with the group scale folded into the fp16 operand (`XIK_W3GSF=1`, approximate, 5e-4 relative rounding of code x scale; no `ag` accumulator set) NP = 3 / 4 no longer spill but are only marginally faster (T = 256: 349 / 352 ms vs 356 ms for NP = 2), because the average expert holds about 16 tokens at T = 256 (NP = 2 already covers it). The remaining lever is the expansion cost per weight (about 0.1 ALU instruction per weight with the fp16 magic-number scheme), i.e. a cheaper 3-bit container or expansion shared across threads through SLM, not the DPAS / memory pipeline.
+
+## 12. Kernel arguments (plain decode)
+
+Sizes (`XIK_ARGSZ=1`): W4Args 456 B, DArgs 464 B, GArgs 464 B, CtlFArgs 392 B, MixArgs 120 B, NormArgs / ConvArgs / PairArgs 80 B, BlendArgs 152 B. Launch cost depends on the argument size: W4Args at 648 B (native-path activations in the segments) was 15 % slower than 456 B when the wo conv fields were added on top, DSeg shrunk from 592 to 464 B gave K1 +0.8 %. A compile-time segment count (one segment for wo: 64 B arguments) was slower (99.5 vs 100.3 tok/s), so it was reverted: the cost is not simply linear in the bytes.
+6 tasks x 5 repeats (plain decode-only median, current build): K3x 100.25 / 100.38 / 100.21 / 100.08 / 99.51 / 99.44 (code / history / prose / repeat / edit_py / jsonl, geo-mean 100.0), K1 88.03 / 87.73 / 88.00 / 88.31 / 87.99 / 87.52 (geo-mean 87.9).
