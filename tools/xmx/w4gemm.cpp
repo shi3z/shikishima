@@ -103,10 +103,55 @@ void k_expand(queue &q, const uint32_t *W, const sycl::half *S, const sycl::half
   });
 }
 
+
+// 3-bit codes as a u2 plane pair + a bit plane, consumed by native u2 x s8 DPAS without any weight expansion (3 dwords per lane and 32-K chunk = 3 bits per weight):
+//   dwords 0..1: bits 0..1 of the 32 codes (u2 B operand, field j of dword kd = K 16 kd + j);  dword 2: bit 2 of weights K 0..15 at the even bit positions and of K 16..31 at the odd ones
+//   -> plane 3 operand = { Z & 0x55555555, (Z >> 1) & 0x55555555 }  (3 ALU instructions per chunk and lane);  code = plane12 + 4 plane3, weight = code - 4
+template <int T>
+void k_planar(queue &q, const int32_t *W, const sycl::half *S, const int32_t *A8, const float *AS, float *out) {
+  constexpr int RC = T < 8 ? T : 8, NP = T / RC;
+  q.parallel_for(range<1>(NTH), [=](id<1> id) SYCL_ESIMD_KERNEL {
+    const int th = (int)id[0];
+    simd<float, 16 * RC> facc[NP];
+    for (int p = 0; p < NP; p++) facc[p] = 0.f;
+    for (int g = 0; g < NG; g++) {
+      simd<int32_t, 32> p0 = block_load<int32_t, 32>(W + (((size_t)(2 * g) * NTH + th) * 48));
+      simd<int32_t, 16> z0 = block_load<int32_t, 16>(W + (((size_t)(2 * g) * NTH + th) * 48) + 32);
+      simd<int32_t, 32> p1 = block_load<int32_t, 32>(W + (((size_t)(2 * g + 1) * NTH + th) * 48));
+      simd<int32_t, 16> z1 = block_load<int32_t, 16>(W + (((size_t)(2 * g + 1) * NTH + th) * 48) + 32);
+      simd<sycl::half, 16> sh = block_load<sycl::half, 16>(S + ((size_t)g * NTH + th) * 16);
+      simd<float, 16> ws = sh;
+      simd<int32_t, 32> q0, q1;
+      q0.template select<16, 1>(0) = z0 & 0x55555555; q0.template select<16, 1>(16) = (z0 >> 1) & 0x55555555;
+      q1.template select<16, 1>(0) = z1 & 0x55555555; q1.template select<16, 1>(16) = (z1 >> 1) & 0x55555555;
+#pragma unroll
+      for (int p = 0; p < NP; p++) {
+        simd<int32_t, 8 * RC> a0, a1;
+#pragma unroll
+        for (int r = 0; r < RC; r++) {
+          a0.template select<8, 1>(8 * r) = block_load<int32_t, 8>(A8 + (size_t)(p * RC + r) * (K / 4) + (2 * g) * 8);
+          a1.template select<8, 1>(8 * r) = block_load<int32_t, 8>(A8 + (size_t)(p * RC + r) * (K / 4) + (2 * g + 1) * 8);
+        }
+        simd<int32_t, 16 * RC> i12 = 0, i3 = 0;
+        i12 = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, AT::u2, AT::s8>(i12, p0, a0);
+        i3 = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, AT::u2, AT::s8>(i3, q0, a0);
+        i12 = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, AT::u2, AT::s8>(i12, p1, a1);
+        i3 = xmx::dpas<8, RC, int32_t, int32_t, int32_t, int32_t, AT::u2, AT::s8>(i3, q1, a1);
+        simd<int32_t, 16 * RC> tot = i12 + (i3 << 2);  // code * activation sum; the centring (- 4 * sum of activations) is applied with the scales in the real kernel
+        simd<float, 16 * RC> fa = convert<float>(tot);
+#pragma unroll
+        for (int r = 0; r < RC; r++) facc[p].template select<16, 1>(16 * r) += fa.template select<16, 1>(16 * r) * (ws * AS[(size_t)(p * RC + r) * NG + g]);
+      }
+    }
+    simd<float, 16> s = 0;
+    for (int p = 0; p < NP; p++) s += facc[p].template select<16, 1>(0);
+    s.copy_to(out + th * 16);
+  });
+}
 int main(int argc, char **argv) {
   queue q{gpu_selector_v};
   const int ncopy = 8, iters = argc > 1 ? atoi(argv[1]) : 60;
-  const size_t wdw = (size_t)NCH * NTH * 64, sh = (size_t)NG * NTH * 16;
+  const size_t wdw = (size_t)NCH * NTH * 64, sh = (size_t)NG * NTH * 16;  // 64 dwords per thread and chunk (4-bit); the planar 3-bit format uses the first 48
   int32_t *W = malloc_device<int32_t>(wdw * ncopy, q);
   sycl::half *S = malloc_device<sycl::half>(sh * ncopy, q);
   int32_t *A8 = malloc_device<int32_t>((size_t)64 * K / 4, q);
@@ -117,7 +162,7 @@ int main(int argc, char **argv) {
   q.parallel_for(range<1>((size_t)64 * K / 4), [=](id<1> i) { A8[i[0]] = (int32_t)(0x01020304u * (1 + i[0] % 5)); }).wait();
   q.parallel_for(range<1>((size_t)64 * K), [=](id<1> i) { AH[i[0]] = (sycl::half)(0.01f * (1 + i[0] % 9)); }).wait();
   q.parallel_for(range<1>(64 * NG), [=](id<1> i) { AS[i[0]] = 0.01f; }).wait();
-  const double wbytes = (double)wdw * 4 + (double)sh * 2;
+  const double wbytes = (double)wdw * 4 + (double)sh * 2, wbytes3 = (double)NCH * NTH * 48 * 4 + (double)sh * 2;
   printf("weights per call: %.1f MB (4-bit + fp16 scale per 64 K), 1152 threads, K=%d, T tokens; roofline at 456 GB/s = %.1f us\n", wbytes / 1e6, K, wbytes / 456e9 * 1e6);
   auto bench = [&](const char *name, auto launch, int T) {
     for (int w = 0; w < 4; w++) { launch(w % ncopy); q.wait(); }
@@ -126,12 +171,13 @@ int main(int argc, char **argv) {
     q.wait();
     double us = (now() - t0) / iters * 1e6;
     const double ops = 2.0 * T * 1152 * 16 * K;
-    printf("T=%2d %-7s %7.1f us  %6.1f GB/s  %6.2f TOPS\n", T, name, us, wbytes / us / 1e3, ops / us / 1e6);
+    const double wb = name[0] == 'p' ? wbytes3 : wbytes; printf("T=%2d %-7s %7.1f us  %6.1f GB/s  %6.2f TOPS\n", T, name, us, wb / us / 1e3, ops / us / 1e6);
     fflush(stdout);
   };
 #define RUN(TT) \
   bench("native", [&](int c) { k_native<TT>(q, W + wdw * c, S + sh * c, A8, AS, out); }, TT); \
-  bench("expand", [&](int c) { k_expand<TT>(q, (const uint32_t *)(W + wdw * c), S + sh * c, AH, out); }, TT);
+  bench("expand", [&](int c) { k_expand<TT>(q, (const uint32_t *)(W + wdw * c), S + sh * c, AH, out); }, TT); \
+  bench("planar3", [&](int c) { k_planar<TT>(q, W + wdw * c, S + sh * c, A8, AS, out); }, TT);
   RUN(1) RUN(2) RUN(4) RUN(8) RUN(16) RUN(32) RUN(64)
   return 0;
 }
