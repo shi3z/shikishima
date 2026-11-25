@@ -109,14 +109,14 @@ int main(int argc, char **argv) {
   const size_t wdw = (size_t)NCH * NTH * 64, sh = (size_t)NG * NTH * 16;
   int32_t *W = malloc_device<int32_t>(wdw * ncopy, q);
   sycl::half *S = malloc_device<sycl::half>(sh * ncopy, q);
-  int32_t *A8 = malloc_device<int32_t>((size_t)16 * K / 4, q);
-  sycl::half *AH = malloc_device<sycl::half>((size_t)16 * K, q);
-  float *AS = malloc_device<float>(16 * NG, q), *out = malloc_device<float>(NTH * 16, q);
+  int32_t *A8 = malloc_device<int32_t>((size_t)64 * K / 4, q);
+  sycl::half *AH = malloc_device<sycl::half>((size_t)64 * K, q);
+  float *AS = malloc_device<float>(64 * NG, q), *out = malloc_device<float>(NTH * 16, q);
   q.parallel_for(range<1>(wdw * ncopy), [=](id<1> i) { uint32_t x = (uint32_t)i[0] * 2654435761u; x ^= x >> 15; x *= 2246822519u; x ^= x >> 13; W[i[0]] = (int32_t)x; }).wait();
   q.parallel_for(range<1>(sh * ncopy), [=](id<1> i) { S[i[0]] = (sycl::half)(0.001f * (1 + (i[0] % 7))); }).wait();
-  q.parallel_for(range<1>((size_t)16 * K / 4), [=](id<1> i) { A8[i[0]] = (int32_t)(0x01020304u * (1 + i[0] % 5)); }).wait();
-  q.parallel_for(range<1>((size_t)16 * K), [=](id<1> i) { AH[i[0]] = (sycl::half)(0.01f * (1 + i[0] % 9)); }).wait();
-  q.parallel_for(range<1>(16 * NG), [=](id<1> i) { AS[i[0]] = 0.01f; }).wait();
+  q.parallel_for(range<1>((size_t)64 * K / 4), [=](id<1> i) { A8[i[0]] = (int32_t)(0x01020304u * (1 + i[0] % 5)); }).wait();
+  q.parallel_for(range<1>((size_t)64 * K), [=](id<1> i) { AH[i[0]] = (sycl::half)(0.01f * (1 + i[0] % 9)); }).wait();
+  q.parallel_for(range<1>(64 * NG), [=](id<1> i) { AS[i[0]] = 0.01f; }).wait();
   const double wbytes = (double)wdw * 4 + (double)sh * 2;
   printf("weights per call: %.1f MB (4-bit + fp16 scale per 64 K), 1152 threads, K=%d, T tokens; roofline at 456 GB/s = %.1f us\n", wbytes / 1e6, K, wbytes / 456e9 * 1e6);
   auto bench = [&](const char *name, auto launch, int T) {
@@ -132,6 +132,6 @@ int main(int argc, char **argv) {
 #define RUN(TT) \
   bench("native", [&](int c) { k_native<TT>(q, W + wdw * c, S + sh * c, A8, AS, out); }, TT); \
   bench("expand", [&](int c) { k_expand<TT>(q, (const uint32_t *)(W + wdw * c), S + sh * c, AH, out); }, TT);
-  RUN(1) RUN(2) RUN(4) RUN(8) RUN(16)
+  RUN(1) RUN(2) RUN(4) RUN(8) RUN(16) RUN(32) RUN(64)
   return 0;
 }

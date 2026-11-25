@@ -86,3 +86,12 @@ Activation int8 quantisation does not change the quality (KL 0.0268 vs 0.0272) a
 
 `XIK_ROUTE_STATS=1` (host sync per call, diagnostic) on the `--bench-prefill` token ids (not natural text): T = 8: 26.0 distinct experts per MoE call, 2.47 tokens per used expert; T = 16: 34.7 distinct experts, 3.69 tokens per used expert (histogram of tokens per expert in the log of the run: 1: 4906, 2: 1968, 3: 1134, 4: 773, ... 8: 363 of 400 calls at T = 8). The production W3 MoE moves 26 x 3.24 MB = 84 MB per visit at T = 8 and 112 MB at T = 16 and takes about 260 us / 430 us per visit (w13 + w2): 326 GB/s (71 % of the DRAM peak) and 260 GB/s (57 %), against 360 GB/s (79 %) at T = 1. (An earlier statement of "37 %" in this file was derived from VTune's average read bandwidth, which under-counts; the bytes / time figure above is the one to use.)
 The T > 1 W3 kernel split into one launch per tokens-per-expert class (`XIK_W3SPLIT=1`, with the activation prefetch enabled for R = 4) is slower (T = 8: 24.5 -> 30.0 ms, T = 16: 40.1 -> 51.2 ms), so neither the register spill nor the per-group activation loads of the R = 4 / 8 bodies are the limiting factor; the remaining distance to the roofline at T = 16 is ALU (ALU1 active 36 % on K3x, XVE stalled 34 %, SBID 30 %) and the number of distinct experts.
+
+## 7. Concurrent kernel execution (`tools/xmx/concurrency.cpp`)
+
+Two in-order queues of the B60 run kernels concurrently only when several compute command streamers are exposed (`ZEX_NUMBER_OF_CCS=4`): streaming kernel A 4.1 ms, latency-bound kernel B 1.0 ms, A then B in one queue 5.0 ms, A and B in two queues 3.5 ms (without the variable: 5.05 ms, serialised). The engine's L2-prefetch of the next visit's attention weights on a side queue (`XIK_AWPF=2`) is still slower with concurrency enabled (K3x plain 87.3 vs 98.9 tok/s), so it stays off.
+
+## 8. Status of the requested work items (end of this session)
+
+Done and measured: micro-benchmarks (DPAS peak per type / repeat count / accumulators, register / SLM / L2 / DRAM operand sources, mixed int4 x int8), roofline bound, T = 1..64 reuse-versus-effective-TOPS sweep (`w4gemm`), native u4 x s8 DPAS in the real model (`XIK_W4N`), routing statistics and MoE bandwidth decomposition (`XIK_ROUTE_STATS`), K3x hardware counters.
+Not done: ISA-level hand-written software pipeline (the DPAS micro-benchmarks use the ESIMD intrinsics, not hand-written ISA), GQA query-head batching of attention, controller stream batching (the three streams use different weights per stream), expert-centric MoE rescheduling.
