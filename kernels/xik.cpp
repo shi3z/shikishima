@@ -2750,6 +2750,79 @@ extern "C" int xik_route_dump(xik_ctx *c, const char *path) {
     return 0;
   } catch (std::exception &e) { g_err = e.what(); return 1; }
 }
+// top-8 of sigmoid(logit) + bias for one token with one sub-group (16 lanes x 8 experts); ties -> lower index; weights normalised and scaled (as k_router)
+template <class SG>
+inline void route_top8(SG sg, int lane, const float *logit, const float *bias, int32_t *ridx, float *rwt) {
+  float s[8], cur[8];
+#pragma unroll
+  for (int j = 0; j < 8; j++) { s[j] = sigmoidf(logit[lane + 16 * j]); cur[j] = s[j] + bias[lane + 16 * j]; }
+  float chosen_w[TOPK]; int chosen_i[TOPK];
+  for (int k = 0; k < TOPK; k++) {
+    float lb = cur[0]; int le = lane;
+#pragma unroll
+    for (int j = 1; j < 8; j++) if (cur[j] > lb) { lb = cur[j]; le = lane + 16 * j; }
+    float m = reduce_over_group(sg, lb, maximum<float>());
+    int cand = (lb == m) ? le : NE;
+    int idx = reduce_over_group(sg, cand, minimum<int>());
+    float sv = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; j++) if (lane + 16 * j == idx) sv = s[j];
+    float sw = reduce_over_group(sg, sv, plus<float>());
+    chosen_i[k] = idx; chosen_w[k] = sw;
+#pragma unroll
+    for (int j = 0; j < 8; j++) if (lane + 16 * j == idx) cur[j] = -3.0e38f;
+  }
+  if (lane == 0) {
+    float sum = 0.f;
+    for (int k = 0; k < TOPK; k++) sum += chosen_w[k];
+    for (int k = 0; k < TOPK; k++) { ridx[k] = chosen_i[k]; rwt[k] = chosen_w[k] / (sum + 1e-20f) * ROUTE_SCALE; }
+  }
+}
+// T == 1: router GEMV (K split in 4 chunks per row, partials added in chunk order: APPROXIMATE rounding order) and top-8 in one launch: the last work-group to finish
+// (atomic ticket) selects the experts.  XIK_RFUSE=0 restores the separate GEMV / top-8 launches.
+static void router_fused(xik_ctx *c, const LayerW &lw) {
+  const uint16_t *W = lw.router; const float *X = c->in[0]; const float *bias = lw.router_bias;
+  float *logit = c->tmp1; int32_t *ridx = c->ridx; float *rwt = c->rwt;
+  static uint32_t *ctr = nullptr;
+  if (!ctr) { ctr = sycl::malloc_device<uint32_t>(16, c->q.q); c->q.memset(ctr, 0, 64).wait(); }
+  uint32_t *ctr_ = ctr;
+  constexpr int NWG = NE / 2, KB = D / 8, QB = KB / 4;
+  c->q.submit([&](handler &h) {
+    local_accessor<float, 1> red(range<1>(8), h);
+    local_accessor<int, 1> last(range<1>(1), h);
+    h.parallel_for(nd_range<1>((size_t)NWG * 128, 128), [=](nd_item<1> it) SUBGROUP16 {
+      auto sg = it.get_sub_group();
+      const int lane = sg.get_local_linear_id(), wg = it.get_group(0), sgid = it.get_local_id(0) / 16;
+      const int row = wg * 2 + sgid / 4, q = sgid % 4;
+      float acc = 0.f;
+      for (int kb = q * QB + lane; kb < (q + 1) * QB; kb += 16) {
+        vec<float, 4> a = *reinterpret_cast<const vec<float, 4> *>(X + kb * 8);
+        vec<float, 4> b = *reinterpret_cast<const vec<float, 4> *>(X + kb * 8 + 4);
+        vec<uint32_t, 4> w = *reinterpret_cast<const vec<uint32_t, 4> *>(W + (size_t)row * D + kb * 8);
+        float xv[8], wf[8];
+        for (int i = 0; i < 4; i++) { xv[i] = a[i]; xv[4 + i] = b[i]; wf[2 * i] = sycl::bit_cast<float>(w[i] << 16); wf[2 * i + 1] = sycl::bit_cast<float>(w[i] & 0xFFFF0000u); }
+        for (int i = 0; i < 8; i++) acc += wf[i] * xv[i];
+      }
+      float r = reduce_over_group(sg, acc, plus<float>());
+      if (lane == 0) red[sgid] = r;
+      group_barrier(it.get_group());
+      if (lane == 0 && q == 0) logit[row] = ((red[sgid] + red[sgid + 1]) + red[sgid + 2]) + red[sgid + 3];
+      group_barrier(it.get_group());
+      if (it.get_local_id(0) == 0) {
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> ar(*ctr_);
+        const uint32_t old = ar.fetch_add(1u);
+        last[0] = (old == NWG - 1) ? 1 : 0;
+        if (old == NWG - 1) ar.store(0u);
+      }
+      group_barrier(it.get_group());
+      if (last[0] && sgid == 0) {
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+        route_top8(sg, lane, logit, bias, ridx, rwt);
+      }
+    });
+  });
+}
 void k_router(xik_ctx *c, const LayerW &lw, int T) {
   static const char *rr_path = getenv("XIK_ROUTE_REPLAY");
   static const bool rec = getenv("XIK_ROUTE_REC") && atoi(getenv("XIK_ROUTE_REC"));
@@ -4812,9 +4885,14 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   }
 
   // ---- MoE
-  gemv_bf16_old(c, lw.router, c->in[0], D, c->tmp1, NE, NE, D, T, false);
+  static const bool rfuse = !getenv("XIK_RFUSE") || atoi(getenv("XIK_RFUSE")) != 0;
   const bool fr = fuse_route() && T == 1 && !use_int8() && !getenv("XIK_OLD_FP8");
-  if (fr) k_route_fused1(c, lw); else k_router(c, lw, T);
+  static const bool rr_active = getenv("XIK_ROUTE_REPLAY") || (getenv("XIK_ROUTE_REC") && atoi(getenv("XIK_ROUTE_REC")));
+  if (rfuse && T == 1 && !fr && !rr_active && !abl_mask()) router_fused(c, lw);
+  else {
+    gemv_bf16_old(c, lw.router, c->in[0], D, c->tmp1, NE, NE, D, T, false);
+    if (fr) k_route_fused1(c, lw); else k_router(c, lw, T);
+  }
   phase(c, P_MOE_ROUTE);
   int np = T * TOPK;
   int nks = 1;
