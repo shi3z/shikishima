@@ -160,3 +160,14 @@ Why plain decode was 11.3 ms/token while `--bench-prefill` T=1 shows 10.8 ms: th
 | router GEMV: one sub-group per (row, token) (was rows/4 sub-groups = 32 hardware threads), bit-identical (md5 equal) | T=8 pass 26.9 -> 24.6 ms, T=16 44.1 -> 39.9 ms, T=1 plain +1.0 tok/s | `XIK_RGV=0` restores |
 | key-split attention (`k_attn_p<4>`: 512 threads per (token, head), logits one key per thread, P.V in 4 chunks added in chunk order): approximate accumulation order, same for plain and verify passes | n=256: 89.7 -> 91.2 tok/s; KL unchanged (K3 mean 0.0281 -> 0.0286, K1 0.0129 -> 0.0124, per-task differences within +/-0.003) | `XIK_ATTNP=0` restores, 2/4/8 |
 | W3 T>1 kernel split into three launches by tokens per expert (one body per kernel) | T=8 24.5 -> 30.5 ms (worse): the spill is not what limits the T>1 W3 kernel | `XIK_W3SPLIT=1`, off |
+
+### 6 tasks x 5 repeats after the parallel-structure round (build with RGV, ROUTER1, ARGMAX2, FUSE2, ATTNP=4; decode-only tok/s, median)
+
+| config | plain code / history / prose / repeat / edit_py / jsonl | plain geo | Hybrid code / history / prose / repeat / edit_py / jsonl | Hybrid geo |
+|---|---|---|---|---|
+| K0 | 78.5 78.5 78.4 78.3 78.2 78.0 | 78.3 | 94.7 84.8 76.6 283.0 278.0 115.1 | 133.1 |
+| K1 | 85.3 85.4 85.3 85.2 84.9 84.8 | 85.2 | 103.0 91.0 83.6 109.2 290.7 164.8 | 126.5 |
+| K3 | 95.0 95.1 95.0 94.9 94.6 94.5 | **94.8** | 104.2 99.8 91.8 115.7 301.6 106.9 | 123.6 |
+
+Plain: +4.6 (K0), +5.6 (K1), +6.9 tok/s (K3) over the previous matrix (73.7 / 79.6 / 87.9); K3 is 10.5 ms/token, 0.5 ms above the 100 tok/s target.
+Hybrid on `repeat` / `jsonl` fell for K1 / K3 (291 -> 116 for K3 repeat): with `XIK_ATTNP=0` the K3 repeat prompt gives 324 tok/s (copy drafter accepts 100 %), with `XIK_ATTNP=4` the greedy text leaves the repetition earlier (copy acceptance 67 %, 141 plain rounds). Plain and Hybrid output are identical for both settings (md5), so this is a trajectory change, not a speculative-decoding inconsistency.
