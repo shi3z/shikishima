@@ -375,7 +375,7 @@ static std::map<const void *, W4Alt> g_w4alt;
 struct W4Seg { const uint32_t *W, *SZ; const float *X; float *Y; int rows, K, ldx, ldy, rnd, wg0; };
 struct W4Args {
   W4Seg s[8]; int n = 0, total_wg = 0;
-  void add(const W4Alt &w, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool rnd) { s[n] = W4Seg{w.w, w.sz, X, Y, rows, K, ldx, ldy, (int)rnd, total_wg}; total_wg += rows / 16; n++; }
+  void add(const W4Alt &w, const float *X, int ldx, float *Y, int ldy, int rows, int K, bool rnd) { s[n] = W4Seg{w.w, w.sz, X, Y, rows, K, ldx, ldy, (int)rnd, total_wg}; total_wg += (rows + 15) / 16; n++; }
 };
 static void w4z_run(xik_ctx *c, const W4Args &a, int T);
 struct DSeg {
@@ -3493,7 +3493,11 @@ static void w4z_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
       }
 #pragma unroll
       for (int r = 0; r < R; r++)
-        if (r < nt) { simd<float, 16> o = sum.template select<16, 1>(16 * r); o.copy_to(sd.Y + (size_t)(t0 + r) * sd.ldy + rb * 16); }
+        if (r < nt) {
+          simd<float, 16> o = sum.template select<16, 1>(16 * r);
+          if ((rb + 1) * 16 <= sd.rows) o.copy_to(sd.Y + (size_t)(t0 + r) * sd.ldy + rb * 16);
+          else for (int i = 0; i < 16; i++) if (rb * 16 + i < sd.rows) sd.Y[(size_t)(t0 + r) * sd.ldy + rb * 16 + i] = o[i];  // rows padded to a multiple of 16
+        }
     }
   });
 }
@@ -3628,19 +3632,23 @@ int xik_finalize(xik_ctx *c) {
       }
       {
         size_t lp = name.find("layers."); int ly = lp == std::string::npos ? -1 : atoi(name.c_str() + lp + 7);
-        if (!mtp && ly >= 0 && ly < 24 && K % 64 == 0 && rows % 16 == 0 && aw4_selected(name, ly)) {
+        if (!mtp && ly >= 0 && ly < 24 && K % 64 == 0 && (rows % 16 == 0 || name.find("attn_sink_proj") != std::string::npos) && aw4_selected(name, ly)) {
           static const int aasym = getenv("XIK_AW4_ASYM") ? atoi(getenv("XIK_AW4_ASYM")) : 1;
           static const int aobj = getenv("XIK_AW4_OBJ") ? atoi(getenv("XIK_AW4_OBJ")) : (getenv("XIK_ACT_STATS_FILE") ? 2 : 1);
           ensure_ast();
           auto has2 = [&](const char *sub) { return name.find(sub) != std::string::npos; };
-          int kind = has2("attn.wo_ud") ? 3 : (has2("attn.wk_dv") && !is_local(ly)) ? 1 : (has2("attn.wv_dv") && !is_local(ly)) ? 2 : 0;
+          int kind = has2("attn.wo_ud") ? 3 : ((has2("attn.wk_dv") || has2("k_sconv.weight_proj")) && !is_local(ly)) ? 1 : ((has2("attn.wv_dv") || has2("v_sconv.weight_proj")) && !is_local(ly)) ? 2 : 0;
           float *dh = nullptr;
           if (aobj == 2 && g_ast_loaded) { dh = sycl::malloc_device<float>(K, c->q.q); c->q.memcpy(dh, g_ast[ly][kind].data(), K * 4).wait(); }
-          uint32_t *w4 = (uint32_t *)alloc_expert(c, (size_t)rows * K / 2 + 4096), *sz = (uint32_t *)alloc_expert(c, (size_t)rows * (K / 64) * 4 + 4096);
+          const int rows16 = (rows + 15) / 16 * 16;  // sink projection has 24 rows: zero-padded to 32, the GEMV masks the extra outputs
+          uint16_t *padw = nullptr; const uint16_t *src = (const uint16_t *)it->second.p;
+          if (rows16 != rows) { padw = sycl::malloc_device<uint16_t>((size_t)rows16 * K, c->q.q); c->q.memset(padw, 0, (size_t)rows16 * K * 2).wait(); c->q.memcpy(padw, src, (size_t)rows * K * 2).wait(); src = padw; }
+          uint32_t *w4 = (uint32_t *)alloc_expert(c, (size_t)rows16 * K / 2 + 4096), *sz = (uint32_t *)alloc_expert(c, (size_t)rows16 * (K / 64) * 4 + 4096);
           require_aligned(w4, 256, "attention int4 weights");
-          k_w4zpack(c, (const uint16_t *)it->second.p, rows, K, aasym, aobj, dh, w4, sz); c->q.wait();
+          k_w4zpack(c, src, rows16, K, aasym, aobj, dh, w4, sz); c->q.wait();
           if (dh) sycl::free(dh, c->q);
-          g_w4alt[nw] = W4Alt{w4, sz, (size_t)rows * K / 2, (size_t)rows * (K / 64) * 4};
+          if (padw) sycl::free(padw, c->q);
+          g_w4alt[nw] = W4Alt{w4, sz, (size_t)rows16 * K / 2, (size_t)rows16 * (K / 64) * 4};
         }
       }
       if (want8) {
