@@ -30,8 +30,9 @@ All numbers are decode-only tok/s, median of 5 interleaved repeats per task, 6 t
 |---|---|---|---|---|
 | exact baseline | NVFP4/MXFP8 experts, bf16 dense | 45.6 | 77 on repetitive text | lossless |
 | K0 | FP8 dense + int4 head | 78.3 | 133.1 | 0.0048 / 85.0 / 85.8 / 100 |
-| K1 | + attention q/k/r/gate int4 (`XIK_AW4`), W3 experts on 8 layers (`XIK_W3L=2,6-9,11,13-14`) | 85.2 | 126.5 | 86.7 / 84.2 / 100 (GSM8K / MMLU / code) |
-| K3 | + all six attention matrices int4, W3 (INT3, group 64) on all NVFP4 layers 0-19 | **94.8** (95.0 on the code/history/prose prompts) | 123.6 | 86.7 / 83.3 / 93.8 |
+| K1 | + attention q/k/r/gate int4 (`XIK_AW4`), W3 experts on 8 layers (`XIK_W3L=2,6-9,11,13-14`) | 86.8 | 147.2 | 86.7 / 84.2 / 100 (GSM8K / MMLU / code) |
+| K3 | + all six attention matrices int4, W3 (INT3, group 64) on all NVFP4 layers 0-19 | 96.8 | 128.7 |
+| K3x | K3 + int4 attention-sink and k/v dynamic-conv projections (`attn_sink_proj`, `k_sconv.weight_proj`, `v_sconv.weight_proj` added to `XIK_AW4`): removes the last small FP8 GEMV launch; quality equal to K3 (KL 0.0272 vs 0.0274; GSM8K 90.0 / MMLU 82.5 / code 93.75 for both) | **99.6** (100.0 on the history prompt) | 142.0 | 86.7 / 83.3 / 93.8 |
 
 Gains of the last optimisation round (K3 plain): early-issue loads of the W3 kernel +1.1 tok/s, tile-major weight layout (adjacent threads read adjacent addresses, `XIK_W3TM`) +1.4, MXFP8 layers in the same layout (`XIK_F8TM`) +0.3; layout changes are bit-identical.
 Verification passes (`xi-run --bench-prefill`, K0 -> K3, ms per pass): T=1 13.0 -> 10.8, T=2 18.2 -> 15.5, T=4 23.2 -> 19.5, T=8 29.9 -> 26.9, T=16 47.8 -> 44.1.
@@ -42,3 +43,7 @@ Reproduce: `/data/inkling`-style 6 x 5 matrix = `xi-run <model> "<prompt>" 256 -
 Latest round (plain, K3 73.7 -> 78.3 (K0), 87.9 -> 94.8): router GEMV one sub-group per (row, token) (bit-identical), top-8 router in one sub-group (bit-identical), two-stage parallel softcap+argmax (bit-identical),
 cvt+group and combine+conv launch fusions (bit-identical), key-split attention `XIK_ATTNP=4` (approximate accumulation order, KL unchanged; plain and Hybrid still produce identical text for the same setting).
 Hybrid numbers are dominated by the accepted draft length, which depends on the generated text: the key-split attention changes the greedy trajectory of the `repeat` and `jsonl` prompts (accepted fraction of the copy drafter 100 % -> 67 % on `repeat`), so their Hybrid speed dropped (K3 repeat 291 -> 116 tok/s) although every kernel got faster; per-task numbers are in `docs/mixed-quant.md`.
+
+Matrix of the latest round (6 tasks x 5 repeats, decode-only tok/s medians; plain code/history/prose/repeat/edit_py/jsonl): K1 87.0 87.1 86.9 86.9 86.6 86.3, K3 97.0 97.1 97.0 97.0 96.6 96.5, K3x 99.8 100.0 99.8 99.8 99.2 99.2; Hybrid K3x 108.9 104.0 97.3 120.5 302.9 203.7.
+Further kernel changes of this round (all bit-identical unless noted): router GEMV + top-8 in one launch (K split in 4, rounding order changes), int4 sink / dynamic projections.
+Study of the XMX (DPAS) pipeline, roofline bounds and native int4 x int8 DPAS: `docs/xmx-backend-study.md`; hardware counters: `docs/hw-counters.md`.
