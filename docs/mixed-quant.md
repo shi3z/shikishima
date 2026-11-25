@@ -171,3 +171,11 @@ Why plain decode was 11.3 ms/token while `--bench-prefill` T=1 shows 10.8 ms: th
 
 Plain: +4.6 (K0), +5.6 (K1), +6.9 tok/s (K3) over the previous matrix (73.7 / 79.6 / 87.9); K3 is 10.5 ms/token, 0.5 ms above the 100 tok/s target.
 Hybrid on `repeat` / `jsonl` fell for K1 / K3 (291 -> 116 for K3 repeat): with `XIK_ATTNP=0` the K3 repeat prompt gives 324 tok/s (copy drafter accepts 100 %), with `XIK_ATTNP=4` the greedy text leaves the repetition earlier (copy acceptance 67 %, 141 plain rounds). Plain and Hybrid output are identical for both settings (md5), so this is a trajectory change, not a speculative-decoding inconsistency.
+
+### Two-card research setup and the Hybrid draft cost (single-B60 numbers only)
+
+A second B60 is used only to run independent experiments / benchmarks in parallel (`/data/inkling/rundev.sh <device> <lib> cmd`: `ONEAPI_DEVICE_SELECTOR=level_zero:<n>`, per-device lock; no tensor / pipeline / expert parallelism). Same K3x decode benchmark: 98.57 tok/s on card 0, 98.35 on card 1 alone, 98.37 / 98.24 when both run at once: no interference, equal cards. All numbers in this file are per single card.
+
+Hybrid analysis (controller trace `XIK_TRACE_CTL=1`, K3x, `code` task): the DSpark drafter costs `td` = 7-11 ms per round (about a plain step) and a K = 3 verification pass (T = 4) 19 ms, so one DSpark round yields 1 + accepted (2.3 at 77 % acceptance on code) tokens in about 26 ms (about 125 tok/s) versus 100 tok/s plain; the controller's estimate (90 tok/s) is more pessimistic and runs plain for 161 of 256 tokens on `code` (182 on `history`, 229 on `prose`). Per draft the 7 sequential draft-head steps re-read the 103 MB bf16 fold matrix (7 x 244 us = 1.7 ms) plus 7 x (state 62 us + argmax 67 us).
+Change: `XIK_MKQ` (default on, `XIK_MKQ=0` restores): int8 copy of the fold matrix with per-row scale for the draft-head logits and a two-stage parallel argmax. Drafts only (target verification unchanged). Hybrid decode-only tok/s, 5 repeats, K3x, one card each (MKQ off / on): code 106.8 / 109.0, history 102.1 / 102.8, prose 95.8 / 96.5, repeat 118.4 / 119.2, edit_py 298.0 / 303.2, jsonl 200.2 / 200.8.
+Next research items (not done): controller policy (estimate versus measured acceptance), drafter dense layers (about 45 launches per draft) and verification width as a function of acceptance and expert reuse.

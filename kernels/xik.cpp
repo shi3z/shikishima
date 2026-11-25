@@ -131,6 +131,7 @@ struct xik_ctx {
   const uint16_t *d_fuse = nullptr, *d_norm = nullptr, *d_mask = nullptr, *mk_dfl = nullptr, *mk_hw = nullptr, *mk_hb = nullptr,
                  *mk_w1 = nullptr, *mk_rw = nullptr, *mk_rb = nullptr;
   uint16_t *foldW = nullptr, *foldB = nullptr;
+  int8_t *foldW8 = nullptr; float *foldS = nullptr; float *argv_ = nullptr; int32_t *argi_ = nullptr;  // XIK_MKQ: int8 copy of the draft-head fold weights (row scale), parallel argmax scratch
   float *d_alpha = nullptr;  // [4][4]
   float *dkc[3], *dvc[3];
   int dpos = 0;
@@ -4327,6 +4328,77 @@ void d_mk_logits(xik_ctx *c, int i) {
     }
   });
 }
+// XIK_MKQ=1: draft-head logits from int8 fold weights (per-row scale): half the bytes of the bf16 matrix that is re-read at each of the 7 sequential draft steps.  Drafts only: the target verification is unchanged.
+static bool mkq_on() { static const bool v = !getenv("XIK_MKQ") || atoi(getenv("XIK_MKQ")) != 0; return v; }
+void d_mk_quant(xik_ctx *c) {
+  const uint16_t *fw = c->foldW; int8_t *q8 = c->foldW8; float *sc = c->foldS;
+  c->q.parallel_for(range<1>((size_t)VOCAB), [=](id<1> id) {
+    const int r = (int)id[0];
+    float amax = 0.f;
+    for (int k = 0; k < DRANK; k++) amax = sycl::fmax(amax, sycl::fabs(bf2f(fw[(size_t)r * DRANK + k])));
+    const float s = amax > 0.f ? amax / 127.f : 1.f, inv = amax > 0.f ? 127.f / amax : 0.f;
+    sc[r] = s;
+    for (int k = 0; k < DRANK; k++) q8[(size_t)r * DRANK + k] = (int8_t)sycl::rint(bf2f(fw[(size_t)r * DRANK + k]) * inv);
+  });
+}
+void d_mk_logits8(xik_ctx *c, int i) {
+  const int8_t *fw = c->foldW8; const float *fs = c->foldS; const uint16_t *fb = c->foldB;
+  const float *lat = c->dmklat, *base = c->dbase + (size_t)i * VOCAB;
+  float *lg = c->dlg;
+  int nsg = VOCAB / 4, wg = 128;
+  int nwg = (nsg * 16 + wg - 1) / wg;
+  c->q.parallel_for(nd_range<1>((size_t)nwg * wg, wg), [=](nd_item<1> it) SUBGROUP16 {
+    auto sg = it.get_sub_group();
+    int lane = sg.get_local_linear_id();
+    int gsg = (int)(it.get_global_linear_id() / 16);
+    if (gsg >= nsg) return;
+    int row0 = gsg * 4;
+    float acc[4] = {0, 0, 0, 0};
+    for (int k16 = lane; k16 < DRANK / 16; k16 += 16) {
+      float xv[16];
+      for (int e = 0; e < 16; e++) xv[e] = lat[k16 * 16 + e];
+      for (int r = 0; r < 4; r++) {
+        vec<uint32_t, 4> w = *reinterpret_cast<const vec<uint32_t, 4> *>(fw + (size_t)(row0 + r) * DRANK + k16 * 16);
+        for (int e = 0; e < 4; e++)
+          for (int b = 0; b < 4; b++) acc[r] += (float)(int8_t)((w[e] >> (8 * b)) & 0xFF) * xv[4 * e + b];
+      }
+    }
+    for (int r = 0; r < 4; r++) {
+      float sm = reduce_over_group(sg, acc[r], plus<float>()) * fs[row0 + r];
+      if (lane == 0) {
+        float bias = rbf(bf2f(fb[row0 + r]) + sm);
+        float l = rbf(base[row0 + r] + bias);
+        lg[row0 + r] = rbf(FINAL_CAP * sycl::tanh(l / FINAL_CAP));
+      }
+    }
+  });
+}
+// two-stage parallel argmax of dlg (lowest index among ties, as d_argmax)
+void d_argmax2(xik_ctx *c, int i) {
+  const float *lg = c->dlg; int32_t *out = c->dtok + i;
+  float *pv = c->argv_; int32_t *pi = c->argi_;
+  constexpr int NW = 64, WGS = 256;
+  c->q.parallel_for(nd_range<1>((size_t)NW * WGS, WGS), [=](nd_item<1> it) {
+    int w = it.get_group(0), l = it.get_local_id(0);
+    auto g = it.get_group();
+    float best = -3.0e38f; int bi = VOCAB_U;
+    for (int k = w * WGS + l; k < VOCAB_U; k += NW * WGS)
+      if (lg[k] > best) { best = lg[k]; bi = k; }
+    float m = reduce_over_group(g, best, maximum<float>());
+    int cand = (best == m) ? bi : VOCAB_U;
+    int idx = reduce_over_group(g, cand, minimum<int>());
+    if (l == 0) { pv[w] = m; pi[w] = idx; }
+  });
+  c->q.parallel_for(nd_range<1>(NW, NW), [=](nd_item<1> it) {
+    int l = it.get_local_id(0);
+    auto g = it.get_group();
+    float v = pv[l]; int k = pi[l];
+    float m = reduce_over_group(g, v, maximum<float>());
+    int cand = (v == m) ? k : VOCAB_U;
+    int idx = reduce_over_group(g, cand, minimum<int>());
+    if (l == 0) out[0] = idx;
+  });
+}
 void d_argmax(xik_ctx *c, int i) {
   const float *lg = c->dlg;
   int32_t *out = c->dtok + i;
@@ -4406,6 +4478,10 @@ void init_drafter(xik_ctx *c) {
       c->foldW = dalloc<uint16_t>(c, (size_t)VOCAB * DRANK);
       c->foldB = dalloc<uint16_t>(c, VOCAB);
       d_fold(c);
+      if (mkq_on()) {
+        c->foldW8 = dalloc<int8_t>(c, (size_t)VOCAB * DRANK); c->foldS = dalloc<float>(c, VOCAB); c->argv_ = dalloc<float>(c, 64); c->argi_ = dalloc<int32_t>(c, 64);
+        d_mk_quant(c); c->q.wait();
+      }
       auto A2 = [&](size_t n) { return dalloc<float>(c, n); };
       size_t TT = (size_t)std::max(c->max_tokens, DB);
       c->dx = A2(DB * D); c->dres = A2(DB * D); c->dsum = A2(DB * D); c->dnorm = A2(DB * D);
@@ -5357,8 +5433,7 @@ extern "C" int xik_draft(xik_ctx *c, int32_t anchor, int32_t *out7) {
     c->q.memset(c->dmkst, 0, DRANK * 4);
     for (int i = 0; i < DCNT; i++) {
       d_mk_state(c, i, 0);
-      d_mk_logits(c, i);
-      d_argmax(c, i);
+      if (mkq_on()) { d_mk_logits8(c, i); d_argmax2(c, i); } else { d_mk_logits(c, i); d_argmax(c, i); }
     }
     c->q.memcpy(out7, c->dtok, DCNT * 4).wait();
     return 0;
