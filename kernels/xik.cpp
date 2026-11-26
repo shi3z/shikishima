@@ -7,7 +7,10 @@
 // All activations are fp32 buffers; "bf16-valued" means the value was rounded
 // to bf16 precision (rbf) exactly where the reference casts to bfloat16.
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
 #include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#include <level_zero/ze_api.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -427,9 +430,9 @@ void dgemm_t(queue &q, const DArgs &a, int t0, int nt) {
     using namespace es;
     slm_init<KSD * 16 * R * 4>();
     int wg = it.get_group(0), tid = it.get_local_id(0);
-    int si = 0;
-    while (si + 1 < a.n && wg >= a.s[si + 1].wg0) si++;
-    const DSeg &sd = a.s[si];
+    DSeg sd = a.s[0];  // constant indices (see w4z_r)
+#pragma unroll
+    for (int i_ = 1; i_ < 8; i_++) if (i_ < a.n && wg >= a.s[i_].wg0) sd = a.s[i_];
     int rb = wg - sd.wg0;
     int nkt = sd.K / 16;
     int per = (nkt + KSD - 1) / KSD;
@@ -3288,11 +3291,128 @@ void k_attn_kv(xik_ctx *c, const LayerW &lw, int slot, bool local) {
     });
   });
 }
+// GQA-shared attention for T = 1 (XIK_ATTN_GQA=1, default off until measured): one work-group of NSPL x 128 threads per kv head handles its NH / NKV = 3 query heads;
+// every K row and V element is loaded once and used by the 3 heads (k_attn_p loads them once per query head).  Key partition, reductions and accumulation order per
+// head are those of k_attn_p<NSPL> (same work-group size), so each head's result is computed with the same operations.
+template <int NSPL>
+void k_attn_g(xik_ctx *c, const LayerW &lw, int slot, bool local) {
+  constexpr int G = NH / NKV;
+  const float *q = c->qb, *r = c->rb, *sink = c->sinkb, *gate = c->gateb;
+  const float *kc = c->kcache[slot], *vc = c->vcache[slot];
+  const bool kbf = c->kbf16;
+  const uint16_t *rp = lw.rel_proj;
+  float *out = c->attn_o;
+  const int32_t *dpp = c->dparams;
+  const int maxkeys = local ? WIN : c->max_ctx;
+  const float scale = 1.0f / sycl::sqrt((float)HD);
+  constexpr int WGS = NSPL * HD;
+  c->q.submit([&](handler &h) {
+    local_accessor<float, 1> lg(range<1>((size_t)G * maxkeys), h);
+    local_accessor<float, 1> qs(range<1>(G * HD), h);
+    local_accessor<float, 1> red(range<1>(G * WGS), h);
+    h.parallel_for(nd_range<1>((size_t)NKV * WGS, WGS), [=](nd_item<1> it) {
+      const int kvh = it.get_group(0), tid = it.get_local_id(0);
+      auto g = it.get_group();
+      const int pos = dpp[0];
+      const int lo = local ? sycl::max(0, pos - WIN + 1) : 0;
+      const int nk = pos - lo + 1;
+      if (tid < HD) for (int hq = 0; hq < G; hq++) qs[hq * HD + tid] = q[(kvh * G + hq) * HD + tid];
+      float rv[G][DREL], sk[G];
+      for (int hq = 0; hq < G; hq++) { for (int e = 0; e < DREL; e++) rv[hq][e] = r[(kvh * G + hq) * DREL + e]; sk[hq] = sink[kvh * G + hq]; }
+      group_barrier(g);
+      float mx[G];
+      for (int hq = 0; hq < G; hq++) mx[hq] = 0.f;
+      for (int j = tid; j < nk; j += WGS) {
+        const int kp = lo + j, dist = pos - kp;
+        const size_t slotpos = local ? (kp % RING) : kp;
+        float s[G];
+        for (int hq = 0; hq < G; hq++) s[hq] = 0.f;
+        if (kbf) {
+          const uint16_t *kb = reinterpret_cast<const uint16_t *>(kc) + slotpos * KVD + kvh * HD;
+          for (int d = 0; d < HD; d += 8) {
+            vec<uint16_t, 8> u = *reinterpret_cast<const vec<uint16_t, 8> *>(kb + d);
+            float k0 = sycl::bit_cast<float>((uint32_t)u[0] << 16), k1 = sycl::bit_cast<float>((uint32_t)u[1] << 16),
+                  k2 = sycl::bit_cast<float>((uint32_t)u[2] << 16), k3 = sycl::bit_cast<float>((uint32_t)u[3] << 16);
+            float k4 = sycl::bit_cast<float>((uint32_t)u[4] << 16), k5 = sycl::bit_cast<float>((uint32_t)u[5] << 16),
+                  k6 = sycl::bit_cast<float>((uint32_t)u[6] << 16), k7 = sycl::bit_cast<float>((uint32_t)u[7] << 16);
+#pragma unroll
+            for (int hq = 0; hq < G; hq++) {
+              const int o = hq * HD + d;
+              s[hq] += qs[o] * k0 + qs[o + 1] * k1 + qs[o + 2] * k2 + qs[o + 3] * k3;
+              s[hq] += qs[o + 4] * k4 + qs[o + 5] * k5 + qs[o + 6] * k6 + qs[o + 7] * k7;
+            }
+          }
+        } else {
+          const float *kr = kc + slotpos * KVD + kvh * HD;
+          for (int d = 0; d < HD; d += 4) {
+            vec<float, 4> kk = *reinterpret_cast<const vec<float, 4> *>(kr + d);
+#pragma unroll
+            for (int hq = 0; hq < G; hq++) { const int o = hq * HD + d; s[hq] += qs[o] * kk[0] + qs[o + 1] * kk[1] + qs[o + 2] * kk[2] + qs[o + 3] * kk[3]; }
+          }
+        }
+#pragma unroll
+        for (int hq = 0; hq < G; hq++) {
+          float bias = 0.f;
+          if (dist < EXT)
+            for (int e = 0; e < DREL; e++) bias += rv[hq][e] * bf2f(rp[(size_t)e * EXT + dist]);
+          const float l = s[hq] * scale + bias - sk[hq];
+          lg[hq * maxkeys + j] = l;
+          mx[hq] = sycl::fmax(mx[hq], l);
+        }
+      }
+      float den[G];
+#pragma unroll
+      for (int hq = 0; hq < G; hq++) mx[hq] = reduce_over_group(g, mx[hq], maximum<float>());
+#pragma unroll
+      for (int hq = 0; hq < G; hq++) {
+        float dd = 0.f;
+        for (int j = tid; j < nk; j += WGS) { const float e = sycl::exp(lg[hq * maxkeys + j] - mx[hq]); lg[hq * maxkeys + j] = e; dd += e; }
+        den[hq] = reduce_over_group(g, dd, plus<float>()) + sycl::exp(-mx[hq]);
+      }
+      group_barrier(g);
+      const int cs = tid / HD, d = tid % HD;
+      const int j0 = (int)((long)nk * cs / NSPL), j1 = (int)((long)nk * (cs + 1) / NSPL);
+      float o[G];
+#pragma unroll
+      for (int hq = 0; hq < G; hq++) o[hq] = 0.f;
+      int j = j0;
+      for (; j + 8 <= j1; j += 8) {
+        float vv[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) { const int kp = lo + j + u; vv[u] = vc[(local ? (kp % RING) : kp) * KVD + kvh * HD + d]; }
+#pragma unroll
+        for (int hq = 0; hq < G; hq++)
+#pragma unroll
+          for (int u = 0; u < 8; u++) o[hq] += lg[hq * maxkeys + j + u] * vv[u];
+      }
+      for (; j < j1; j++) { const int kp = lo + j; const float v = vc[(local ? (kp % RING) : kp) * KVD + kvh * HD + d];
+#pragma unroll
+        for (int hq = 0; hq < G; hq++) o[hq] += lg[hq * maxkeys + j] * v; }
+#pragma unroll
+      for (int hq = 0; hq < G; hq++) red[hq * WGS + tid] = o[hq];
+      group_barrier(g);
+      if (tid < HD) {
+#pragma unroll
+        for (int hq = 0; hq < G; hq++) {
+          float tot = red[hq * WGS + tid];
+#pragma unroll
+          for (int k = 1; k < NSPL; k++) tot += red[hq * WGS + k * HD + tid];
+          tot /= den[hq];
+          const int hh = kvh * G + hq;
+          const float gt = sigmoidf(gate[hh * HD + tid]);
+          out[hh * HD + tid] = rbf(tot * gt);
+        }
+      }
+    });
+  });
+}
 void k_attn(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
   // XIK_ATTN = V prefetch width VW (0 = original loop, default 8); XIK_ATTN_UNR = outer-loop unroll (-1 compiler default, 0 none, 4 forced x4);
   // XIK_ATTN_ABL = timing-only ablation bits (1 no SLM read, 2 no V load) -- wrong numbers, benchmark only.
   // Default (measured fastest at every context, output bit-identical): VW=8 loads issued ahead, outer loop unrolled x4.  XIK_ATTN=0 = original loop.
   static const int atp = getenv("XIK_ATTNP") ? atoi(getenv("XIK_ATTNP")) : 4;
+  static const bool gqa = getenv("XIK_ATTN_GQA") && atoi(getenv("XIK_ATTN_GQA")) != 0;
+  if (gqa && T == 1 && atp == 4 && (size_t)(NH / NKV) * (local ? WIN : c->max_ctx) * 4 + 8192 <= 60 * 1024) return k_attn_g<4>(c, lw, slot, local);
   if (atp == 2) return k_attn_p<2>(c, lw, slot, local, T, pos0);
   if (atp == 4) return k_attn_p<4>(c, lw, slot, local, T, pos0);
   if (atp == 8) return k_attn_p<8>(c, lw, slot, local, T, pos0);
@@ -3382,6 +3502,10 @@ static void router_fused(xik_ctx *c, const LayerW &lw, bool grp, int32_t *qrec =
   const float *xin = c->in[0]; sycl::half *x16 = c->x16_in;
   int32_t *ecnt = c->ecnt, *elist = c->elist, *actl = c->act_e, *nact = c->nact, *desc = c->desc;
   constexpr int NWG = NE / 2, KB = D / 8, QB = KB / 4;
+  // XIK_RPF = number of 128-K tiles of each selected expert's planar w13 prefetched into L2 by the last work-group right after the top-8 (0 = off)
+  static const int rpf_env = getenv("XIK_RPF") ? atoi(getenv("XIK_RPF")) : 0;
+  const int rpf = (grp && qrec && lw.w3p) ? rpf_env : 0;
+  const uint8_t *w13p = lw.w13;
   c->q.submit([&](handler &h) {
     local_accessor<float, 1> red(range<1>(8), h);
     local_accessor<int, 1> last(range<1>(1), h);
@@ -3448,6 +3572,16 @@ static void router_fused(xik_ctx *c, const LayerW &lw, bool grp, int32_t *qrec =
         const int tot = reduce_over_group(it.get_group(), flag, plus<int>());
         if (e == 0) nact[0] = tot;
         for (int j = tot + e; j < TOPK; j += NE) desc[j * 16 + 1] = 0;
+        if (rpf > 0) {  // L2 prefetch of the first rpf tiles (all 144 row blocks) of each selected expert: fire-and-forget, no waiting
+          constexpr size_t TILEB = (size_t)(2 * FI / 16) * 192 * 4;  // bytes of one 128-K tile over all row blocks (tile-major layout)
+          const size_t span = TILEB * (size_t)rpf, chunk = (span + 127) / 128;
+          for (int p = 0; p < TOPK; p++) {
+            const int ee = ridx[p];
+            const uint8_t *base = w13p + (size_t)ee * (D / 128) * TILEB + (size_t)e * chunk;
+            for (size_t o = 0; o < chunk; o += 64)
+              sycl::ext::oneapi::experimental::prefetch((void *)(base + o), sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::prefetch_hint_L2});
+          }
+        }
       }
     });
   });
@@ -4045,17 +4179,17 @@ static void k_w4zpack(xik_ctx *c, const uint16_t *w, int rows, int K, int asym, 
 }
 namespace {
 // W4A16 GEMV over several matrices in one launch: one work-group of KSD = 12 threads per 16-row block, K split in KSD parts of K/64/12 groups (3 or 4), partials summed in thread order.
-template <int R>
+template <int R, int KSD = 12>
 static void w4z_r(xik_ctx *c, const W4Args &a, int t0, int nt) {
-  constexpr int KSD = 12;
   const bool tm = getenv("XIK_W4TM") != nullptr;
   c->q.parallel_for(nd_range<1>((size_t)a.total_wg * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
     using namespace es;
     slm_init<KSD * 16 * R * 4>();
     const int wgi = (int)it.get_group(0), tid = (int)it.get_local_id(0);
-    int si = 0;
-    while (si + 1 < a.n && wgi >= a.s[si + 1].wg0) si++;
-    const W4Seg &sd = a.s[si];
+    // segment by constant indices (a dynamic index moves the argument struct to scratch and costs a chain of dependent loads at start)
+    W4Seg sd = a.s[0];
+#pragma unroll
+    for (int i_ = 1; i_ < 8; i_++) if (i_ < a.n && wgi >= a.s[i_].wg0) sd = a.s[i_];
     const int rb = wgi - sd.wg0, K = sd.K, ngrp = K / 64, per = ngrp / KSD, g0 = tid * per;
     const int nrbw = sd.rows / 16;
     const size_t wst = tm ? (size_t)nrbw * 128 : 128, sst = tm ? (size_t)nrbw * 16 : 16;  // tm: group-major layout [group][row block]
@@ -4382,6 +4516,45 @@ static void w4np_np(xik_ctx *c, const W4Args &a, const W4AuxArr &aux, int t0, in
   }
 }
 static bool w4np_on() { static const bool v = !getenv("XIK_W4NP") || atoi(getenv("XIK_W4NP")) != 0; return v; }
+// ---- externally assembled kernels (hand-written / hand-edited Xe2 ISA): a zebin is loaded into the queue's Level Zero context and launched in place of
+// the JIT kernel with the same arguments.  XIK_ISA_W4Z1=<zebin>: replaces w4z_r<1, 12> (T = 1 int4 attention GEMV); the zebin must contain the kernel under
+// the name XIK_ISA_W4Z1_NAME (default: the mangled name of w4z_r<1, 12>'s lambda) with the argument order (W4Args, bool tm, int t0, int nt).
+struct IsaKernel { bool tried = false, ok = false; sycl::kernel *k = nullptr; };
+static sycl::kernel *isa_load(xik_ctx *c, IsaKernel &ik, const char *path, const char *name) {
+  if (ik.tried) return ik.ok ? ik.k : nullptr;
+  ik.tried = true;
+  FILE *f = fopen(path, "rb");
+  if (!f) { fprintf(stderr, "ISA: cannot open %s\n", path); return nullptr; }
+  fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); std::vector<unsigned char> bin(n);
+  if (fread(bin.data(), 1, n, f) != (size_t)n) { fclose(f); return nullptr; }
+  fclose(f);
+  sycl::context ctx = c->q.q.get_context(); sycl::device dev = c->q.q.get_device();
+  auto zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
+  auto zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(dev);
+  ze_module_desc_t md = {ZE_STRUCTURE_TYPE_MODULE_DESC}; md.format = ZE_MODULE_FORMAT_NATIVE; md.inputSize = (size_t)n; md.pInputModule = bin.data();
+  ze_module_handle_t mod; ze_result_t r = zeModuleCreate(zctx, zdev, &md, &mod, nullptr);
+  if (r) { fprintf(stderr, "ISA: zeModuleCreate 0x%x\n", (unsigned)r); return nullptr; }
+  ze_kernel_desc_t kd = {ZE_STRUCTURE_TYPE_KERNEL_DESC}; kd.pKernelName = name; ze_kernel_handle_t zk;
+  r = zeKernelCreate(mod, &kd, &zk);
+  if (r) { fprintf(stderr, "ISA: zeKernelCreate(%s) 0x%x\n", name, (unsigned)r); return nullptr; }
+  zeKernelSetIndirectAccess(zk, ZE_KERNEL_INDIRECT_ACCESS_FLAG_DEVICE | ZE_KERNEL_INDIRECT_ACCESS_FLAG_SHARED | ZE_KERNEL_INDIRECT_ACCESS_FLAG_HOST);
+  auto kb = sycl::make_kernel_bundle<sycl::backend::ext_oneapi_level_zero, sycl::bundle_state::executable>({mod, sycl::ext::oneapi::level_zero::ownership::keep}, ctx);
+  ik.k = new sycl::kernel(sycl::make_kernel<sycl::backend::ext_oneapi_level_zero>({kb, zk, sycl::ext::oneapi::level_zero::ownership::keep}, ctx));
+  ik.ok = true;
+  fprintf(stderr, "ISA: loaded %s from %s (%ld bytes)\n", name, path, n);
+  return ik.k;
+}
+static bool isa_w4z1(xik_ctx *c, const W4Args &a) {
+  static const char *path = getenv("XIK_ISA_W4Z1");
+  if (!path) return false;
+  static const char *name = getenv("XIK_ISA_W4Z1_NAME") ? getenv("XIK_ISA_W4Z1_NAME") : "_ZTSZN12_GLOBAL__N_15w4z_rILi1ELi12EEEvP7xik_ctxRKNS_6W4ArgsEiiEUlN4sycl3_V17nd_itemILi1EEEE_";
+  static IsaKernel ik;
+  sycl::kernel *k = isa_load(c, ik, path, name);
+  if (!k) return false;
+  const bool tm = getenv("XIK_W4TM") != nullptr; const int t0 = 0, nt = 1;
+  c->q.submit([&](sycl::handler &h) { h.set_args(a, tm, t0, nt); h.parallel_for(sycl::nd_range<1>((size_t)a.total_wg * 12, 12), *k); });
+  return true;
+}
 static void w4z_run(xik_ctx *c, const W4Args &a_in, int T) {
   W4Args a = a_in;
   if (w4n_use(T)) {
@@ -4413,6 +4586,14 @@ static void w4z_run(xik_ctx *c, const W4Args &a_in, int T) {
     }
     return;
   }
+  // XIK_W4WO_KSD: threads per 16-row block of the T = 1 launches whose segments all have K = 3072 (the attention output projection); 12 = previous
+  static const int wo_ksd = getenv("XIK_W4WO_KSD") ? atoi(getenv("XIK_W4WO_KSD")) : 12;
+  bool all3072 = true; for (int i = 0; i < a.n; i++) if (a.s[i].K != 3072) all3072 = false;
+  if (T == 1 && all3072 && wo_ksd != 12) {
+    switch (wo_ksd) { case 6: w4z_r<1, 6>(c, a, 0, 1); return; case 8: w4z_r<1, 8>(c, a, 0, 1); return; case 16: w4z_r<1, 16>(c, a, 0, 1); return;
+      case 24: w4z_r<1, 24>(c, a, 0, 1); return; case 48: w4z_r<1, 48>(c, a, 0, 1); return; default: break; }
+  }
+  if (T == 1 && isa_w4z1(c, a)) return;
   for (int t0 = 0; t0 < T; t0 += 8) {
     const int n = std::min(8, T - t0);
     if (n == 1) w4z_r<1>(c, a, t0, n);
@@ -5392,6 +5573,30 @@ ESIMD_INLINE simd<float, 16> gemv64(const uint32_t *wp, const float *scale, int 
   }
   return s;
 }
+// gemv64 (fp8 path) on weight tiles and row scales already in registers: same arithmetic and order as gemv64
+ESIMD_INLINE simd<float, 16> gemv64_pre(simd<uint32_t, 256> wq, simd<float, 16> sv, simd<int32_t, 32> avh) {
+  simd<float, 16> s = 0.f;
+#pragma unroll
+  for (int t = 0; t < 4; t++) {
+    simd<uint32_t, 64> bq = wq.template select<64, 1>(64 * t);
+    simd<uint32_t, 128> B;
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+      simd<uint32_t, 16> xq = bq.template select<16, 1>(16 * q);
+      simd<uint32_t, 16> m0 = xq & 0x00FF00FFu, m1 = (xq >> 8) & 0x00FF00FFu;
+      B.template select<16, 1>(16 * (2 * q)) = ((m0 & 0x007F007Fu) << 7) | ((m0 & 0x00800080u) << 8);
+      B.template select<16, 1>(16 * (2 * q + 1)) = ((m1 & 0x007F007Fu) << 7) | ((m1 & 0x00800080u) << 8);
+    }
+    simd<int32_t, 128> bi = B.template bit_cast_view<int32_t>();
+    simd<int32_t, 8> a8 = avh.template select<8, 1>(8 * t);
+    simd<float, 16> z = 0.f;
+    simd<float, 16> d = xmx::dpas<8, 1, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(z, bi, a8);
+    if (t == 0) s = d; else s += d;
+  }
+  sv *= 256.0f;
+  s *= sv;
+  return s;
+}
 ESIMD_INLINE simd<int32_t, 8> pack_v(simd<float, 16> xv, bool fp8) {  // same as pack_a for a register operand
   if (fp8) { simd<sycl::half, 16> xh = xv; return xh.template bit_cast_view<int32_t>(); }
   simd<uint32_t, 16> xb = xv.template bit_cast_view<uint32_t>();
@@ -5468,7 +5673,7 @@ ESIMD_INLINE simd<float, 16> rbf16(simd<float, 16> x) {
     barrier();                                                                                                                                      \
     fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();                                                                           \
   }
-#define CTL_STAMP(I) if (a.ts && tid == 0) { simd<uint64_t, 1> tv_ = rdtsc(); a.ts[((size_t)a.tsidx * 54 + wg) * 6 + (I)] = tv_[0]; }
+#define CTL_STAMP(I) if (a.ts && tid == 0) { simd<uint64_t, 1> tv_ = rdtsc(); a.ts[((size_t)a.tsidx * 54 + wg) * 8 + (I)] = tv_[0]; }
 struct CtlFArgs {
   const uint32_t *wg[3], *wf[3];
   const float *sg[3], *sf[3];  // fp8 per-row scales (null = bf16 weights)
@@ -5486,6 +5691,12 @@ struct CtlFArgs {
 template <int TV, bool FULL = false>
 void k_ctl_fused(xik_ctx *c, const CtlFArgs &a, int n) {
   const uint32_t nwg = (uint32_t)n * 9;
+  // XIK_CTL_PRE (default on): the gain / forget fp8 weight tiles, their row scales and the dest / msg rows of both units of a thread are loaded at kernel
+  // start (they do not depend on phase 0); issued after phase 0 (its registers are free, 128 GRF) so their latency hides behind the grid barrier and the hid sum
+  static const bool pre_on = !getenv("XIK_CTL_PRE") || atoi(getenv("XIK_CTL_PRE")) != 0;
+  const bool pre = pre_on;
+  static const bool p0all_on = getenv("XIK_CTL_P0ALL") && atoi(getenv("XIK_CTL_P0ALL")) != 0;  // default off: no E2E gain over the work-group norm
+  const bool p0all = p0all_on;
   c->q.parallel_for(nd_range<1>((size_t)nwg * 8, 8), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
     using namespace sycl::ext::intel::esimd;
     slm_init<64>();
@@ -5493,6 +5704,21 @@ void k_ctl_fused(xik_ctx *c, const CtlFArgs &a, int n) {
     if (a.dbg & 8) return;  // debug: empty kernel
     CTL_STAMP(0)
     const int k = wg / 9, ts = (wg % 9) * 8 + tid;  // thread index within the stream, 0..71
+    const bool use_pre = pre && a.sg[k] && a.sf[k];
+    simd<uint32_t, 256> pwg[2], pwf[2]; simd<float, 16> psg[2], psf[2], pde[2], pms[2];
+#define CTL_PRELOAD \
+    if (use_pre) { \
+      _Pragma("unroll") for (int u = 0; u < 2; u++) { \
+        const int rb = ts + 72 * u; \
+        _Pragma("unroll") for (int t = 0; t < 4; t++) { \
+          pwg[u].template select<64, 1>(64 * t) = block_load<uint32_t, 64>(a.wg[k] + (size_t)rb * 4 * 64 + (size_t)t * 64); \
+          pwf[u].template select<64, 1>(64 * t) = block_load<uint32_t, 64>(a.wf[k] + (size_t)rb * 4 * 64 + (size_t)t * 64); \
+        } \
+        psg[u].copy_from(a.sg[k] + rb * 16); psf[u].copy_from(a.sf[k] + rb * 16); \
+        pde[u].copy_from(a.dest[k] + rb * 16); pms[u].copy_from(a.msg[k] + rb * 16); \
+      } \
+    }
+    if constexpr (!FULL) { CTL_PRELOAD }
     simd<int32_t, 32> av, avh;
     if constexpr (FULL) {
       // ---- phase 0: pairnorm (recomputed per unit, exact order) + ctl_down GEMV partials.  Unit u = rb * 16 + t16: row block rb of the 64 rank rows,
@@ -5504,10 +5730,47 @@ void k_ctl_fused(xik_ctx *c, const CtlFArgs &a, int n) {
         const int rb0 = ts / 16, t16 = ts % 16;  // 16 K-partials of 18 tiles per row block, as dgemm_t (KSD = 16)
         const float *xseg = (t16 < 8) ? a.dest[k] : a.msg[k];
         const int off = (t16 & 7) * 288;
-        const float inv_ = ctlx::norm_inv(xseg, false);
+        // XIK_CTL_P0ALL (default off): all 18 fp8 weight tiles and the 18 activation vectors of this thread are issued before the norm
+        const uint32_t *wp0 = a.wd[k] + ((size_t)rb0 * 288 + t16 * 18) * tw;
+        simd<uint32_t, 1152> wall; simd<float, 288> xall;
+        if (fpd && p0all) {
+#pragma unroll
+          for (int i = 0; i < 18; i++) wall.template select<64, 1>(64 * i) = block_load<uint32_t, 64>(wp0 + (size_t)i * 64);
+#pragma unroll
+          for (int i = 0; i < 18; i++) xall.template select<16, 1>(16 * i) = block_load<float, 16>(xseg + off + 16 * i);
+        }
+        float inv_;
+        if (a.dbg & 32) inv_ = ctlx::norm_inv(xseg, false);
+        else {
+          // the 8 threads of this work-group share xseg (t16 < 8 for every thread of an even work-group, >= 8 for an odd one): thread tid computes the
+          // partial sg[tid] of norm_inv from lanes 32 tid .. 32 tid + 31 of the 256-lane accumulator (same order), the 8 partials are exchanged in SLM
+          simd<float, 32> pp;
+#pragma unroll
+          for (int i = 0; i < 9; i++) { simd<float, 32> v = block_load<float, 32>(xseg + i * 256 + 32 * tid); if (i == 0) pp = v * v; else pp += v * v; }
+          simd<float, 16> h = pp.template select<16, 1>(0) + pp.template select<16, 1>(16);
+          simd<float, 8> h8 = h.template select<8, 1>(0) + h.template select<8, 1>(8);
+          simd<float, 4> h4 = h8.template select<4, 1>(0) + h8.template select<4, 1>(4);
+          simd<float, 2> h2 = h4.template select<2, 1>(0) + h4.template select<2, 1>(2);
+          slm_scalar_store<float>(tid * 4, h2[0] + h2[1]);
+          barrier();
+          simd<float, 8> sg = slm_block_load<float, 8>(0);
+          simd<float, 4> w4 = sg.template select<4, 1>(0) + sg.template select<4, 1>(4);
+          simd<float, 2> w2 = w4.template select<2, 1>(0) + w4.template select<2, 1>(2);
+          const float ss = w2[0] + w2[1];
+          inv_ = rsqrt(simd<float, 1>(ss / (float)D + EPS))[0];
+        }
         const uint32_t *wp = a.wd[k] + ((size_t)rb0 * 288 + t16 * 18) * tw;
         simd<float, 16> acc = 0.f;
-        if (fpd) {
+        if (fpd && p0all) {
+#pragma unroll
+          for (int i = 0; i < 18; i++) {
+            simd<float, 16> xv = xall.template select<16, 1>(16 * i);
+            xv = ctlx::rbf16(xv * inv_);
+            simd<int32_t, 8> a8 = ctlx::pack_v(xv, true);
+            simd<int32_t, 128> bi = ctlx::unpack_fp8(wall.template select<64, 1>(64 * i));
+            acc = xmx::dpas<8, 1, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(acc, bi, a8);
+          }
+        } else if (fpd) {
           simd<uint32_t, 384> cur, nxt;
 #pragma unroll
           for (int i = 0; i < 6; i++) cur.template select<64, 1>(64 * i) = block_load<uint32_t, 64>(wp + (size_t)i * 64);
@@ -5543,12 +5806,17 @@ void k_ctl_fused(xik_ctx *c, const CtlFArgs &a, int n) {
       }
       CTL_STAMP(1)
       GRID_BARRIER(a.base + nwg)
+      CTL_PRELOAD  // after the barrier: its fence would otherwise wait for these loads
       CTL_STAMP(2)
 #pragma unroll
       for (int rb = 0; rb < 4; rb++) {
-        simd<float, 16> sum = block_load<float, 16>(a.hp[k] + rb * 256, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
-        for (int j = 1; j < 16; j++)
-          sum += block_load<float, 16>(a.hp[k] + rb * 256 + j * 16, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+        // the 16 partials of this row block: 4 loads of 256 B (was 16 loads of 64 B), summed in the same order j = 0..15
+        simd<float, 256> hpv;
+#pragma unroll
+        for (int q4 = 0; q4 < 4; q4++) hpv.template select<64, 1>(64 * q4) = block_load<float, 64>(a.hp[k] + rb * 256 + q4 * 64, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+        simd<float, 16> sum = hpv.template select<16, 1>(0);
+#pragma unroll
+        for (int j = 1; j < 16; j++) sum += hpv.template select<16, 1>(16 * j);
         if (fpd) { simd<float, 16> sv; sv.copy_from(a.sd[k] + rb * 16); sv *= 256.0f; sum *= sv; }
         sum = ctlx::rbf16(sum);
         av.template select<8, 1>(8 * rb) = ctlx::pack_v(sum, false);
@@ -5559,20 +5827,25 @@ void k_ctl_fused(xik_ctx *c, const CtlFArgs &a, int n) {
 #pragma unroll
       for (int t = 0; t < 4; t++) { av.template select<8, 1>(8 * t) = ctlx::pack_a(a.hid[k], t, false); avh.template select<8, 1>(8 * t) = ctlx::pack_a(a.hid[k], t, true); }
     }
+    CTL_STAMP(6)
     const int tile = a.sg[k] ? 64 : 128;
     if (a.dbg & 16) return;  // debug: after the A-operand packing only
     simd<float, 16> vv[2];
 #pragma unroll
     for (int u = 0; u < 2; u++) {
       const int rb = ts + 72 * u;
-      simd<float, 16> g = ctlx::gemv64(a.wg[k] + (size_t)rb * 4 * tile, a.sg[k], rb, av, avh);
-      simd<float, 16> f = ctlx::gemv64(a.wf[k] + (size_t)rb * 4 * tile, a.sf[k], rb, av, avh);
-      simd<float, 16> de, ms;
-      de.copy_from(a.dest[k] + rb * 16); ms.copy_from(a.msg[k] + rb * 16);
+      simd<float, 16> g, f, de, ms;
+      if (use_pre) { g = ctlx::gemv64_pre(pwg[u], psg[u], avh); f = ctlx::gemv64_pre(pwf[u], psf[u], avh); de = pde[u]; ms = pms[u]; }
+      else {
+        g = ctlx::gemv64(a.wg[k] + (size_t)rb * 4 * tile, a.sg[k], rb, av, avh);
+        f = ctlx::gemv64(a.wf[k] + (size_t)rb * 4 * tile, a.sf[k], rb, av, avh);
+        de.copy_from(a.dest[k] + rb * 16); ms.copy_from(a.msg[k] + rb * 16);
+      }
       simd<float, 16> tf = ctlx::th<TV>(f), tg = ctlx::th<TV>(g);
       simd<float, 16> m1 = (1.0f - tf) * de, m2 = tg * ms;
       vv[u] = m1 + m2;
       vv[u].copy_to(a.vbuf[k] + rb * 16);
+      if (u == 0) CTL_STAMP(7)
     }
     if (a.dbg & 2) return;  // debug: phase 1 only
     if (a.dbg & 2) return;  // debug: phase 1 only
@@ -5678,27 +5951,28 @@ void run_ctl(xik_ctx *c, const LayerW &lw, const int *cid, int n, const float **
     static std::vector<int> ts_n;
     fa.ts = nullptr; fa.tsidx = 0;
     if (ts_on && full) {
-      if (!tsb) { tsb = sycl::malloc_device<uint64_t>(256 * 54 * 6, c->q.q); c->q.memset(tsb, 0, 256 * 54 * 6 * 8).wait(); }
+      if (!tsb) { tsb = sycl::malloc_device<uint64_t>(256 * 54 * 8, c->q.q); c->q.memset(tsb, 0, 256 * 54 * 8 * 8).wait(); }
       if (tscall < 256) { fa.ts = tsb; fa.tsidx = tscall; ts_n.push_back(n); tscall++; }
       if (tscall == 256) {
         tscall++;
         c->q.wait();
-        std::vector<uint64_t> h(256 * 54 * 6); c->q.memcpy(h.data(), tsb, h.size() * 8).wait();
+        std::vector<uint64_t> h(256 * 54 * 8); c->q.memcpy(h.data(), tsb, h.size() * 8).wait();
         for (int kind = 1; kind <= 3; kind += 2) {
           double sum[6] = {0, 0, 0, 0, 0, 0}, skew_start = 0, skew_end = 0, wait1 = 0, wait2 = 0; int cnt = 0;
           for (int ci = 0; ci < 256; ci++) {
             if (ts_n[ci] != kind) continue;
             const int nw = kind * 9; uint64_t t0 = ~0ull, mx_s = 0, mn_e = ~0ull, mx_e = 0;
-            for (int w = 0; w < nw; w++) { const uint64_t *r = &h[((size_t)ci * 54 + w) * 6]; t0 = std::min(t0, r[0]); mx_s = std::max(mx_s, r[0]); mn_e = std::min(mn_e, r[5]); mx_e = std::max(mx_e, r[5]); }
+            for (int w = 0; w < nw; w++) { const uint64_t *r = &h[((size_t)ci * 54 + w) * 8]; t0 = std::min(t0, r[0]); mx_s = std::max(mx_s, r[0]); mn_e = std::min(mn_e, r[5]); mx_e = std::max(mx_e, r[5]); }
             skew_start += (double)(mx_s - t0); skew_end += (double)(mx_e - mn_e);
-            for (int w = 0; w < nw; w++) { const uint64_t *r = &h[((size_t)ci * 54 + w) * 6];
-              for (int q = 1; q < 6; q++) sum[q] += (double)(r[q] - r[q - 1]); wait1 += 0; }
+            for (int w = 0; w < nw; w++) { const uint64_t *r = &h[((size_t)ci * 54 + w) * 8];
+              for (int q = 1; q < 6; q++) sum[q] += (double)(r[q] - r[q - 1]); wait1 += (double)(r[6] - r[2]); wait2 += (double)(r[7] - r[6]); }
             cnt += nw;
           }
           if (cnt) { const double tick = 1.0 / 2400.0;  // us per rdtsc tick (about 2.4 GHz)
             int ncalls = 0; for (int ci = 0; ci < 256; ci++) ncalls += ts_n[ci] == kind;
             fprintf(stderr, "ctl timeline [%d stream(s), %d calls, per work-group mean, us]: phase0 (pairnorm+down partials) %.2f | wait barrier1 %.2f | hid sum + gain/forget/blend %.2f | wait barrier2 %.2f | norm + store %.2f | total %.2f ; launch skew (last start - first start) %.2f, finish skew %.2f\n",
-              kind, ncalls, sum[1] * tick / cnt, sum[2] * tick / cnt, sum[3] * tick / cnt, sum[4] * tick / cnt, sum[5] * tick / cnt, (sum[1] + sum[2] + sum[3] + sum[4] + sum[5]) * tick / cnt, skew_start * tick / ncalls, skew_end * tick / ncalls); }
+              kind, ncalls, sum[1] * tick / cnt, sum[2] * tick / cnt, sum[3] * tick / cnt, sum[4] * tick / cnt, sum[5] * tick / cnt, (sum[1] + sum[2] + sum[3] + sum[4] + sum[5]) * tick / cnt, skew_start * tick / ncalls, skew_end * tick / ncalls);
+            fprintf(stderr, "   of which: hid partial sums + A packing %.2f | gain/forget GEMV + tanh + blend, unit 0 %.2f | unit 1 %.2f\n", wait1 * tick / cnt, wait2 * tick / cnt, (sum[3] - wait1 - wait2) * tick / cnt); }
         }
       }
     }
