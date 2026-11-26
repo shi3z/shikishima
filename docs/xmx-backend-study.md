@@ -226,3 +226,14 @@ The kernel is not limited by that load's position: its remaining time is the DRA
 
 **Planar MoE at T = 1 in isolation (`--bench-moe`, `XIK_BENCH_KINDS=2,3`, cold weights, GPU timestamps).** w13: 43.5 us for 17.3 MB = 397 GB/s (87 % of 456 GB/s, floor 37.9 us); w2: 23.8 us for 8.6 MB = 362 GB/s (79 %, floor 18.9 us). Both sit ~5 us above the DRAM floor; with 44 planar visits per step that is ~0.46 ms per step. Deeper prefetch (section 15), Split-K (15) and early L2 prefetch from the router (18) did not reduce it; the remaining part is the ramp-up and drain of a 1152-thread grid in which every thread streams the same amount and all finish together.
 Two 16-row blocks per thread (`moe_p3_t1rb2`, `XIK_P3RB2`, default off; 576 threads, two streams each, identical output): w13 43.9 us, w2 24.2-24.4 us against 43.5-45.9 / 23.8-25.2 us for the standard kernel in the same session (run-to-run spread ~5 %): no gain, the stream length per thread is not the limit either.
+
+## 19. Persistent per-slot MoE chain at T = 1 (`moe_chain`, `XIK_MOECHAIN`, default off; timing prototype, negative)
+
+One launch replaces w13 -> `k_act_q` -> w2 for the planar layers. 576 threads (half the resident capacity), thread = (expert slot, pair of 16-row blocks); per slot: w13 rows -> store, fence, atomic count; the slot's activation records after its 72 w13 threads; w2 rows after its 36 records. Only per-slot waiting, never global. Safety: every wait has a hard per-thread poll budget with an error counter (then the thread continues: wrong numbers, guaranteed termination); co-residency by construction; data written by other cores read with L1-uncached loads. The activation in the prototype uses ESIMD exp (not identical to `k_act_q`); it was only built to measure the upside before reproducing `sycl::tanh` / `sycl::exp` bit-exactly in ESIMD (IGC's implementations were read from the ISA: range-reduced polynomial + `math.exp` + IEEE division with `math.inv` refinement).
+
+* v1: the polling `block_load` was hoisted out of the loop by the compiler (it spun on a register; every wait ran out of budget; the run still terminated): fixed with an atomic load.
+* v1 with atomic-load polling: 77.4 tok/s (all 108 threads of a slot polling one address).
+* v2: work-groups of 8 aligned to slots, one poller per work-group, the others wait at the work-group barrier: 101.90 / 101.77, 101.72 / 101.79 against 103.48 / 103.52, 103.50 / 103.04 without the chain (same GPU, interleaved): -1.6 %. Zero exhausted waits.
+* v3: w2 tile 0 requested before the wait: 100.1 / 100.0 (the fence after the wait also waits for those loads).
+
+The separate launches have only ~0.15 us of GPU idle between them (`--bench-moe` PROF); the per-slot synchronisation and the 36-thread activation step cost more than the launch boundaries and the ramp they remove, even with the cheaper activation. The exact-activation version was therefore not built.

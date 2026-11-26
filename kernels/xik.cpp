@@ -1954,6 +1954,147 @@ void moe_p3_t1rb2(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const int3
     accb.copy_to(Y + (size_t)id0 * ldy + (rb0 + 1) * 16);
   });
 }
+// ---- persistent per-slot MoE chain for T = 1 planar layers (XIK_MOECHAIN=1, TIMING PROTOTYPE: the activation uses ESIMD exp/tanh, NOT identical to k_act_q).
+// One launch replaces w13 -> k_act_q -> w2.  576 threads (half the resident capacity): thread = (expert slot j, pair of 16-row blocks).  Per slot: phase A w13 rows,
+// store + fence + atomic count; phase B (36 threads of the slot, after the slot's 72 w13 threads) activation + int8 records; phase C w2 rows after the slot's 36
+// records.  Only per-slot waiting, never global; every wait polls with an L1-uncached load and has a hard total budget per thread (error counter, then the thread
+// stops waiting and continues: wrong numbers, guaranteed termination).
+struct ChainArgs {
+  const uint32_t *W13, *S13, *W2, *S2; const int32_t *AQ1; int32_t *AQ2; float *GU, *YP; const int32_t *desc;
+  uint32_t *cnt; uint32_t *err; uint32_t epoch;
+};
+ESIMD_INLINE void chain_pre(const uint32_t *Wp, const uint32_t *Sp, int e, int rb0, int ntile, int nrb, es::simd<uint32_t, 192> (&wa)[2], es::simd<uint32_t, 192> (&wb2)[2], es::simd<uint32_t, 16> (&sa)[2], es::simd<uint32_t, 16> (&sb2)[2]) {
+  const size_t wst = (size_t)nrb * 192, sst = (size_t)nrb * 16;
+  const uint32_t *wpa = Wp + (((size_t)e * ntile) * nrb + rb0) * 192, *wpb = wpa + 192;
+  const uint32_t *spa = Sp + (((size_t)e * ntile) * nrb + rb0) * 16, *spb = spa + 16;
+  w3_ld_tile(wpa, spa, wst, sst, 0, wa[0], sa[0]);
+  w3_ld_tile(wpb, spb, wst, sst, 0, wb2[0], sb2[0]);
+}
+// tile 0 of both row blocks must already be in wa[0] / wb2[0] / sa[0] / sb2[0] (chain_pre), so that it can be requested before a wait
+ESIMD_INLINE void chain_rows(const uint32_t *Wp, const uint32_t *Sp, const int32_t *AQ, int e, int trow, int rb0, int ntile, int nrb, es::simd<float, 16> &acca, es::simd<float, 16> &accb, bool l1uc,
+                             es::simd<uint32_t, 192> (&wa)[2], es::simd<uint32_t, 192> (&wb2)[2], es::simd<uint32_t, 16> (&sa)[2], es::simd<uint32_t, 16> (&sb2)[2]) {
+  using namespace es;
+  const int ngk = ntile * 2;
+  const size_t wst = (size_t)nrb * 192, sst = (size_t)nrb * 16;
+  const uint32_t *wpa = Wp + (((size_t)e * ntile) * nrb + rb0) * 192, *wpb = wpa + 192;
+  const uint32_t *spa = Sp + (((size_t)e * ntile) * nrb + rb0) * 16, *spb = spa + 16;
+  acca = 0.f; accb = 0.f;
+  for (int t0 = 0; t0 < ntile; t0 += 2) {
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      const int t = t0 + u;
+      if (t + 1 < ntile) { w3_ld_tile(wpa, spa, wst, sst, t + 1, wa[(u + 1) % 2], sa[(u + 1) % 2]); w3_ld_tile(wpb, spb, wst, sst, t + 1, wb2[(u + 1) % 2], sb2[(u + 1) % 2]); }
+      if (t < ntile) {
+#pragma unroll
+        for (int gi = 0; gi < 2; gi++) {
+          const int gg = 2 * t + gi;
+          simd<int32_t, 32> a32;
+          if (l1uc) a32 = block_load<int32_t, 32>(AQ + ((size_t)trow * ngk * 2 + (size_t)gg * 2) * 16, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+          else a32 = block_load<int32_t, 32>(AQ + ((size_t)trow * ngk * 2 + (size_t)gg * 2) * 16);
+          simd<int32_t, 8> a0 = a32.template select<8, 1>(0), a1 = a32.template select<8, 1>(16);
+          const float as0 = sycl::bit_cast<float>((int32_t)a32[8]), sm0 = (float)(int32_t)a32[9], as1 = sycl::bit_cast<float>((int32_t)a32[24]), sm1 = (float)(int32_t)a32[25];
+#pragma unroll
+          for (int hb = 0; hb < 2; hb++) {
+            simd<uint32_t, 192> &wv = hb ? wb2[u] : wa[u]; simd<uint32_t, 16> &sv = hb ? sb2[u] : sa[u];
+            simd<int32_t, 32> p0 = wv.template select<32, 1>(96 * gi).template bit_cast_view<int32_t>().read();
+            simd<int32_t, 16> z0 = wv.template select<16, 1>(96 * gi + 32).template bit_cast_view<int32_t>().read();
+            simd<int32_t, 32> p1 = wv.template select<32, 1>(96 * gi + 48).template bit_cast_view<int32_t>().read();
+            simd<int32_t, 16> z1 = wv.template select<16, 1>(96 * gi + 80).template bit_cast_view<int32_t>().read();
+            simd<int32_t, 32> q0, q1;
+            q0.template select<16, 1>(0) = z0 & 0x55555555; q0.template select<16, 1>(16) = (z0 >> 1) & 0x55555555;
+            q1.template select<16, 1>(0) = z1 & 0x55555555; q1.template select<16, 1>(16) = (z1 >> 1) & 0x55555555;
+            simd<sycl::half, 16> sh = sv.template select<8, 1>(8 * gi).template bit_cast_view<sycl::half>();
+            simd<float, 16> ws = sh;
+            simd<int32_t, 16> i12a = 0, i3a = 0, i12b = 0, i3b = 0;
+            i12a = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12a, p0, a0);
+            i3a = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3a, q0, a0);
+            i12b = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12b, p1, a1);
+            i3b = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3b, q1, a1);
+            simd<float, 16> fa = convert<float>(i12a + (i3a << 2)), fb = convert<float>(i12b + (i3b << 2));
+            simd<float, 16> upd = ((fa - 4.f * sm0) * as0 + (fb - 4.f * sm1) * as1) * ws;
+            if (hb) accb += upd; else acca += upd;
+          }
+        }
+      }
+    }
+  }
+}
+// bounded wait: poll *p (L1 uncached) until >= target; total budget per thread; returns false (and counts an error) when the budget is spent
+ESIMD_INLINE bool chain_wait(const uint32_t *p, uint32_t target, uint32_t &budget, uint32_t *err) {
+  using namespace es;
+  while (budget > 0) {
+    // atomic load: cannot be hoisted out of the loop (a plain block_load was, and the loop then spun on a register)
+    simd<uint32_t, 1> v = atomic_update<atomic_op::load, uint32_t, 1>(const_cast<uint32_t *>(p), simd<uint32_t, 1>(0));
+    if (v[0] >= target) { fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>(); return true; }
+    budget--;
+  }
+  atomic_update<atomic_op::inc, uint32_t, 1>(err, simd<uint32_t, 1>(0));
+  return false;
+}
+static void moe_chain(xik_ctx *c, const LayerW &lw, int np) {
+  static uint32_t *cnt = nullptr, *err = nullptr; static uint32_t epoch = 0;
+  if (!cnt) { cnt = sycl::malloc_device<uint32_t>(8 * 32 + 16, c->q.q); err = cnt + 8 * 32; c->q.memset(cnt, 0, (8 * 32 + 16) * 4).wait(); }
+  epoch++;
+  P3Bufs &pb = p3_bufs(c);
+  ChainArgs a{(const uint32_t *)lw.w13, (const uint32_t *)lw.w13_s, (const uint32_t *)lw.w2, (const uint32_t *)lw.w2_s, pb.aq1, pb.aq2, c->gu_part, c->yp_part, c->desc, cnt, err, epoch};
+  constexpr int NRB = 144, NPAIR = NRB / 2, NTH = 8 * NPAIR;  // 576 threads
+  c->q.parallel_for(nd_range<1>(NTH, 8), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {  // 8 threads per work-group: 9 work-groups per slot, one poller each
+    using namespace es;
+    const int gid = (int)it.get_global_id(0), j = gid / NPAIR, rp = gid % NPAIR, rb0 = 2 * rp, ltid = (int)it.get_local_id(0);
+    simd<int32_t, 16> d = block_load<int32_t, 16>(a.desc + j * 16);
+    if (d[1] <= 0) return;
+    const int e = d[0], id0 = d[2];
+    uint32_t budget = 400000;
+    uint32_t *c13 = a.cnt + j * 32, *cac = a.cnt + j * 32 + 16;
+    // phase A: w13 rows rb0, rb0 + 1 of slot j
+    simd<uint32_t, 192> wa[2], wb2[2]; simd<uint32_t, 16> sa[2], sb2[2];
+    simd<float, 16> ga, gb;
+    chain_pre(a.W13, a.S13, e, rb0, D / 128, NRB, wa, wb2, sa, sb2);
+    chain_rows(a.W13, a.S13, a.AQ1, e, id0 / TOPK, rb0, D / 128, NRB, ga, gb, false, wa, wb2, sa, sb2);
+    ga.copy_to(a.GU + (size_t)id0 * 2 * FI + rb0 * 16); gb.copy_to(a.GU + (size_t)id0 * 2 * FI + (rb0 + 1) * 16);
+    fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();
+    atomic_update<atomic_op::inc, uint32_t, 1>(c13, simd<uint32_t, 1>(0));
+    // phase B: activation + records of chunk rp (36 chunks of 32 values), after all 72 w13 threads of the slot
+    if (ltid == 0) chain_wait(c13, a.epoch * NPAIR, budget, a.err);
+    barrier();
+    fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();
+    if (rp < FI / 32) {
+      simd<float, 64> gu = block_load<float, 64>(a.GU + (size_t)id0 * 2 * FI + rp * 64, properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>, alignment<16>});
+      simd<float, 32> g = gu.template select<32, 2>(0), u = gu.template select<32, 2>(1);
+      // approximate activation (timing only)
+      simd<float, 32> tg = 1.f - 2.f / (exp(g * (2.f / GATE_CAP)) + 1.f), tu = 1.f - 2.f / (exp(u * (2.f / UP_CAP)) + 1.f);
+      simd<float, 32> sg = 1.f / (1.f + exp(-g));
+      simd<float, 32> v = (tg * GATE_CAP) * sg * (tu * UP_CAP);
+      simd<float, 32> av = abs(v);
+      float amax = hmax<float>(av);
+      const float inv = amax > 0.f ? 127.f / amax : 0.f;
+      simd<float, 32> qf = v * inv; qf = rnde<float, 32>(qf); qf = max(simd<float, 32>(-127.f), min(simd<float, 32>(127.f), qf));
+      simd<int32_t, 32> qi = convert<int32_t>(qf);
+      const int sum = reduce<int32_t>(qi, std::plus<>());
+      simd<uint32_t, 32> qb = qi.template bit_cast_view<uint32_t>() & 0xFFu;
+      simd<int32_t, 16> rec = 0;
+#pragma unroll
+      for (int w = 0; w < 8; w++) rec[w] = (int32_t)(qb[4 * w] | (qb[4 * w + 1] << 8) | (qb[4 * w + 2] << 16) | (qb[4 * w + 3] << 24));
+      rec[8] = sycl::bit_cast<int32_t>(amax / 127.f); rec[9] = sum;
+      rec.copy_to(a.AQ2 + ((size_t)id0 * (FI / 32) + rp) * 16);
+      fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();
+      atomic_update<atomic_op::inc, uint32_t, 1>(cac, simd<uint32_t, 1>(0));
+    }
+    // phase C: w2 rows rb0, rb0 + 1 after the slot's 36 records
+    chain_pre(a.W2, a.S2, e, rb0, FI / 128, NRB, wa, wb2, sa, sb2);  // w2 tile 0 requested before the wait (independent of the records)
+    if (ltid == 0) chain_wait(cac, a.epoch * (FI / 32), budget, a.err);
+    barrier();
+    fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();
+    simd<float, 16> ya, yb;
+    chain_rows(a.W2, a.S2, a.AQ2, e, id0, rb0, FI / 128, NRB, ya, yb, true, wa, wb2, sa, sb2);
+    ya.copy_to(a.YP + (size_t)id0 * D + rb0 * 16); yb.copy_to(a.YP + (size_t)id0 * D + (rb0 + 1) * 16);
+  });
+  static int dbg = 0;
+  if (getenv("XIK_MOECHAIN_DBG") && dbg < 4) { dbg++; std::vector<uint32_t> h(8 * 32 + 16); c->q.q.memcpy(h.data(), cnt, h.size() * 4).wait();
+    fprintf(stderr, "moe_chain call %u: c13 %u %u .. cac %u %u .. err %u\n", epoch, h[0], h[32], h[16], h[48], h[8 * 32]); }
+  static int chk = 0;
+  if (getenv("XIK_MOECHAIN_ERR") && ++chk % 500 == 0) { uint32_t h = 0; c->q.q.memcpy(&h, err, 4).wait(); fprintf(stderr, "moe_chain: exhausted waits so far %u\n", h); }
+}
 void moe_p3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const int32_t *AQ, const float *AS, const int32_t *SM, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
   const uint32_t *W = (const uint32_t *)Wp, *S = (const uint32_t *)Sp;
   static const int p3rb2 = getenv("XIK_P3RB2") ? atoi(getenv("XIK_P3RB2")) : 0;
@@ -6388,10 +6529,14 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
     if (lw.w3p && nks == 1) {  // planar INT3 experts on native u2 x s8 DPAS
       P3Bufs &pb = p3_bufs(c);
       if (!(fused_grp && T == 1)) k_aq(c, c->in[0], D, T, D, pb.aq1, pb.as1, pb.sm1, false, true);
+      static const bool mchain = getenv("XIK_MOECHAIN") && atoi(getenv("XIK_MOECHAIN")) != 0;
+      if (mchain && T == 1 && fused_grp) moe_chain(c, lw, np);
+      else {
       moe_p3g(c, lw.w13, lw.w13_s, pb.aq1, pb.as1, pb.sm1, true, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
       phase(c, P_MOE_W13);
       k_act_q(c, np, pb.aq2);
       moe_p3g(c, lw.w2, lw.w2_s, pb.aq2, pb.as2, pb.sm2, false, T, slots, D, FI, c->yp_part, (size_t)np * D, D);
+      }
     } else {
     if (lw.w3_13) moe_w3g(c, lw.w13, lw.w13_s, c->x16_in, D, true, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
     else moe_fp4g(c, mcfg, lw.w13, lw.w13_s, c->x16_in, D, true, lw.w13_amax, lw.w13_den, T, slots, 2 * FI, D, c->gu_part,
