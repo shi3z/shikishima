@@ -6848,6 +6848,12 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
       }
       static const int nrot = getenv("XIK_BENCH_ROT") ? atoi(getenv("XIK_BENCH_ROT")) : 20;  // 20 = cold; 1 = same layer every call (TLB warm)
       const LayerW &lq = c->L[(layer + (it++ % nrot)) % 20];  // rotate over layers: weights are cold every call
+      if (kind >= 2 && lq.w3p) {  // planar INT3 experts (the T = 1 production path): 2 = w13, 3 = w2
+        P3Bufs &pb = p3_bufs(c);
+        if (kind == 2) moe_p3g(c, lq.w13, lq.w13_s, pb.aq1, pb.as1, pb.sm1, true, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
+        else moe_p3g(c, lq.w2, lq.w2_s, pb.aq2, pb.as2, pb.sm2, false, T, slots, D, FI, c->yp_part, (size_t)np * D, D);
+        return;
+      }
       if (kind == 0) {
         if (lq.w3_13) moe_w3g(c, lq.w13, lq.w13_s, c->x16_in, D, true, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
         else moe_fp4g(c, cfg, lq.w13, lq.w13_s, c->x16_in, D, true, lq.w13_amax, lq.w13_den, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
@@ -6980,6 +6986,7 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
     }
     if (fp8l) *out_bytes = (double)distinct * (kind == 0 ? (2.0 * FI * D * (1 + 1.0 / 32)) : ((double)D * FI * (1 + 1.0 / 32)));
     else *out_bytes = (double)distinct * (kind == 0 ? (2.0 * FI * D / 2 + 2.0 * FI * D / 16) : ((double)D * FI / 2 + (double)D * FI / 16));
+    if (!fp8l && kind >= 2) *out_bytes = (double)distinct * (kind == 2 ? 2.0 * FI * D : (double)D * FI) * (3.0 / 8 + 1.0 / 32);  // planar INT3: 3 bits + fp16 scale per 64
     return 0;
   } catch (std::exception &e) {
     g_err = e.what();
