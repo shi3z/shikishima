@@ -3144,6 +3144,150 @@ void k_attn_p(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos
   });
 }
 
+// T = 1 fusion of k_kv (+ q / r clipping) into the key-split attention (XIK_FUSE_KVA, default off): one launch instead of two, no inter-work-group waiting.
+// Work-group (head hh) computes the new token's k / v of its kv head itself (redundantly in the 3 heads of a kv group; head hh % 3 == 0 writes the cache), clips its
+// own q / r, and uses the new k / v from SLM for the current position (same rounding as the cache value).  Extra work-groups write the conv state (no consumer here).
+// Reductions run over the 512-thread group (zeros outside the first 128 threads): sums may differ in the last bit from the 128-thread k_kv (APPROXIMATE).
+template <int NSPL>
+void k_attn_kv(xik_ctx *c, const LayerW &lw, int slot, bool local) {
+  int par = c->cpar[slot];
+  float *so = c->convst[slot][par], *sn = c->defer ? nullptr : c->convst[slot][1 - par];
+  ConvArgs ak{c->kb, so, sn, nullptr, nullptr, KVD, 1, local ? lw.k_conv : nullptr, lw.k_static, c->dynk, NKV, local ? 2.2360679775f : 3.0f};
+  ConvArgs av{c->vb, so + 3 * KVD, sn ? sn + 3 * KVD : nullptr, nullptr, nullptr, KVD, 1, local ? lw.v_conv : nullptr, lw.v_static, c->dynv, NKV, local ? 2.2360679775f : 3.0f};
+  float *q = c->qb, *r = c->rb; const float *sink = c->sinkb, *gate = c->gateb;
+  float *kc = c->kcache[slot], *vc = c->vcache[slot];
+  const bool kbf = c->kbf16;
+  const uint16_t *rp = lw.rel_proj, *qcl = lw.q_clip, *rcl = lw.rel_clip;
+  float *out = c->attn_o;
+  const int32_t *dpp = c->dparams;
+  const int maxkeys = local ? WIN : c->max_ctx;
+  const float scale = 1.0f / sycl::sqrt((float)HD);
+  constexpr int WGS = NSPL * HD;
+  const int nst = sn ? 3 * KVD / HD : 0, nstg = (nst * HD + WGS - 1) / WGS;
+  c->q.submit([&](handler &h) {
+    local_accessor<float, 1> lg(range<1>(maxkeys), h);
+    local_accessor<float, 1> qs(range<1>(HD), h);
+    local_accessor<float, 1> kn(range<1>(HD), h);
+    local_accessor<float, 1> vn(range<1>(HD), h);
+    local_accessor<float, 1> rs(range<1>(DREL), h);
+    local_accessor<float, 1> red(range<1>(WGS), h);
+    h.parallel_for(nd_range<1>((size_t)(NH + nstg) * WGS, WGS), [=](nd_item<1> it) {
+      const int idx = it.get_group(0), tid = it.get_local_id(0);
+      if (idx >= NH) {  // conv state write (independent of the attention)
+        const int j = (idx - NH) * WGS + tid;
+        if (j < nst * HD) { conv_state_write(ak, j); conv_state_write(av, j); }
+        return;
+      }
+      const int hh = idx, kvh = hh / (NH / NKV);
+      auto g = it.get_group();
+      const int pos = dpp[0];
+      const int lo = local ? sycl::max(0, pos - WIN + 1) : 0;
+      const int nk = pos - lo + 1;
+      // new k / v of this kv head (k_kv), q / r clipping of this head (k_qr_clip part of k_kv)
+      const int d0 = tid < HD ? tid : 0, ch = kvh * HD + d0;
+      const float kv = tid < HD ? conv_one(ak, 0, ch) : 0.f, vv = tid < HD ? conv_one(av, 0, ch) : 0.f;
+      const float qv = tid < HD ? q[hh * HD + d0] * bf2f(qcl[hh * HD + d0]) : 0.f;
+      const float rv0 = tid < DREL ? r[hh * DREL + tid] * bf2f(rcl[hh * DREL + tid]) : 0.f;
+      // the four sums of squares: sub-group reductions of the first 128 threads, partials in SLM, one work-group barrier
+      auto sg = it.get_sub_group();
+      const int sgs = (int)sg.get_max_local_range()[0], sid = (int)sg.get_group_id()[0], nsg = HD / sgs;
+      const float p0 = reduce_over_group(sg, kv * kv, plus<float>()), p1 = reduce_over_group(sg, vv * vv, plus<float>());
+      const float p2 = reduce_over_group(sg, qv * qv, plus<float>()), p3 = reduce_over_group(sg, rv0 * rv0, plus<float>());
+      if (tid < HD && sg.get_local_id()[0] == 0) { red[4 * sid] = p0; red[4 * sid + 1] = p1; red[4 * sid + 2] = p2; red[4 * sid + 3] = p3; }
+      group_barrier(g);
+      float ks = 0.f, vs = 0.f, qss = 0.f, rss = 0.f;
+      for (int k = 0; k < nsg; k++) { ks += red[4 * k]; vs += red[4 * k + 1]; qss += red[4 * k + 2]; rss += red[4 * k + 3]; }
+      if (tid < HD) {
+        const float fk = sycl::fmin(QK_CLIP / (sycl::sqrt(ks) + 1e-6f), 1.0f);
+        const float knew = rbf(kv * fk), vnew = vv * sycl::rsqrt(vs / HD + EPS);
+        kn[tid] = knew; vn[tid] = vnew;
+        if (hh % (NH / NKV) == 0) {
+          const size_t slotpos = local ? (pos % RING) : pos;
+          if (kbf) reinterpret_cast<uint16_t *>(kc)[slotpos * KVD + ch] = (uint16_t)(sycl::bit_cast<uint32_t>(knew) >> 16);
+          else kc[slotpos * KVD + ch] = knew;
+          vc[slotpos * KVD + ch] = vnew;
+        }
+        const float fq = sycl::fmin(QK_CLIP / (sycl::sqrt(qss) + 1e-6f), 1.0f);
+        const float qc = rbf(qv * fq); qs[tid] = qc; q[hh * HD + tid] = qc;
+        if (tid < DREL) { const float fr = sycl::fmin(REL_CLIP / (sycl::sqrt(rss) + 1e-6f), 1.0f); const float rc = rbf(rv0 * fr); rs[tid] = rc; r[hh * DREL + tid] = rc; }
+      }
+      group_barrier(g);
+      float rv[DREL];
+      for (int e = 0; e < DREL; e++) rv[e] = rs[e];
+      const float sk = sink[hh];
+      float mx = 0.f;
+      for (int j = tid; j < nk - 1; j += WGS) {
+        const int kp = lo + j, dist = pos - kp;
+        const size_t slotpos = local ? (kp % RING) : kp;
+        float s = 0.f;
+        if (kbf) {
+          const uint16_t *kb = reinterpret_cast<const uint16_t *>(kc) + slotpos * KVD + kvh * HD;
+          for (int d = 0; d < HD; d += 8) {
+            vec<uint16_t, 8> u = *reinterpret_cast<const vec<uint16_t, 8> *>(kb + d);
+            float k0 = sycl::bit_cast<float>((uint32_t)u[0] << 16), k1 = sycl::bit_cast<float>((uint32_t)u[1] << 16),
+                  k2 = sycl::bit_cast<float>((uint32_t)u[2] << 16), k3 = sycl::bit_cast<float>((uint32_t)u[3] << 16);
+            s += qs[d] * k0 + qs[d + 1] * k1 + qs[d + 2] * k2 + qs[d + 3] * k3;
+            float k4 = sycl::bit_cast<float>((uint32_t)u[4] << 16), k5 = sycl::bit_cast<float>((uint32_t)u[5] << 16),
+                  k6 = sycl::bit_cast<float>((uint32_t)u[6] << 16), k7 = sycl::bit_cast<float>((uint32_t)u[7] << 16);
+            s += qs[d + 4] * k4 + qs[d + 5] * k5 + qs[d + 6] * k6 + qs[d + 7] * k7;
+          }
+        } else {
+          const float *kr = kc + slotpos * KVD + kvh * HD;
+          for (int d = 0; d < HD; d += 4) {
+            vec<float, 4> kk = *reinterpret_cast<const vec<float, 4> *>(kr + d);
+            s += qs[d] * kk[0] + qs[d + 1] * kk[1] + qs[d + 2] * kk[2] + qs[d + 3] * kk[3];
+          }
+        }
+        float bias = 0.f;
+        if (dist < EXT)
+          for (int e = 0; e < DREL; e++) bias += rv[e] * bf2f(rp[(size_t)e * EXT + dist]);
+        const float l = s * scale + bias - sk;
+        lg[j] = l;
+        mx = sycl::fmax(mx, l);
+      }
+      if ((nk - 1) % WGS == tid) {  // the new key (dist 0): from SLM, same grouping as the cache paths
+        float s = 0.f;
+        if (kbf) { for (int d = 0; d < HD; d += 8) { s += qs[d] * kn[d] + qs[d + 1] * kn[d + 1] + qs[d + 2] * kn[d + 2] + qs[d + 3] * kn[d + 3]; s += qs[d + 4] * kn[d + 4] + qs[d + 5] * kn[d + 5] + qs[d + 6] * kn[d + 6] + qs[d + 7] * kn[d + 7]; } }
+        else { for (int d = 0; d < HD; d += 4) s += qs[d] * kn[d] + qs[d + 1] * kn[d + 1] + qs[d + 2] * kn[d + 2] + qs[d + 3] * kn[d + 3]; }
+        float bias = 0.f;
+        if (0 < EXT) for (int e = 0; e < DREL; e++) bias += rv[e] * bf2f(rp[(size_t)e * EXT + 0]);
+        const float l = s * scale + bias - sk;
+        lg[nk - 1] = l;
+        mx = sycl::fmax(mx, l);
+      }
+      mx = reduce_over_group(g, mx, maximum<float>());
+      float den = 0.f;
+      for (int j = tid; j < nk; j += WGS) { const float e = sycl::exp(lg[j] - mx); lg[j] = e; den += e; }
+      den = reduce_over_group(g, den, plus<float>()) + sycl::exp(-mx);
+      group_barrier(g);
+      const int cs = tid / HD, d = tid % HD;
+      const int j0 = (int)((long)nk * cs / NSPL), j1 = (int)((long)nk * (cs + 1) / NSPL);
+      const int jl = nk - 1;  // index of the new key
+      float o = 0.f;
+      const int je = j1 > jl ? jl : j1;
+      int j = j0;
+      for (; j + 8 <= je; j += 8) {
+        float vv8[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) { const int kp = lo + j + u; vv8[u] = vc[(local ? (kp % RING) : kp) * KVD + kvh * HD + d]; }
+#pragma unroll
+        for (int u = 0; u < 8; u++) o += lg[j + u] * vv8[u];
+      }
+      for (; j < je; j++) { const int kp = lo + j; o += lg[j] * vc[(local ? (kp % RING) : kp) * KVD + kvh * HD + d]; }
+      if (j1 > jl && j0 <= jl) o += lg[jl] * vn[d];
+      red[tid] = o;
+      group_barrier(g);
+      if (tid < HD) {
+        float tot = red[tid];
+#pragma unroll
+        for (int k = 1; k < NSPL; k++) tot += red[k * HD + tid];
+        tot /= den;
+        const float gt = sigmoidf(gate[hh * HD + tid]);
+        out[hh * HD + tid] = rbf(tot * gt);
+      }
+    });
+  });
+}
 void k_attn(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
   // XIK_ATTN = V prefetch width VW (0 = original loop, default 8); XIK_ATTN_UNR = outer-loop unroll (-1 compiler default, 0 none, 4 forced x4);
   // XIK_ATTN_ABL = timing-only ablation bits (1 no SLM read, 2 no V load) -- wrong numbers, benchmark only.
@@ -5674,9 +5818,15 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   }
   phase(c, P_GEMV_ATTN);
   { static const bool f3 = !getenv("XIK_FUSE3") || atoi(getenv("XIK_FUSE3")) != 0; if (!f3 || (abl_mask() & 64)) k_qr_clip(c, lw, T); }
+  static const bool fkva = getenv("XIK_FUSE_KVA") && atoi(getenv("XIK_FUSE_KVA")) != 0;  // default off: no measurable gain, not bit-identical
+  static const int atp_k = getenv("XIK_ATTNP") ? atoi(getenv("XIK_ATTNP")) : 4;
+  static const bool f3_k = !getenv("XIK_FUSE3") || atoi(getenv("XIK_FUSE3")) != 0;
+  if (fkva && T == 1 && atp_k == 4 && f3_k && !(abl_mask() & 64)) { k_attn_kv<4>(c, lw, slot, local); phase(c, P_KV); }
+  else {
   k_kv(c, lw, slot, local, T, pos0);
   phase(c, P_KV);
   k_attn(c, lw, slot, local, T, pos0);
+  }
   phase(c, P_ATTN);
   if (as_on()) as_rec(c, layer, 3, c->attn_o, QD, T);
   static const int ksd_wo = getenv("XIK_KSD_WO") ? atoi(getenv("XIK_KSD_WO")) : 32;
