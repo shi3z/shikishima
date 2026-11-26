@@ -1893,8 +1893,71 @@ void moe_p3_t1s(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const int32_
     }
   });
 }
+// T = 1 planar expert kernel with two 16-row blocks per thread (XIK_P3RB2: 1 = w2 only, 2 = w13 and w2): half the threads, each streaming two row blocks
+// with the one-tile-ahead ring of moe_p3_t<1, 1>; per row block the arithmetic and its order are unchanged (identical results).
+void moe_p3_t1rb2(xik_ctx *c, const uint32_t *Wp, const uint32_t *Sp, const int32_t *AQ, bool w13, int maxslots, int rows, int K, float *Y, int ldy) {
+  const int nrb = rows / 16, ntile = K / 128, ngk = K / 64, nrb2 = nrb / 2;
+  const int32_t *desc = c->desc;
+  const size_t nthreads = (size_t)maxslots * nrb2;
+  c->q.parallel_for(nd_range<1>(nthreads, expert_lws()), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    const size_t gid = it.get_global_id(0);
+    const int rp = (int)(gid % nrb2), j = (int)(gid / nrb2), rb0 = 2 * rp;
+    simd<int32_t, 16> d = block_load<int32_t, 16>(desc + j * 16);
+    if (d[1] <= 0) return;
+    const int e = d[0], id0 = d[2], trow = w13 ? id0 / TOPK : id0;
+    const size_t wst = (size_t)nrb * 192, sst = (size_t)nrb * 16;
+    const uint32_t *wpa = Wp + (((size_t)e * ntile) * nrb + rb0) * 192, *wpb = wpa + 192;
+    const uint32_t *spa = Sp + (((size_t)e * ntile) * nrb + rb0) * 16, *spb = spa + 16;
+    simd<float, 16> acca = 0.f, accb = 0.f;
+    simd<uint32_t, 192> wa[2], wb2[2]; simd<uint32_t, 16> sa[2], sb2[2];
+    w3_ld_tile(wpa, spa, wst, sst, 0, wa[0], sa[0]);
+    w3_ld_tile(wpb, spb, wst, sst, 0, wb2[0], sb2[0]);
+    for (int t0 = 0; t0 < ntile; t0 += 2) {
+#pragma unroll
+      for (int u = 0; u < 2; u++) {
+        const int t = t0 + u;
+        if (t + 1 < ntile) { w3_ld_tile(wpa, spa, wst, sst, t + 1, wa[(u + 1) % 2], sa[(u + 1) % 2]); w3_ld_tile(wpb, spb, wst, sst, t + 1, wb2[(u + 1) % 2], sb2[(u + 1) % 2]); }
+        if (t < ntile) {
+#pragma unroll
+          for (int gi = 0; gi < 2; gi++) {
+            const int gg = 2 * t + gi;
+            simd<int32_t, 32> a32 = block_load<int32_t, 32>(AQ + ((size_t)trow * ngk * 2 + (size_t)gg * 2) * 16);
+            simd<int32_t, 8> a0 = a32.template select<8, 1>(0), a1 = a32.template select<8, 1>(16);
+            const float as0 = sycl::bit_cast<float>((int32_t)a32[8]), sm0 = (float)(int32_t)a32[9], as1 = sycl::bit_cast<float>((int32_t)a32[24]), sm1 = (float)(int32_t)a32[25];
+#pragma unroll
+            for (int hb = 0; hb < 2; hb++) {
+              simd<uint32_t, 192> &wv = hb ? wb2[u] : wa[u]; simd<uint32_t, 16> &sv = hb ? sb2[u] : sa[u];
+              simd<int32_t, 32> p0 = wv.template select<32, 1>(96 * gi).template bit_cast_view<int32_t>().read();
+              simd<int32_t, 16> z0 = wv.template select<16, 1>(96 * gi + 32).template bit_cast_view<int32_t>().read();
+              simd<int32_t, 32> p1 = wv.template select<32, 1>(96 * gi + 48).template bit_cast_view<int32_t>().read();
+              simd<int32_t, 16> z1 = wv.template select<16, 1>(96 * gi + 80).template bit_cast_view<int32_t>().read();
+              simd<int32_t, 32> q0, q1;
+              q0.template select<16, 1>(0) = z0 & 0x55555555; q0.template select<16, 1>(16) = (z0 >> 1) & 0x55555555;
+              q1.template select<16, 1>(0) = z1 & 0x55555555; q1.template select<16, 1>(16) = (z1 >> 1) & 0x55555555;
+              simd<sycl::half, 16> sh = sv.template select<8, 1>(8 * gi).template bit_cast_view<sycl::half>();
+              simd<float, 16> ws = sh;
+              simd<int32_t, 16> i12a = 0, i3a = 0, i12b = 0, i3b = 0;
+              i12a = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12a, p0, a0);
+              i3a = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3a, q0, a0);
+              i12b = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12b, p1, a1);
+              i3b = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3b, q1, a1);
+              simd<float, 16> fa = convert<float>(i12a + (i3a << 2)), fb = convert<float>(i12b + (i3b << 2));
+              simd<float, 16> upd = ((fa - 4.f * sm0) * as0 + (fb - 4.f * sm1) * as1) * ws;
+              if (hb) accb += upd; else acca += upd;
+            }
+          }
+        }
+      }
+    }
+    acca.copy_to(Y + (size_t)id0 * ldy + rb0 * 16);
+    accb.copy_to(Y + (size_t)id0 * ldy + (rb0 + 1) * 16);
+  });
+}
 void moe_p3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const int32_t *AQ, const float *AS, const int32_t *SM, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
   const uint32_t *W = (const uint32_t *)Wp, *S = (const uint32_t *)Sp;
+  static const int p3rb2 = getenv("XIK_P3RB2") ? atoi(getenv("XIK_P3RB2")) : 0;
+  if (maxper <= 1 && p3rb2 > 0 && (p3rb2 == 2 || !w13) && ((rows / 16) % 2 == 0)) { moe_p3_t1rb2(c, W, S, AQ, w13, maxslots, rows, K, Y, ldy); return; }
   static const int p3ks = getenv("XIK_P3KS") ? atoi(getenv("XIK_P3KS")) : 0;
   if (maxper <= 1 && p3ks > 0) {
     switch (p3ks) { case 1: moe_p3_t1s<1>(c, W, S, AQ, w13, maxslots, rows, K, Y, ldy); break; case 2: moe_p3_t1s<2>(c, W, S, AQ, w13, maxslots, rows, K, Y, ldy); break;
