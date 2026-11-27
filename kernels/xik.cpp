@@ -1655,8 +1655,8 @@ static P3Bufs &p3_bufs(xik_ctx *c) {
   static P3Bufs b; static bool init = false;
   if (!init) {
     const size_t mt = (size_t)std::max(64, c->max_tokens);
-    b.aq1 = sycl::malloc_device<int32_t>(mt * (D / 64) * 32, c->q.q); b.as1 = sycl::malloc_device<float>(mt * (D / 64), c->q.q); b.sm1 = sycl::malloc_device<int32_t>(mt * (D / 64), c->q.q);
-    b.aq2 = sycl::malloc_device<int32_t>(mt * TOPK * (FI / 64) * 32, c->q.q); b.as2 = sycl::malloc_device<float>(mt * TOPK * (FI / 64), c->q.q); b.sm2 = sycl::malloc_device<int32_t>(mt * TOPK * (FI / 64), c->q.q);
+    b.aq1 = sycl::malloc_device<int32_t>(mt * (D / 64) * 32 + 1024, c->q.q);  // + slack: the hand-written expert ISA reads the records up to two tiles ahead b.as1 = sycl::malloc_device<float>(mt * (D / 64), c->q.q); b.sm1 = sycl::malloc_device<int32_t>(mt * (D / 64), c->q.q);
+    b.aq2 = sycl::malloc_device<int32_t>(mt * TOPK * (FI / 64) * 32 + 1024, c->q.q); b.as2 = sycl::malloc_device<float>(mt * TOPK * (FI / 64), c->q.q); b.sm2 = sycl::malloc_device<int32_t>(mt * TOPK * (FI / 64), c->q.q);
     init = true;
   }
   return b;
@@ -2164,7 +2164,7 @@ static void moe_p3_isa(xik_ctx *c, const P3IArgs a, int maxslots) {
 }
 void moe_p3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const int32_t *AQ, const float *AS, const int32_t *SM, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
   const uint32_t *W = (const uint32_t *)Wp, *S = (const uint32_t *)Sp;
-  static const int p3isa = getenv("XIK_P3ISA") ? atoi(getenv("XIK_P3ISA")) : 0;  // 1 = carrier ESIMD kernel (same arithmetic), 2 = its hand-written ISA (XIK_ISA_P3)
+  static const int p3isa = getenv("XIK_P3ISA") ? atoi(getenv("XIK_P3ISA")) : 1;  // default 1: the single-struct T = 1 kernel is ~4 us faster per call than moe_p3_t<1, 1> (identical results)  // 1 = carrier ESIMD kernel (same arithmetic), 2 = its hand-written ISA (XIK_ISA_P3)
   if (maxper <= 1 && p3isa > 0) {
     P3IArgs pa{W, S, AQ, c->desc, Y, rows / 16, K / 128, ldy, w13 ? 1 : 0};
     if (p3isa == 2 && isa_p3(c, pa, maxslots)) return;
@@ -2561,8 +2561,36 @@ void moe_fp8g_t(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::ha
     c->q.parallel_for(nd_range<1>(nthreads, expert_lws()), kernel);
   }
 }
+// T = 1 MXFP8 experts with one struct argument and only the one-token body instantiated (XIK_F8T1, default 0 until measured); same body
+// function (moe_fp8_body<1, 1>) as the generic kernel, so the arithmetic is identical.
+struct F8T1Args { const uint8_t *Wp, *Sp; const sycl::half *X16; const int32_t *desc; float *Y; int ldx, w13, nrb, nst, per, ksv, ldy; size_t ystride; };
+static void moe_fp8_t1(xik_ctx *c, const F8T1Args a, int maxslots) {
+  c->q.parallel_for(nd_range<1>((size_t)maxslots * a.nrb * a.ksv, expert_lws()), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    const size_t gid = it.get_global_id(0);
+    const int ks = (int)(gid % a.ksv); const size_t r1 = gid / a.ksv; const int rb = (int)(r1 % a.nrb), j = (int)(r1 / a.nrb);
+    simd<int32_t, 16> d = block_load<int32_t, 16>(a.desc + j * 16);
+    if (d[1] <= 0) return;
+    const int e = d[0];
+    const size_t wst = (size_t)a.nrb * 256, sst = (size_t)a.nrb * 8;
+    const uint32_t *wp = reinterpret_cast<const uint32_t *>(a.Wp) + (((size_t)e * a.nst + ks * a.per) * a.nrb + rb) * 256;
+    const uint32_t *sp = reinterpret_cast<const uint32_t *>(a.Sp) + (((size_t)e * a.nst + ks * a.per) * a.nrb + rb) * 8;
+    const sycl::half *xs = a.X16 + (size_t)ks * a.per * 64;
+    float *Yk = a.Y + (size_t)ks * a.ystride;
+    int32_t ids[8];
+#pragma unroll
+    for (int r = 0; r < 8; r++) ids[r] = d[2 + r];
+    moe_fp8_body<1, 1, 0, 0, 0>(wp, sp, xs, a.ldx, a.w13 != 0, ids, 1, a.per, Yk, a.ldy, rb, wst, sst);
+  });
+}
 void moe_fp8g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const sycl::half *X16, int ldx, bool w13, int maxper,
               int maxslots, int rows, int K, float *Y, int ldy, size_t ystride) {
+  static const int f8t1 = getenv("XIK_F8T1") ? atoi(getenv("XIK_F8T1")) : 0;
+  if (f8t1 && maxper <= 1 && fp8_cfg() == 1 && fp8_pf() == 0 && (!getenv("XIK_F8TM") || atoi(getenv("XIK_F8TM")) != 0) && !getenv("XIK_FP8E_POL")) {
+    const int ksv = fp8_ks(), nst = K / 64;
+    F8T1Args fa{Wp, Sp, X16, c->desc, Y, ldx, w13 ? 1 : 0, rows / 16, nst, nst / ksv, ksv, ldy, ystride};
+    moe_fp8_t1(c, fa, maxslots); return;
+  }
   {
     static const int fpol = [] { const char *e = getenv("XIK_FP8E_POL"); if (!e) return 0; int w = 0, sc = 0; sscanf(e, "%d,%d", &w, &sc); return w * 16 + sc; }();
     if (fpol != 0 && fp8_cfg() == 1 && fp8_pf() == 0) {
@@ -4932,7 +4960,7 @@ static bool isa_w4z1(xik_ctx *c, const W4Args &a) {
 static bool isa_p3(xik_ctx *c, const P3IArgs &a, int maxslots) {
   static const char *path = getenv("XIK_ISA_P3");
   if (!path) return false;
-  static const char *name = getenv("XIK_ISA_P3_NAME") ? getenv("XIK_ISA_P3_NAME") : "_ZTSZN12_GLOBAL__N_110moe_p3_isaEP7xik_ctx7P3IArgsiEUlN4sycl3_V17nd_itemILi1EEEE_";
+  static const char *name = getenv("XIK_ISA_P3_NAME") ? getenv("XIK_ISA_P3_NAME") : "_ZTSZN12_GLOBAL__N_110moe_p3_isaEP7xik_ctxNS_7P3IArgsEiEUlN4sycl3_V17nd_itemILi1EEEE_";
   static IsaKernel ik;
   sycl::kernel *k = isa_load(c, ik, path, name);
   if (!k) return false;
@@ -5016,6 +5044,21 @@ static void w4z_run(xik_ctx *c, const W4Args &a_in, int T) {
 struct PfArgs { const uint8_t *p[12]; uint32_t n256[12]; int n = 0; uint32_t total = 0; uint32_t start[12]; };
 static void w4_prefetch_layer(xik_ctx *c, int layer, bool side) {
   if (layer < 0 || layer >= NLAYER || g_w4alt.empty()) return;
+  // XIK_AWPF_KB: prefetch only the first KB of the layer's relocated block (projections first), with XIK_AWPF_THR issuing threads (side queue: runs concurrently)
+  static const size_t cap = getenv("XIK_AWPF_KB") ? (size_t)atoi(getenv("XIK_AWPF_KB")) * 1024 : 0;
+  static const uint32_t pthr = getenv("XIK_AWPF_THR") ? (uint32_t)atoi(getenv("XIK_AWPF_THR")) : 256;
+  if (cap && g_ablk_built && g_ablk[layer].base) {
+    const uint8_t *b = g_ablk[layer].base; const size_t n = std::min(cap, g_ablk[layer].bytes); const uint32_t n256 = (uint32_t)((n + 255) / 256), pt = pthr;
+    static sycl::queue *q2b = nullptr;
+    if (side && !q2b) q2b = new sycl::queue(c->q.q.get_context(), c->q.q.get_device(), sycl::property_list{sycl::property::queue::in_order{}});
+    auto body2 = [=](id<1> id) SYCL_ESIMD_KERNEL {
+      using namespace es;
+      for (uint32_t u = id[0]; u < n256; u += pt)
+        prefetch<uint32_t, 64>((const uint32_t *)(b + (size_t)u * 256), sycl::ext::oneapi::experimental::properties{es::cache_hint_L1<es::cache_hint::uncached>, es::cache_hint_L2<es::cache_hint::cached>});
+    };
+    if (side) q2b->parallel_for(range<1>(pt), body2); else c->q.parallel_for(range<1>(pt), body2);
+    return;
+  }
   const LayerW &lw = c->L[layer];
   const void *keys[6] = {lw.wq, lw.wk, lw.wv, lw.wo, lw.wr, lw.gate_attn};
   PfArgs a;
@@ -6698,6 +6741,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   phase(c, P_CONV);
   {
     static const int awpf = getenv("XIK_AWPF") ? atoi(getenv("XIK_AWPF")) : 0;  // 1: prefetch kernel in the main queue, 2: in a second queue
+    if (awpf && T <= 16 && getenv("XIK_AWPF_KB")) ensure_ablk(c);
     if (awpf && T <= 16) { const int nl = (layer == CORE1 - 1 && pass < NPASS - 1) ? CORE0 : layer + 1; w4_prefetch_layer(c, nl, awpf == 2); }
   }
 }
