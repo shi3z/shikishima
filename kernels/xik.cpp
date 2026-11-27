@@ -13,6 +13,7 @@
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <level_zero/ze_api.h>
 #include <cstdio>
+#include <typeinfo>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
@@ -36,12 +37,14 @@ struct QW {
   bool rec = false;
   int tag = 0;
   std::vector<std::pair<int, event>> evs;
+  std::vector<const char *> names;  // kernel lambda type name of each recorded event (encodes the launching function), for the timeline dump
   operator queue &() { return q; }
-  template <class... A> event parallel_for(A &&...a) { event e = q.parallel_for(std::forward<A>(a)...); if (rec) evs.push_back({tag, e}); return e; }
-  template <class... A> event submit(A &&...a) { event e = q.submit(std::forward<A>(a)...); if (rec) evs.push_back({tag, e}); return e; }
-  template <class... A> event single_task(A &&...a) { event e = q.single_task(std::forward<A>(a)...); if (rec) evs.push_back({tag, e}); return e; }
-  template <class... A> event memcpy(A &&...a) { event e = q.memcpy(std::forward<A>(a)...); if (rec) evs.push_back({tag, e}); return e; }
-  template <class... A> event memset(A &&...a) { event e = q.memset(std::forward<A>(a)...); if (rec) evs.push_back({tag, e}); return e; }
+  template <class... A> static const char *last_name(A &&...a) { const char *n = ""; ((n = typeid(a).name()), ...); return n; }
+  template <class... A> event parallel_for(A &&...a) { const char *n = rec ? last_name(a...) : ""; event e = q.parallel_for(std::forward<A>(a)...); if (rec) { evs.push_back({tag, e}); names.push_back(n); } return e; }
+  template <class... A> event submit(A &&...a) { const char *n = rec ? last_name(a...) : ""; event e = q.submit(std::forward<A>(a)...); if (rec) { evs.push_back({tag, e}); names.push_back(n); } return e; }
+  template <class... A> event single_task(A &&...a) { event e = q.single_task(std::forward<A>(a)...); if (rec) { evs.push_back({tag, e}); names.push_back("single_task"); } return e; }
+  template <class... A> event memcpy(A &&...a) { event e = q.memcpy(std::forward<A>(a)...); if (rec) { evs.push_back({tag, e}); names.push_back("memcpy"); } return e; }
+  template <class... A> event memset(A &&...a) { event e = q.memset(std::forward<A>(a)...); if (rec) { evs.push_back({tag, e}); names.push_back("memset"); } return e; }
   void wait() { q.wait(); }
   device get_device() { return q.get_device(); }
 };
@@ -378,6 +381,16 @@ static std::map<const void *, const float *> g_fp8_scale;  // weight tile pointe
 // Used for T <= 16 (decode, verify); prefill keeps the FP8 copy.
 struct W4Alt { const uint32_t *w; const uint32_t *sz; size_t wb = 0, sb = 0; };
 static std::map<const void *, W4Alt> g_w4alt;
+// ---- cross-kernel L2 prefetch of routing-independent weights (XIK_PFX): the next kernel launched by a participating function takes (pointer, bytes) from
+// g_pf and every work-item issues L2 prefetches of its share (fire-and-forget).  A kernel does not end before its prefetches arrive, so each kernel only gets
+// what fits into its own duration.  Per layer the int4 attention weights are relocated into one contiguous block in use order (projections, then wo).
+struct PfSlot { const uint8_t *p = nullptr; size_t n = 0; };
+static PfSlot g_pf;
+static inline PfSlot take_pf() { PfSlot r = g_pf; g_pf = PfSlot{}; return r; }
+#define PF_ISSUE(PF, GID, NWI) { for (size_t o_ = (size_t)(GID) * 64; o_ < (PF).n; o_ += (size_t)(NWI) * 64) sycl::ext::oneapi::experimental::prefetch((void *)((PF).p + o_), sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::prefetch_hint_L2}); }
+struct AttnBlk { const uint8_t *base = nullptr; size_t bytes = 0, wo_off = 0; };
+static AttnBlk g_ablk[24];
+static bool g_ablk_built = false;
 struct W4Seg { const uint32_t *W, *SZ; const float *X; float *Y; int rows, K, ldx, ldy, rnd, wg0; };
 // int8 activations of the native path (separate from W4Seg: the fp16-expansion decode kernels do not carry these 24 bytes per segment in their arguments)
 struct W4Aux { const int32_t *aq = nullptr; const float *as = nullptr; const int32_t *asum = nullptr; };
@@ -1652,6 +1665,7 @@ static P3Bufs &p3_bufs(xik_ctx *c) {
 void k_act_q(xik_ctx *c, int npairs, int32_t *rec) {
   const float *gu = c->gu_part;
   constexpr int NGF = FI / 64;
+  const PfSlot pf = take_pf();
   c->q.parallel_for(nd_range<1>((size_t)npairs * NGF * 16, 16), [=](nd_item<1> it) SUBGROUP16 {
     auto sg = it.get_sub_group();
     const int lane = sg.get_local_linear_id(), gidx = (int)it.get_group(0);
@@ -1672,6 +1686,7 @@ void k_act_q(xik_ctx *c, int npairs, int32_t *rec) {
     int32_t *r = rec + (((size_t)pr * NGF + gr) * 2 + lane / 8) * 16;
     r[lane % 8] = (int32_t)w;
     if (lane % 8 == 0) { r[8] = sycl::bit_cast<int32_t>(amax / 127.f); r[9] = sum; }
+    if (pf.n) PF_ISSUE(pf, it.get_global_linear_id(), it.get_global_range(0));
   });
 }
 template <int RC, int NP>
@@ -2095,8 +2110,66 @@ static void moe_chain(xik_ctx *c, const LayerW &lw, int np) {
   static int chk = 0;
   if (getenv("XIK_MOECHAIN_ERR") && ++chk % 500 == 0) { uint32_t h = 0; c->q.q.memcpy(&h, err, 4).wait(); fprintf(stderr, "moe_chain: exhausted waits so far %u\n", h); }
 }
+// ---- carrier kernel for hand-written ISA of the T = 1 planar expert GEMM (XIK_P3ISA): same arithmetic as moe_p3_t<1, 1> for one token per slot, but a single
+// struct argument (stable argument layout for an externally assembled replacement, XIK_ISA_P3=<zebin>).
+struct P3IArgs { const uint32_t *W, *S; const int32_t *AQ, *desc; float *Y; int nrb, ntile, ldy, w13; };
+static bool isa_p3(xik_ctx *c, const P3IArgs &a, int maxslots);
+static void moe_p3_isa(xik_ctx *c, const P3IArgs a, int maxslots) {
+  c->q.parallel_for(nd_range<1>((size_t)maxslots * a.nrb, expert_lws()), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    const int gid = (int)it.get_global_id(0), rb = gid % a.nrb, j = gid / a.nrb;
+    simd<int32_t, 16> d = block_load<int32_t, 16>(a.desc + j * 16);
+    if (d[1] <= 0) return;
+    const int e = d[0], id0 = d[2], trow = a.w13 ? id0 / TOPK : id0, ntile = a.ntile, ngk = 2 * ntile;
+    const size_t wst = (size_t)a.nrb * 192, sst = (size_t)a.nrb * 16;
+    const uint32_t *wp = a.W + (((size_t)e * ntile) * a.nrb + rb) * 192;
+    const uint32_t *sp = a.S + (((size_t)e * ntile) * a.nrb + rb) * 16;
+    simd<float, 16> acc = 0.f;
+    simd<uint32_t, 192> wb[2]; simd<uint32_t, 16> sb[2];
+    w3_ld_tile(wp, sp, wst, sst, 0, wb[0], sb[0]);
+    for (int t0 = 0; t0 < ntile; t0 += 2) {
+#pragma unroll
+      for (int u = 0; u < 2; u++) {
+        const int t = t0 + u;
+        if (t + 1 < ntile) w3_ld_tile(wp, sp, wst, sst, t + 1, wb[(u + 1) % 2], sb[(u + 1) % 2]);
+        if (t < ntile) {
+#pragma unroll
+          for (int gi = 0; gi < 2; gi++) {
+            const int gg = 2 * t + gi;
+            simd<int32_t, 32> p0 = wb[u].template select<32, 1>(96 * gi).template bit_cast_view<int32_t>().read();
+            simd<int32_t, 16> z0 = wb[u].template select<16, 1>(96 * gi + 32).template bit_cast_view<int32_t>().read();
+            simd<int32_t, 32> p1 = wb[u].template select<32, 1>(96 * gi + 48).template bit_cast_view<int32_t>().read();
+            simd<int32_t, 16> z1 = wb[u].template select<16, 1>(96 * gi + 80).template bit_cast_view<int32_t>().read();
+            simd<int32_t, 32> q0, q1;
+            q0.template select<16, 1>(0) = z0 & 0x55555555; q0.template select<16, 1>(16) = (z0 >> 1) & 0x55555555;
+            q1.template select<16, 1>(0) = z1 & 0x55555555; q1.template select<16, 1>(16) = (z1 >> 1) & 0x55555555;
+            simd<sycl::half, 16> sh = sb[u].template select<8, 1>(8 * gi).template bit_cast_view<sycl::half>();
+            simd<float, 16> ws = sh;
+            simd<int32_t, 32> a32 = block_load<int32_t, 32>(a.AQ + ((size_t)trow * ngk * 2 + (size_t)gg * 2) * 16);
+            simd<int32_t, 8> a0 = a32.template select<8, 1>(0), a1 = a32.template select<8, 1>(16);
+            const float as0 = sycl::bit_cast<float>((int32_t)a32[8]), sm0 = (float)(int32_t)a32[9], as1 = sycl::bit_cast<float>((int32_t)a32[24]), sm1 = (float)(int32_t)a32[25];
+            simd<int32_t, 16> i12a = 0, i3a = 0, i12b = 0, i3b = 0;
+            i12a = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12a, p0, a0);
+            i3a = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3a, q0, a0);
+            i12b = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i12b, p1, a1);
+            i3b = xmx::dpas<8, 1, int32_t, int32_t, int32_t, int32_t, xmx::dpas_argument_type::u2, xmx::dpas_argument_type::s8>(i3b, q1, a1);
+            simd<float, 16> fa = convert<float>(i12a + (i3a << 2)), fb = convert<float>(i12b + (i3b << 2));
+            acc += ((fa - 4.f * sm0) * as0 + (fb - 4.f * sm1) * as1) * ws;
+          }
+        }
+      }
+    }
+    acc.copy_to(a.Y + (size_t)id0 * a.ldy + rb * 16);
+  });
+}
 void moe_p3g(xik_ctx *c, const uint8_t *Wp, const uint8_t *Sp, const int32_t *AQ, const float *AS, const int32_t *SM, bool w13, int maxper, int maxslots, int rows, int K, float *Y, size_t ystride, int ldy) {
   const uint32_t *W = (const uint32_t *)Wp, *S = (const uint32_t *)Sp;
+  static const int p3isa = getenv("XIK_P3ISA") ? atoi(getenv("XIK_P3ISA")) : 0;  // 1 = carrier ESIMD kernel (same arithmetic), 2 = its hand-written ISA (XIK_ISA_P3)
+  if (maxper <= 1 && p3isa > 0) {
+    P3IArgs pa{W, S, AQ, c->desc, Y, rows / 16, K / 128, ldy, w13 ? 1 : 0};
+    if (p3isa == 2 && isa_p3(c, pa, maxslots)) return;
+    moe_p3_isa(c, pa, maxslots); return;
+  }
   static const int p3rb2 = getenv("XIK_P3RB2") ? atoi(getenv("XIK_P3RB2")) : 0;
   if (maxper <= 1 && p3rb2 > 0 && (p3rb2 == 2 || !w13) && ((rows / 16) % 2 == 0)) { moe_p3_t1rb2(c, W, S, AQ, w13, maxslots, rows, K, Y, ldy); return; }
   static const int p3ks = getenv("XIK_P3KS") ? atoi(getenv("XIK_P3KS")) : 0;
@@ -3072,7 +3145,9 @@ void k_kv(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
   const bool qr = f3 && !(abl_mask() & 64);
   float *qq = c->qb, *rr = c->rb; const uint16_t *qcl = lw.q_clip, *rcl = lw.rel_clip;
   const int nqr = qr ? T * NH : 0;
+  const PfSlot pf = take_pf();
   c->q.parallel_for(nd_range<1>((size_t)(ngrp + nst + nqr) * HD, HD), [=](nd_item<1> it) {
+    if (pf.n) PF_ISSUE(pf, it.get_global_linear_id(), it.get_global_range(0));
     int idx = it.get_group(0), d = it.get_local_id(0);
     if (idx >= ngrp + nst) {
       const int j = idx - ngrp - nst, t = j / NH, h = j % NH;
@@ -3260,8 +3335,10 @@ void k_attn_w(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos
 // Key-split attention (APPROXIMATE accumulation order, XIK_ATTNP = NSPL, 0 = off): a work-group of NSPL x 128 threads per (token, head); the logits use all threads
 // (one key per thread), the P.V sum of each of the 128 dims is accumulated over NSPL contiguous key chunks in parallel (each chunk in ascending key order, as before)
 // and the NSPL partial sums are added in chunk order.  The split depends only on the number of keys of the token, so plain decode and verify passes agree.
+// pf / pfb (optional, XIK_PFWO): an L2 prefetch of the next kernel's weights (the int4 wo of this layer) issued by every work-item at start; the attention
+// itself barely uses DRAM, so the transfer overlaps it and the wo GEMV then reads from L2.  Fire-and-forget (no waiting).
 template <int NSPL>
-void k_attn_p(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0) {
+void k_attn_p(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0, const uint8_t *pf0 = nullptr, size_t pfb0 = 0, const uint8_t *pf1 = nullptr, size_t pfb1 = 0) {
   const float *q = c->qb, *r = c->rb, *sink = c->sinkb, *gate = c->gateb;
   const float *kc = c->kcache[slot], *vc = c->vcache[slot];
   const bool kbf = c->kbf16;
@@ -3271,12 +3348,19 @@ void k_attn_p(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos
   int maxkeys = local ? WIN : c->max_ctx;
   const float scale = 1.0f / sycl::sqrt((float)HD);
   constexpr int WGS = NSPL * HD;
+  const PfSlot pf = take_pf();
   c->q.submit([&](handler &h) {
     local_accessor<float, 1> lg(range<1>(maxkeys), h);
     local_accessor<float, 1> qs(range<1>(HD), h);
     local_accessor<float, 1> red(range<1>(WGS), h);
     h.parallel_for(nd_range<1>((size_t)T * NH * WGS, WGS), [=](nd_item<1> it) {
       int idx = it.get_group(0), tid = it.get_local_id(0);
+      if (pf.n) PF_ISSUE(pf, it.get_global_linear_id(), it.get_global_range(0));
+      if (pf0) {
+        const size_t gid = it.get_global_linear_id(), nwi = it.get_global_range(0);
+        for (size_t o = gid * 64; o < pfb0; o += nwi * 64) sycl::ext::oneapi::experimental::prefetch((void *)(pf0 + o), sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::prefetch_hint_L2});
+        for (size_t o = gid * 64; o < pfb1; o += nwi * 64) sycl::ext::oneapi::experimental::prefetch((void *)(pf1 + o), sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::prefetch_hint_L2});
+      }
       int t = idx / NH, hh = idx % NH, kvh = hh / (NH / NKV);
       auto g = it.get_group();
       int pos = dpp[0] + t;
@@ -3619,6 +3703,11 @@ void k_attn(xik_ctx *c, const LayerW &lw, int slot, bool local, int T, int pos0)
   static const bool gqa = getenv("XIK_ATTN_GQA") && atoi(getenv("XIK_ATTN_GQA")) != 0;
   if (gqa && T == 1 && atp == 4 && (size_t)(NH / NKV) * (local ? WIN : c->max_ctx) * 4 + 8192 <= 60 * 1024) return k_attn_g<4>(c, lw, slot, local);
   if (atp == 2) return k_attn_p<2>(c, lw, slot, local, T, pos0);
+  static const bool pfwo = getenv("XIK_PFWO") && atoi(getenv("XIK_PFWO")) != 0;
+  if (atp == 4 && pfwo && T == 1) {
+    auto it2 = g_w4alt.find(lw.wo);
+    if (it2 != g_w4alt.end()) return k_attn_p<4>(c, lw, slot, local, T, pos0, (const uint8_t *)it2->second.w, it2->second.wb, (const uint8_t *)it2->second.sz, it2->second.sb);
+  }
   if (atp == 4) return k_attn_p<4>(c, lw, slot, local, T, pos0);
   if (atp == 8) return k_attn_p<8>(c, lw, slot, local, T, pos0);
   static const int vw = getenv("XIK_ATTN") ? atoi(getenv("XIK_ATTN")) : 8;
@@ -3711,6 +3800,7 @@ static void router_fused(xik_ctx *c, const LayerW &lw, bool grp, int32_t *qrec =
   static const int rpf_env = getenv("XIK_RPF") ? atoi(getenv("XIK_RPF")) : 0;
   const int rpf = (grp && qrec && lw.w3p) ? rpf_env : 0;
   const uint8_t *w13p = lw.w13;
+  const PfSlot pf = take_pf();
   c->q.submit([&](handler &h) {
     local_accessor<float, 1> red(range<1>(8), h);
     local_accessor<int, 1> last(range<1>(1), h);
@@ -3788,6 +3878,7 @@ static void router_fused(xik_ctx *c, const LayerW &lw, bool grp, int32_t *qrec =
           }
         }
       }
+      if (pf.n) PF_ISSUE(pf, it.get_global_linear_id(), it.get_global_range(0));
     });
   });
 }
@@ -3999,6 +4090,7 @@ void k_combine_conv(xik_ctx *c, int nks, const ConvArgs &a) {
   const float *y = c->yp_part, *w = c->rwt;
   float *out = c->moe_o;
   const size_t stride = (size_t)TOPK * D;
+  const PfSlot pf = take_pf();
   c->q.parallel_for(range<1>((size_t)D), [=](id<1> id) {
     const int d = (int)id[0];
     float s = 0.f;
@@ -4017,6 +4109,7 @@ void k_combine_conv(xik_ctx *c, int nks, const ConvArgs &a) {
     const float v = rbf((acc + xv) / a.denom);
     a.out[d] = a.add_to ? a.add_to[d] + v : v;
     if (a.state_new) { a.state_new[d] = a.state[(size_t)1 * a.C + d]; a.state_new[a.C + d] = a.state[(size_t)2 * a.C + d]; a.state_new[2 * a.C + d] = xv; }
+    if (pf.n) PF_ISSUE(pf, id[0], D);  // after the work-item's own loads (issued first, the prefetches delayed them)
   });
 }
 void k_moe_combine(xik_ctx *c, int T, int nks) {
@@ -4834,6 +4927,16 @@ static bool isa_w4z1(xik_ctx *c, const W4Args &a) {
   if (!k) return false;
   const bool tm = getenv("XIK_W4TM") != nullptr; const int t0 = 0, nt = 1;
   c->q.submit([&](sycl::handler &h) { h.set_args(a, tm, t0, nt); h.parallel_for(sycl::nd_range<1>((size_t)a.total_wg * 12, 12), *k); });
+  return true;
+}
+static bool isa_p3(xik_ctx *c, const P3IArgs &a, int maxslots) {
+  static const char *path = getenv("XIK_ISA_P3");
+  if (!path) return false;
+  static const char *name = getenv("XIK_ISA_P3_NAME") ? getenv("XIK_ISA_P3_NAME") : "_ZTSZN12_GLOBAL__N_110moe_p3_isaEP7xik_ctx7P3IArgsiEUlN4sycl3_V17nd_itemILi1EEEE_";
+  static IsaKernel ik;
+  sycl::kernel *k = isa_load(c, ik, path, name);
+  if (!k) return false;
+  c->q.submit([&](sycl::handler &h) { h.set_args(a); h.parallel_for(sycl::nd_range<1>((size_t)maxslots * a.nrb, expert_lws()), *k); });
   return true;
 }
 static void w4z_run(xik_ctx *c, const W4Args &a_in, int T) {
@@ -6314,7 +6417,41 @@ void run_ctl(xik_ctx *c, const LayerW &lw, const int *cid, int n, const float **
   k_blend(c, ba, T);
 }
 
+static void ensure_ablk(xik_ctx *c) {
+  if (g_ablk_built) return;
+  g_ablk_built = true;
+  c->q.wait();
+  size_t tot_all = 0;
+  for (int l = 0; l < NLAYER; l++) {
+    const LayerW &lw = c->L[l];
+    const void *keys[9] = {lw.wq, lw.wr, lw.sink, lw.gate_attn, lw.wk, lw.wv, lw.k_dynw, lw.v_dynw, lw.wo};
+    auto al = [](size_t x) { return (x + 255) & ~(size_t)255; };
+    size_t tot = 0, wo_off = 0;
+    for (int i = 0; i < 9; i++) { auto it = g_w4alt.find(keys[i]); if (it == g_w4alt.end()) continue; if (i == 8) wo_off = tot; tot += al(it->second.wb) + al(it->second.sb); }
+    if (!tot) continue;
+    uint8_t *blk = (uint8_t *)sycl::aligned_alloc_device(4096, tot + 4096, c->q.q);
+    size_t off = 0;
+    for (int i = 0; i < 9; i++) {
+      auto it = g_w4alt.find(keys[i]); if (it == g_w4alt.end()) continue;
+      W4Alt &w = it->second;
+      uint8_t *nw = blk + off; c->q.q.memcpy(nw, w.w, w.wb).wait(); off += al(w.wb);
+      uint8_t *ns = blk + off; c->q.q.memcpy(ns, w.sz, w.sb).wait(); off += al(w.sb);
+      sycl::free((void *)w.w, c->q.q); sycl::free((void *)w.sz, c->q.q);
+      w.w = (const uint32_t *)nw; w.sz = (const uint32_t *)ns;
+    }
+    g_ablk[l] = AttnBlk{blk, tot, wo_off};
+    tot_all += tot;
+  }
+  fprintf(stderr, "PFX: attention weights relocated into per-layer blocks, %.1f MB total (%.2f MB per layer)\n", tot_all / 1e6, tot_all / 24e6);
+}
+static size_t pfx_kb(const char *name) { const char *v = getenv(name); return v ? (size_t)atoi(v) * 1024 : 0; }
+static void pf_set(const AttnBlk &b, size_t off, size_t n) { if (!b.base || off >= b.bytes) { g_pf = PfSlot{}; return; } g_pf = PfSlot{b.base + off, std::min(n, b.bytes - off)}; }
 void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool have_msg) {
+  static const bool pfx = getenv("XIK_PFX") && atoi(getenv("XIK_PFX")) != 0;
+  static const size_t pf_kv = pfx_kb("XIK_PF_KV"), pf_at = pfx_kb("XIK_PF_ATTN"), pf_ro = pfx_kb("XIK_PF_ROUTER"), pf_aq = pfx_kb("XIK_PF_ACTQ"), pf_co = pfx_kb("XIK_PF_COMB");
+  const bool pfon = pfx && T == 1;
+  if (pfon) ensure_ablk(c);
+  const int pf_nl = (layer == CORE1 - 1 && pass < NPASS - 1) ? CORE0 : (layer + 1 < NLAYER ? layer + 1 : -1);
   const LayerW &lw = c->L[layer];
   const int slot = slot_of(layer, pass);
   const bool local = is_local(layer);
@@ -6402,8 +6539,10 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   static const bool f3_k = !getenv("XIK_FUSE3") || atoi(getenv("XIK_FUSE3")) != 0;
   if (fkva && T == 1 && atp_k == 4 && f3_k && !(abl_mask() & 64)) { k_attn_kv<4>(c, lw, slot, local); phase(c, P_KV); }
   else {
+  if (pfon) pf_set(g_ablk[layer], g_ablk[layer].wo_off, pf_kv);
   k_kv(c, lw, slot, local, T, pos0);
   phase(c, P_KV);
+  if (pfon) pf_set(g_ablk[layer], g_ablk[layer].wo_off + pf_kv, pf_at);
   k_attn(c, lw, slot, local, T, pos0);
   }
   phase(c, P_ATTN);
@@ -6470,7 +6609,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   static const bool rr_active = getenv("XIK_ROUTE_REPLAY") || (getenv("XIK_ROUTE_REC") && atoi(getenv("XIK_ROUTE_REC")));
   static const bool rgrp = !getenv("XIK_RGRP") || atoi(getenv("XIK_RGRP")) != 0;  // router launch also converts the MLP input and builds the expert groups
   const bool fused_grp = rfuse && rgrp && T == 1 && !fr && !rr_active && !abl_mask();
-  if (rfuse && T == 1 && !fr && !rr_active && !abl_mask()) router_fused(c, lw, fused_grp, (fused_grp && lw.w3p) ? p3_bufs(c).aq1 : nullptr);
+  if (rfuse && T == 1 && !fr && !rr_active && !abl_mask()) { if (pfon && pf_nl >= 0) pf_set(g_ablk[pf_nl], 0, pf_ro); router_fused(c, lw, fused_grp, (fused_grp && lw.w3p) ? p3_bufs(c).aq1 : nullptr); }
   else {
     gemv_bf16_old(c, lw.router, c->in[0], D, c->tmp1, NE, NE, D, T, false);
     if (fr) k_route_fused1(c, lw); else k_router(c, lw, T);
@@ -6534,6 +6673,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
       else {
       moe_p3g(c, lw.w13, lw.w13_s, pb.aq1, pb.as1, pb.sm1, true, T, slots, 2 * FI, D, c->gu_part, (size_t)np * 2 * FI, 2 * FI);
       phase(c, P_MOE_W13);
+      if (pfon && pf_nl >= 0) pf_set(g_ablk[pf_nl], pf_ro, pf_aq);
       k_act_q(c, np, pb.aq2);
       moe_p3g(c, lw.w2, lw.w2_s, pb.aq2, pb.as2, pb.sm2, false, T, slots, D, FI, c->yp_part, (size_t)np * D, D);
       }
@@ -6550,7 +6690,7 @@ void run_layer(xik_ctx *c, Fwd &f, int layer, int pass, int T, int pos0, bool ha
   }
   {
     ConvArgs a{c->moe_o, st_old + 6 * KVD + 3 * D, st_new ? st_new + 6 * KVD + 3 * D : nullptr, f.cur, f.cur, D, T, lw.mlp_conv, nullptr, nullptr, 0, 2.2360679775f};
-    if (T == 1 && (fuse2_mask() & 2) && !abl_mask()) { k_combine_conv(c, nks, a); phase(c, P_MOE_W2); }
+    if (T == 1 && (fuse2_mask() & 2) && !abl_mask()) { if (pfon && pf_nl >= 0) pf_set(g_ablk[pf_nl], pf_ro + pf_aq, pf_co); k_combine_conv(c, nks, a); phase(c, P_MOE_W2); }
     else { k_moe_combine(c, T, nks); phase(c, P_MOE_W2); k_conv(c, a); }
   }
   if (!c->defer) c->cpar[slot] = 1 - par;
@@ -7006,13 +7146,13 @@ extern "C" int xik_bench_fp4var(xik_ctx *c, int var, int na, int rot, int iters,
     c->q.wait();
     *out_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
     c->q.wait();
-    c->q.evs.clear(); c->q.rec = true; c->q.tag = 0;
+    c->q.evs.clear(); c->q.names.clear(); c->q.rec = true; c->q.tag = 0;
     for (int i = 0; i < 100; i++) run();
     c->q.wait();
     c->q.rec = false;
     double sd = 0; int n = 0;
     for (auto &p : c->q.evs) { sd += (p.second.get_profiling_info<sycl::info::event_profiling::command_end>() - p.second.get_profiling_info<sycl::info::event_profiling::command_start>()) * 1e-3; n++; }
-    c->q.evs.clear();
+    c->q.evs.clear(); c->q.names.clear();
     *out_dur = n ? sd / n : 0;
     return 0;
   } catch (std::exception &ex) { g_err = ex.what(); return 1; }
@@ -7080,14 +7220,14 @@ extern "C" int xik_bench_moe(xik_ctx *c, int layer, int kind, int cfg, int T, in
     *out_us = us;
     if (getenv("XIK_BENCH_PROF")) {  // GPU-timestamp decomposition: kernel duration vs start-to-start period vs idle gap
       c->q.wait();
-      c->q.evs.clear(); c->q.rec = true; c->q.tag = 0;
+      c->q.evs.clear(); c->q.names.clear(); c->q.rec = true; c->q.tag = 0;
       for (int i = 0; i < 100; i++) run();
       c->q.wait();
       c->q.rec = false;
       std::vector<std::pair<double, double>> k;
       for (auto &p : c->q.evs) k.push_back({p.second.get_profiling_info<sycl::info::event_profiling::command_start>() * 1e-3,
                                             p.second.get_profiling_info<sycl::info::event_profiling::command_end>() * 1e-3});
-      c->q.evs.clear();
+      c->q.evs.clear(); c->q.names.clear();
       std::sort(k.begin(), k.end());
       double sd = 0, sp = 0, sg = 0; int n = 0; double mind = 1e30, minp = 1e30;
       for (size_t i = 1; i + 1 < k.size(); i++) {
@@ -7668,7 +7808,7 @@ extern "C" double xik_bench_launch(xik_ctx *c, int n, int kind) {
 extern "C" void xik_prof_rec(xik_ctx *c, int on) {
   c->q.wait();
   c->q.rec = on != 0;
-  c->q.evs.clear();
+  c->q.evs.clear(); c->q.names.clear();
   c->seg_tag.clear();
   c->q.tag = -1;
 }
@@ -7680,6 +7820,19 @@ extern "C" void xik_prof_tag(xik_ctx *c, int tag) {
 // start (us since the first recorded kernel), end (us).  Returns the number of segments.
 extern "C" int xik_prof_segments(xik_ctx *c, double *out, int max_seg) {
   c->q.wait();
+  if (const char *tl = getenv("XIK_TL_DUMP")) {  // per-kernel timeline: tag, start_us, end_us, name (one line per recorded kernel)
+    FILE *f = fopen(tl, "w");
+    if (f) {
+      double t0 = 1e30;
+      for (auto &p : c->q.evs) t0 = std::min(t0, (double)p.second.get_profiling_info<sycl::info::event_profiling::command_start>() * 1e-3);
+      for (size_t i = 0; i < c->q.evs.size(); i++) {
+        auto &p = c->q.evs[i];
+        fprintf(f, "%d\t%.3f\t%.3f\t%s\n", p.first, p.second.get_profiling_info<sycl::info::event_profiling::command_start>() * 1e-3 - t0,
+                p.second.get_profiling_info<sycl::info::event_profiling::command_end>() * 1e-3 - t0, i < c->q.names.size() ? c->q.names[i] : "?");
+      }
+      fclose(f);
+    }
+  }
   int n = (int)c->seg_tag.size();
   if (n > max_seg) n = max_seg;
   std::vector<double> cnt(n, 0), sum(n, 0), st(n, 1e30), en(n, 0);
