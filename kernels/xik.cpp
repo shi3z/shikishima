@@ -4918,6 +4918,83 @@ static void w4z_r1p(xik_ctx *c, const W4Args &a) {
     }
   });
 }
+struct W4C { const uint32_t *W[6], *SZ[6]; const float *X[6]; float *Y[6]; int rows[6], wg0[6], rnd[6]; int n, total_wg; };  // 268 B (W4Args: 456 B)
+template <int PER>
+static void w4z_r1c(xik_ctx *c, const W4C a) {
+  constexpr int KSD = 12, KK = PER * KSD * 64;
+  c->q.parallel_for(nd_range<1>((size_t)a.total_wg * KSD, KSD), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+    using namespace es;
+    slm_init<KSD * 16 * 4>();
+    const int wgi = (int)it.get_group(0), tid = (int)it.get_local_id(0);
+    int si = 0;
+#pragma unroll
+    for (int i_ = 1; i_ < 6; i_++) if (i_ < a.n && wgi >= a.wg0[i_]) si = i_;
+    W4Seg sd; sd.W = a.W[0]; sd.SZ = a.SZ[0]; sd.X = a.X[0]; sd.Y = a.Y[0]; sd.rows = a.rows[0]; sd.rnd = a.rnd[0]; sd.wg0 = 0;
+#pragma unroll
+    for (int i_ = 1; i_ < 6; i_++) if (i_ == si) { sd.W = a.W[i_]; sd.SZ = a.SZ[i_]; sd.X = a.X[i_]; sd.Y = a.Y[i_]; sd.rows = a.rows[i_]; sd.rnd = a.rnd[i_]; sd.wg0 = a.wg0[i_]; }
+    const int rb = wgi - sd.wg0, ngrp = KK / 64, g0 = tid * PER;
+    const uint32_t *wp = sd.W + ((size_t)rb * (KK / 32) + (size_t)g0 * 2) * 64;
+    const uint32_t *sp = sd.SZ + ((size_t)rb * ngrp + g0) * 16;
+    simd<uint32_t, 128> wb[PER]; simd<uint32_t, 16> sb[PER]; simd<float, 64> xb[PER];
+#pragma unroll
+    for (int g = 0; g < PER; g++) {
+      wb[g].template select<64, 1>(0) = block_load<uint32_t, 64>(wp + (size_t)g * 128);
+      wb[g].template select<64, 1>(64) = block_load<uint32_t, 64>(wp + (size_t)g * 128 + 64);
+    }
+#pragma unroll
+    for (int g = 0; g < PER; g++) sb[g] = block_load<uint32_t, 16>(sp + (size_t)g * 16);
+#pragma unroll
+    for (int g = 0; g < PER; g++) xb[g] = block_load<float, 64>(sd.X + (size_t)(g0 + g) * 64);
+    simd<float, 16> acc = 0.f;
+#pragma unroll
+    for (int g = 0; g < PER; g++) {
+      simd<uint32_t, 16> zpair = (sb[g] >> 16) * 0x10001u;
+      simd<float, 16> ag = 0.f;
+#pragma unroll
+      for (int t = 0; t < 4; t++) {
+        simd<uint32_t, 128> B;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          simd<uint32_t, 16> x = wb[g].template select<16, 1>(64 * (t / 2) + 16 * (2 * (t % 2) + h));
+#pragma unroll
+          for (int pp = 0; pp < 4; pp++) {
+            simd<uint32_t, 16> v = (pp == 0 ? x : (x >> (4 * pp))) & 0x000F000Fu;
+            B.template select<16, 1>(16 * (4 * h + pp)) = v | 0x64006400u;
+          }
+        }
+        simd<sycl::half, 256> bh = B.template bit_cast_view<sycl::half>();
+        simd<uint32_t, 128> Z;
+#pragma unroll
+        for (int i = 0; i < 8; i++) Z.template select<16, 1>(16 * i) = zpair;
+        bh -= Z.template bit_cast_view<sycl::half>();
+        simd<int32_t, 128> bi = bh.template bit_cast_view<int32_t>();
+        simd<float, 16> xv = xb[g].template select<16, 1>(16 * t);
+        simd<sycl::half, 16> xh = xv;
+        simd<int32_t, 8> av = xh.template bit_cast_view<int32_t>();
+        simd<float, 16> z = 0.f;
+        ag = xmx::dpas<8, 1, float, float, int32_t, int32_t, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(t == 0 ? z : ag, bi, av);
+      }
+      simd<uint16_t, 32> sv16 = sb[g].template bit_cast_view<uint16_t>();
+      simd<uint16_t, 16> slo = sv16.template select<16, 2>(0);
+      simd<sycl::half, 16> sh = slo.template bit_cast_view<sycl::half>();
+      simd<float, 16> sf = sh;
+      acc = sycl::ext::intel::experimental::esimd::fma(ag, sf, acc);  // one fused multiply-add per group, as the compiled w4z_r
+    }
+    slm_block_store<float, 16>(tid * 16 * 4, acc);
+    barrier();
+    if (tid == 0) {
+      simd<float, 16> sum = slm_block_load<float, 16>(0);
+      for (int j = 1; j < KSD; j++) sum += slm_block_load<float, 16>(j * 16 * 4);
+      if (sd.rnd) {
+        simd<uint32_t, 16> u = sum.template bit_cast_view<uint32_t>();
+        u += 0x7FFFu + ((u >> 16) & 1u); u &= 0xFFFF0000u;
+        sum = u.template bit_cast_view<float>();
+      }
+      if ((rb + 1) * 16 <= sd.rows) sum.copy_to(sd.Y + rb * 16);
+      else for (int i = 0; i < 16; i++) if (rb * 16 + i < sd.rows) sd.Y[rb * 16 + i] = sum[i];
+    }
+  });
+}
 // ---- externally assembled kernels (hand-written / hand-edited Xe2 ISA): a zebin is loaded into the queue's Level Zero context and launched in place of
 // the JIT kernel with the same arguments.  XIK_ISA_W4Z1=<zebin>: replaces w4z_r<1, 12> (T = 1 int4 attention GEMV); the zebin must contain the kernel under
 // the name XIK_ISA_W4Z1_NAME (default: the mangled name of w4z_r<1, 12>'s lambda) with the argument order (W4Args, bool tm, int t0, int nt).
@@ -5025,6 +5102,13 @@ static void w4z_run(xik_ctx *c, const W4Args &a_in, int T) {
         if (ncmp == 1) { std::vector<float> y(a.s[0].rows); c->q.q.memcpy(y.data(), a.s[0].Y, y.size() * 4).wait();
           for (int r2 = 0; r2 < 40; r2 += 1) fprintf(stderr, "  row %d: ref %g new %g\n", r2, y[r2], b.s[0].Y[r2]); }
       }
+      return;
+    }
+    static const bool w4c = getenv("XIK_W4C") && atoi(getenv("XIK_W4C")) != 0;  // compact 268-B argument struct
+    if (w4c && a.n <= 6 && (k23 || k30)) {
+      W4C cc{}; cc.n = a.n; cc.total_wg = a.total_wg;
+      for (int i = 0; i < a.n; i++) { cc.W[i] = a.s[i].W; cc.SZ[i] = a.s[i].SZ; cc.X[i] = a.s[i].X; cc.Y[i] = a.s[i].Y; cc.rows[i] = a.s[i].rows; cc.wg0[i] = a.s[i].wg0; cc.rnd[i] = a.s[i].rnd; }
+      if (k23) w4z_r1c<3>(c, cc); else w4z_r1c<4>(c, cc);
       return;
     }
     if (k23) { w4z_r1p<3>(c, a); return; }
